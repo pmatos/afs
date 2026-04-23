@@ -196,3 +196,160 @@ fn ask_connects_to_live_daemon_and_prints_stub_response() {
 
     stop_daemon(&mut daemon);
 }
+
+#[test]
+fn install_creates_agent_home_and_history_baseline_through_live_supervisor() {
+    let afs_home = unique_afs_home("install-agent-home");
+    let managed_dir = unique_afs_home("managed-dir");
+    let socket_path = supervisor_socket(&afs_home);
+    std::fs::create_dir_all(&managed_dir).expect("test should create managed directory");
+    std::fs::write(managed_dir.join("notes.txt"), "hello afs\n")
+        .expect("test should create managed file");
+    let mut daemon = start_daemon(&afs_home);
+
+    assert!(
+        wait_until(Duration::from_secs(2), || socket_path
+            .metadata()
+            .map(|metadata| metadata.file_type().is_socket())
+            .unwrap_or(false)),
+        "daemon should create the Supervisor Socket before install connects"
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_afs"))
+        .env("AFS_HOME", &afs_home)
+        .arg("install")
+        .arg(&managed_dir)
+        .output()
+        .expect("afs install should run");
+
+    assert!(output.status.success(), "afs install should succeed");
+    assert_eq!(String::from_utf8_lossy(&output.stderr), "");
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("installed managed directory"),
+        "afs install should report a new Managed Directory"
+    );
+    assert!(managed_dir.join(".afs/identity").is_file());
+    assert!(managed_dir.join(".afs/instructions.md").is_file());
+    assert!(managed_dir.join(".afs/history/baseline.tsv").is_file());
+
+    stop_daemon(&mut daemon);
+}
+
+#[test]
+fn install_is_idempotent_for_an_already_managed_directory() {
+    let afs_home = unique_afs_home("install-idempotent");
+    let managed_dir = unique_afs_home("managed-idempotent");
+    let socket_path = supervisor_socket(&afs_home);
+    std::fs::create_dir_all(&managed_dir).expect("test should create managed directory");
+    std::fs::write(managed_dir.join("notes.txt"), "hello afs\n")
+        .expect("test should create managed file");
+    let mut daemon = start_daemon(&afs_home);
+
+    assert!(
+        wait_until(Duration::from_secs(2), || socket_path
+            .metadata()
+            .map(|metadata| metadata.file_type().is_socket())
+            .unwrap_or(false)),
+        "daemon should create the Supervisor Socket before install connects"
+    );
+
+    let first = Command::new(env!("CARGO_BIN_EXE_afs"))
+        .env("AFS_HOME", &afs_home)
+        .arg("install")
+        .arg(&managed_dir)
+        .output()
+        .expect("first afs install should run");
+
+    assert!(first.status.success(), "first afs install should succeed");
+    let identity_after_first =
+        std::fs::read_to_string(managed_dir.join(".afs/identity")).expect("identity should exist");
+    let baseline_after_first =
+        std::fs::read_to_string(managed_dir.join(".afs/history/baseline.tsv"))
+            .expect("baseline should exist");
+
+    let second = Command::new(env!("CARGO_BIN_EXE_afs"))
+        .env("AFS_HOME", &afs_home)
+        .arg("install")
+        .arg(&managed_dir)
+        .output()
+        .expect("second afs install should run");
+
+    assert!(second.status.success(), "second afs install should succeed");
+    assert_eq!(String::from_utf8_lossy(&second.stderr), "");
+    assert!(
+        String::from_utf8_lossy(&second.stdout).contains("already managed directory"),
+        "second install should report the existing Managed Directory"
+    );
+    assert_eq!(
+        std::fs::read_to_string(managed_dir.join(".afs/identity"))
+            .expect("identity should still exist"),
+        identity_after_first
+    );
+    assert_eq!(
+        std::fs::read_to_string(managed_dir.join(".afs/history/baseline.tsv"))
+            .expect("baseline should still exist"),
+        baseline_after_first
+    );
+
+    stop_daemon(&mut daemon);
+}
+
+#[test]
+fn agents_lists_installed_directory_with_live_runtime_status() {
+    let afs_home = unique_afs_home("agents-live-status");
+    let managed_dir = unique_afs_home("managed-live-status");
+    let socket_path = supervisor_socket(&afs_home);
+    std::fs::create_dir_all(&managed_dir).expect("test should create managed directory");
+    let managed_dir = managed_dir
+        .canonicalize()
+        .expect("managed directory should canonicalize");
+    let mut daemon = start_daemon(&afs_home);
+
+    assert!(
+        wait_until(Duration::from_secs(2), || socket_path
+            .metadata()
+            .map(|metadata| metadata.file_type().is_socket())
+            .unwrap_or(false)),
+        "daemon should create the Supervisor Socket before install connects"
+    );
+
+    let install = Command::new(env!("CARGO_BIN_EXE_afs"))
+        .env("AFS_HOME", &afs_home)
+        .arg("install")
+        .arg(&managed_dir)
+        .output()
+        .expect("afs install should run");
+    assert!(install.status.success(), "afs install should succeed");
+
+    let agents = Command::new(env!("CARGO_BIN_EXE_afs"))
+        .env("AFS_HOME", &afs_home)
+        .arg("agents")
+        .output()
+        .expect("afs agents should run");
+
+    assert!(agents.status.success(), "afs agents should succeed");
+    assert_eq!(String::from_utf8_lossy(&agents.stderr), "");
+    let stdout = String::from_utf8_lossy(&agents.stdout);
+    assert!(
+        stdout.contains(&managed_dir.display().to_string()),
+        "afs agents should show the Managed Directory path"
+    );
+    assert!(
+        stdout.contains("health=running"),
+        "afs agents should show basic live health"
+    );
+    assert!(
+        stdout.contains("index=warming"),
+        "afs agents should show Index Status"
+    );
+    assert!(
+        stdout.contains("reconciliation=idle"),
+        "afs agents should show reconciliation state"
+    );
+    assert!(
+        stdout.contains("queue=0"),
+        "afs agents should show Task Queue length"
+    );
+
+    stop_daemon(&mut daemon);
+}
