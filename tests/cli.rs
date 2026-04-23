@@ -2,7 +2,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use std::os::unix::fs::FileTypeExt;
+use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 
 fn unique_afs_home(test_name: &str) -> std::path::PathBuf {
@@ -36,6 +36,43 @@ fn start_daemon(afs_home: &std::path::Path) -> Child {
         .stderr(Stdio::null())
         .spawn()
         .expect("afs daemon should start")
+}
+
+fn start_daemon_with_pi_runtime(afs_home: &std::path::Path, pi_runtime: &std::path::Path) -> Child {
+    Command::new(env!("CARGO_BIN_EXE_afs"))
+        .env("AFS_HOME", afs_home)
+        .env("AFS_PI_RUNTIME", pi_runtime)
+        .arg("daemon")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("afs daemon should start")
+}
+
+fn fake_pi_runtime(test_name: &str) -> std::path::PathBuf {
+    let runtime_dir = unique_afs_home(test_name);
+    std::fs::create_dir_all(&runtime_dir).expect("test should create fake runtime directory");
+    let runtime = runtime_dir.join("pi");
+    std::fs::write(
+        &runtime,
+        r#"#!/bin/sh
+{
+  printf 'identity=%s\n' "$AFS_AGENT_ID"
+  printf 'managed_dir=%s\n' "$AFS_MANAGED_DIR"
+  printf 'rpc=%s\n' "$AFS_AGENT_RPC"
+} > "$AFS_AGENT_HOME/runtime-started"
+while IFS= read -r _line; do
+  :
+done
+"#,
+    )
+    .expect("test should create fake Pi runtime");
+    let mut permissions = std::fs::metadata(&runtime)
+        .expect("fake Pi runtime should exist")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&runtime, permissions).expect("fake Pi runtime should be executable");
+    runtime
 }
 
 fn stop_daemon(daemon: &mut Child) {
@@ -201,11 +238,12 @@ fn ask_connects_to_live_daemon_and_prints_stub_response() {
 fn install_creates_agent_home_and_history_baseline_through_live_supervisor() {
     let afs_home = unique_afs_home("install-agent-home");
     let managed_dir = unique_afs_home("managed-dir");
+    let pi_runtime = fake_pi_runtime("install-agent-home-runtime");
     let socket_path = supervisor_socket(&afs_home);
     std::fs::create_dir_all(&managed_dir).expect("test should create managed directory");
     std::fs::write(managed_dir.join("notes.txt"), "hello afs\n")
         .expect("test should create managed file");
-    let mut daemon = start_daemon(&afs_home);
+    let mut daemon = start_daemon_with_pi_runtime(&afs_home, &pi_runtime);
 
     assert!(
         wait_until(Duration::from_secs(2), || socket_path
@@ -231,6 +269,18 @@ fn install_creates_agent_home_and_history_baseline_through_live_supervisor() {
     assert!(managed_dir.join(".afs/identity").is_file());
     assert!(managed_dir.join(".afs/instructions.md").is_file());
     assert!(managed_dir.join(".afs/history/baseline.tsv").is_file());
+    assert!(
+        wait_until(Duration::from_secs(2), || managed_dir
+            .join(".afs/runtime-started")
+            .is_file()),
+        "afs install should start the configured Pi Agent Runtime"
+    );
+    assert!(
+        std::fs::read_to_string(managed_dir.join(".afs/runtime-started"))
+            .expect("runtime marker should be readable")
+            .contains("rpc=stdio"),
+        "Pi Agent Runtime should be started in stdio RPC mode"
+    );
 
     stop_daemon(&mut daemon);
 }
@@ -239,11 +289,12 @@ fn install_creates_agent_home_and_history_baseline_through_live_supervisor() {
 fn install_is_idempotent_for_an_already_managed_directory() {
     let afs_home = unique_afs_home("install-idempotent");
     let managed_dir = unique_afs_home("managed-idempotent");
+    let pi_runtime = fake_pi_runtime("install-idempotent-runtime");
     let socket_path = supervisor_socket(&afs_home);
     std::fs::create_dir_all(&managed_dir).expect("test should create managed directory");
     std::fs::write(managed_dir.join("notes.txt"), "hello afs\n")
         .expect("test should create managed file");
-    let mut daemon = start_daemon(&afs_home);
+    let mut daemon = start_daemon_with_pi_runtime(&afs_home, &pi_runtime);
 
     assert!(
         wait_until(Duration::from_secs(2), || socket_path
@@ -298,12 +349,13 @@ fn install_is_idempotent_for_an_already_managed_directory() {
 fn agents_lists_installed_directory_with_live_runtime_status() {
     let afs_home = unique_afs_home("agents-live-status");
     let managed_dir = unique_afs_home("managed-live-status");
+    let pi_runtime = fake_pi_runtime("agents-live-status-runtime");
     let socket_path = supervisor_socket(&afs_home);
     std::fs::create_dir_all(&managed_dir).expect("test should create managed directory");
     let managed_dir = managed_dir
         .canonicalize()
         .expect("managed directory should canonicalize");
-    let mut daemon = start_daemon(&afs_home);
+    let mut daemon = start_daemon_with_pi_runtime(&afs_home, &pi_runtime);
 
     assert!(
         wait_until(Duration::from_secs(2), || socket_path

@@ -4,13 +4,6 @@ fn main() -> ExitCode {
     let mut args = std::env::args().skip(1);
 
     match args.next().as_deref() {
-        Some("__directory-agent") => match afs::directory_agent::run_stdio() {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(error) => {
-                eprintln!("{error}");
-                ExitCode::FAILURE
-            }
-        },
         Some("daemon") => match afs::supervisor::run_foreground() {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {

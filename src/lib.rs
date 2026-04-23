@@ -8,6 +8,7 @@ pub mod supervisor {
     const SOCKET_FILE: &str = "supervisor.sock";
     const AGENT_HOME_DIR: &str = ".afs";
     const REGISTRY_FILE: &str = "registry.tsv";
+    const PI_RUNTIME_ENV: &str = "AFS_PI_RUNTIME";
 
     pub fn run_foreground() -> io::Result<()> {
         let home = home()?;
@@ -66,6 +67,7 @@ pub mod supervisor {
     struct RegisteredAgent {
         identity: String,
         managed_dir: PathBuf,
+        agent_home: PathBuf,
         process: Child,
     }
 
@@ -155,10 +157,12 @@ pub mod supervisor {
                 .iter()
                 .any(|agent| agent.managed_dir == managed_dir)
             {
-                let process = start_directory_agent_process(&managed_dir)?;
+                let process =
+                    start_directory_agent_process(&managed_dir, &agent_home, identity.trim())?;
                 self.agents.push(RegisteredAgent {
                     identity: identity.trim().to_string(),
                     managed_dir: managed_dir.clone(),
+                    agent_home,
                     process,
                 });
                 self.write_registry()?;
@@ -198,25 +202,62 @@ pub mod supervisor {
         }
 
         fn write_registry(&self) -> io::Result<()> {
-            let mut registry = String::from("identity\tmanaged_dir\n");
+            let mut registry = String::from("identity\tmanaged_dir\tagent_home\n");
             for agent in &self.agents {
                 registry.push_str(&agent.identity);
                 registry.push('\t');
                 registry.push_str(&agent.managed_dir.to_string_lossy());
+                registry.push('\t');
+                registry.push_str(&agent.agent_home.to_string_lossy());
                 registry.push('\n');
             }
             std::fs::write(self.home.join(REGISTRY_FILE), registry)
         }
     }
 
-    fn start_directory_agent_process(managed_dir: &Path) -> io::Result<Child> {
-        Command::new(std::env::current_exe()?)
-            .arg("__directory-agent")
+    fn start_directory_agent_process(
+        managed_dir: &Path,
+        agent_home: &Path,
+        identity: &str,
+    ) -> io::Result<Child> {
+        let runtime = pi_runtime_command();
+        Command::new(&runtime)
+            .arg("agent")
+            .arg("--rpc")
+            .arg("stdio")
+            .arg("--managed-dir")
             .arg(managed_dir)
+            .arg("--agent-home")
+            .arg(agent_home)
+            .arg("--identity")
+            .arg(identity)
+            .env("AFS_AGENT_ID", identity)
+            .env("AFS_AGENT_HOME", agent_home)
+            .env("AFS_MANAGED_DIR", managed_dir)
+            .env("AFS_AGENT_RPC", "stdio")
             .stdin(Stdio::piped())
-            .stdout(Stdio::null())
+            .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()
+            .map_err(|error| {
+                if error.kind() == io::ErrorKind::NotFound {
+                    io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!(
+                            "Pi Agent Runtime command not found: {} (set {PI_RUNTIME_ENV})",
+                            runtime.display()
+                        ),
+                    )
+                } else {
+                    error
+                }
+            })
+    }
+
+    fn pi_runtime_command() -> PathBuf {
+        std::env::var_os(PI_RUNTIME_ENV)
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("pi"))
     }
 
     fn new_agent_identity() -> io::Result<String> {
@@ -326,22 +367,5 @@ pub mod client {
             io::ErrorKind::InvalidData,
             "supervisor returned an invalid response",
         )))
-    }
-}
-
-pub mod directory_agent {
-    use std::io::{self, Read};
-
-    pub fn run_stdio() -> io::Result<()> {
-        let mut stdin = io::stdin().lock();
-        let mut buffer = [0_u8; 1024];
-        loop {
-            match stdin.read(&mut buffer) {
-                Ok(0) => return Ok(()),
-                Ok(_) => {}
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                Err(error) => return Err(error),
-            }
-        }
     }
 }
