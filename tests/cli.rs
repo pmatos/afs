@@ -62,7 +62,15 @@ fn fake_pi_runtime(test_name: &str) -> std::path::PathBuf {
   printf 'rpc=%s\n' "$AFS_AGENT_RPC"
 } > "$AFS_AGENT_HOME/runtime-started"
 while IFS= read -r _line; do
-  :
+  if [ "$_line" = "ASK" ]; then
+    IFS= read -r asked_path
+    IFS= read -r asked_prompt
+    {
+      printf 'path=%s\n' "$asked_path"
+      printf 'prompt=%s\n' "$asked_prompt"
+    } >> "$AFS_AGENT_HOME/ask-received"
+    printf 'agent %s answered about %s\n' "$AFS_AGENT_ID" "$asked_path"
+  fi
 done
 "#,
     )
@@ -93,6 +101,15 @@ fn afs_history(afs_home: &std::path::Path, managed_dir: &std::path::Path) -> std
         .arg(managed_dir)
         .output()
         .expect("afs history should run")
+}
+
+fn afs_ask(afs_home: &std::path::Path, prompt: &str) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_afs"))
+        .env("AFS_HOME", afs_home)
+        .arg("ask")
+        .arg(prompt)
+        .output()
+        .expect("afs ask should run")
 }
 
 #[test]
@@ -239,6 +256,208 @@ fn ask_connects_to_live_daemon_and_prints_stub_response() {
         "ask handling not implemented yet\n"
     );
     assert_eq!(String::from_utf8_lossy(&output.stderr), "");
+
+    stop_daemon(&mut daemon);
+}
+
+#[test]
+fn ask_routes_explicit_nested_managed_path_directly_to_deepest_owner() {
+    let afs_home = unique_afs_home("ask-direct-managed-path");
+    let parent_dir = unique_afs_home("ask-direct-parent");
+    let pi_runtime = fake_pi_runtime("ask-direct-runtime");
+    let socket_path = supervisor_socket(&afs_home);
+    let child_dir = parent_dir.join("child");
+    std::fs::create_dir_all(&child_dir).expect("test should create nested managed directory");
+    let target_file = child_dir.join("notes.txt");
+    std::fs::write(&target_file, "child notes\n").expect("test should create target file");
+    let parent_dir = parent_dir
+        .canonicalize()
+        .expect("parent managed directory should canonicalize");
+    let child_dir = child_dir
+        .canonicalize()
+        .expect("child managed directory should canonicalize");
+    let target_file = target_file
+        .canonicalize()
+        .expect("target file should canonicalize");
+    let mut daemon = start_daemon_with_pi_runtime(&afs_home, &pi_runtime);
+
+    assert!(
+        wait_until(Duration::from_secs(2), || socket_path
+            .metadata()
+            .map(|metadata| metadata.file_type().is_socket())
+            .unwrap_or(false)),
+        "daemon should create the Supervisor Socket before install connects"
+    );
+
+    let parent_install = Command::new(env!("CARGO_BIN_EXE_afs"))
+        .env("AFS_HOME", &afs_home)
+        .arg("install")
+        .arg(&parent_dir)
+        .output()
+        .expect("parent afs install should run");
+    assert!(
+        parent_install.status.success(),
+        "parent afs install should succeed"
+    );
+    let child_install = Command::new(env!("CARGO_BIN_EXE_afs"))
+        .env("AFS_HOME", &afs_home)
+        .arg("install")
+        .arg(&child_dir)
+        .output()
+        .expect("child afs install should run");
+    assert!(
+        child_install.status.success(),
+        "child afs install should succeed"
+    );
+
+    let ask = afs_ask(&afs_home, &format!("summarize {}", target_file.display()));
+
+    assert!(ask.status.success(), "afs ask should succeed");
+    assert_eq!(String::from_utf8_lossy(&ask.stderr), "");
+    let stdout = String::from_utf8_lossy(&ask.stdout);
+    assert!(
+        stdout.contains(&format!("answered about {}", target_file.display())),
+        "afs ask should return the owning agent response"
+    );
+    assert!(
+        wait_until(Duration::from_secs(2), || child_dir
+            .join(".afs/ask-received")
+            .is_file()),
+        "deepest owning agent should receive the ask"
+    );
+    assert!(
+        std::fs::read_to_string(child_dir.join(".afs/ask-received"))
+            .expect("owning agent ask marker should be readable")
+            .contains(&target_file.display().to_string()),
+        "owning agent should receive the explicit path"
+    );
+    assert!(
+        !parent_dir.join(".afs/ask-received").exists(),
+        "ancestor agent should not receive a direct path ask owned by a nested agent"
+    );
+
+    stop_daemon(&mut daemon);
+}
+
+#[test]
+fn ask_answer_for_managed_path_includes_file_reference_and_index_caveat() {
+    let afs_home = unique_afs_home("ask-reference-caveat");
+    let managed_dir = unique_afs_home("ask-reference-caveat-managed");
+    let pi_runtime = fake_pi_runtime("ask-reference-caveat-runtime");
+    let socket_path = supervisor_socket(&afs_home);
+    std::fs::create_dir_all(&managed_dir).expect("test should create managed directory");
+    let target_file = managed_dir.join("notes.txt");
+    std::fs::write(&target_file, "notes for direct ask\n").expect("test should create target file");
+    let managed_dir = managed_dir
+        .canonicalize()
+        .expect("managed directory should canonicalize");
+    let target_file = target_file
+        .canonicalize()
+        .expect("target file should canonicalize");
+    let mut daemon = start_daemon_with_pi_runtime(&afs_home, &pi_runtime);
+
+    assert!(
+        wait_until(Duration::from_secs(2), || socket_path
+            .metadata()
+            .map(|metadata| metadata.file_type().is_socket())
+            .unwrap_or(false)),
+        "daemon should create the Supervisor Socket before install connects"
+    );
+
+    let install = Command::new(env!("CARGO_BIN_EXE_afs"))
+        .env("AFS_HOME", &afs_home)
+        .arg("install")
+        .arg(&managed_dir)
+        .output()
+        .expect("afs install should run");
+    assert!(install.status.success(), "afs install should succeed");
+
+    let ask = afs_ask(&afs_home, &format!("summarize {}", target_file.display()));
+
+    assert!(ask.status.success(), "afs ask should succeed");
+    assert_eq!(String::from_utf8_lossy(&ask.stderr), "");
+    let stdout = String::from_utf8_lossy(&ask.stdout);
+    assert!(
+        stdout.contains("references:\n"),
+        "afs ask should include a file-reference section"
+    );
+    assert!(
+        stdout.contains(&format!("- {}", target_file.display())),
+        "afs ask should reference the explicit managed path"
+    );
+    assert!(
+        stdout.contains("caveat: local index is warming; answer may be incomplete"),
+        "afs ask should disclose incomplete local index coverage"
+    );
+
+    stop_daemon(&mut daemon);
+}
+
+#[test]
+fn ask_reports_unmanaged_explicit_path_without_contacting_agents() {
+    let afs_home = unique_afs_home("ask-unmanaged-path");
+    let managed_dir = unique_afs_home("ask-unmanaged-managed");
+    let unmanaged_dir = unique_afs_home("ask-unmanaged-outside");
+    let pi_runtime = fake_pi_runtime("ask-unmanaged-runtime");
+    let socket_path = supervisor_socket(&afs_home);
+    std::fs::create_dir_all(&managed_dir).expect("test should create managed directory");
+    std::fs::create_dir_all(&unmanaged_dir).expect("test should create unmanaged directory");
+    let unmanaged_file = unmanaged_dir.join("outside.txt");
+    std::fs::write(&unmanaged_file, "outside afs\n").expect("test should create unmanaged file");
+    let managed_dir = managed_dir
+        .canonicalize()
+        .expect("managed directory should canonicalize");
+    let unmanaged_file = unmanaged_file
+        .canonicalize()
+        .expect("unmanaged file should canonicalize");
+    let unmanaged_parent = unmanaged_file
+        .parent()
+        .expect("unmanaged file should have a parent")
+        .to_path_buf();
+    let mut daemon = start_daemon_with_pi_runtime(&afs_home, &pi_runtime);
+
+    assert!(
+        wait_until(Duration::from_secs(2), || socket_path
+            .metadata()
+            .map(|metadata| metadata.file_type().is_socket())
+            .unwrap_or(false)),
+        "daemon should create the Supervisor Socket before install connects"
+    );
+
+    let install = Command::new(env!("CARGO_BIN_EXE_afs"))
+        .env("AFS_HOME", &afs_home)
+        .arg("install")
+        .arg(&managed_dir)
+        .output()
+        .expect("afs install should run");
+    assert!(install.status.success(), "afs install should succeed");
+
+    let ask = afs_ask(
+        &afs_home,
+        &format!("summarize {}", unmanaged_file.display()),
+    );
+
+    assert!(
+        !ask.status.success(),
+        "afs ask should fail for an unmanaged explicit path"
+    );
+    assert_eq!(String::from_utf8_lossy(&ask.stdout), "");
+    let stderr = String::from_utf8_lossy(&ask.stderr);
+    assert!(
+        stderr.contains(&format!(
+            "path is not managed: {}",
+            unmanaged_file.display()
+        )),
+        "afs ask should identify the unmanaged path"
+    );
+    assert!(
+        stderr.contains(&format!("afs install {}", unmanaged_parent.display())),
+        "afs ask should suggest installing the path parent"
+    );
+    assert!(
+        !managed_dir.join(".afs/ask-received").exists(),
+        "managed agents should not inspect unmanaged explicit paths"
+    );
 
     stop_daemon(&mut daemon);
 }

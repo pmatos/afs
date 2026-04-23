@@ -5,7 +5,7 @@ pub mod supervisor {
     use std::io::{self, BufRead, Read, Write};
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::{Path, PathBuf};
-    use std::process::{Child, Command, Stdio};
+    use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
     use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
     use std::sync::{Mutex, OnceLock};
     use std::thread;
@@ -81,6 +81,8 @@ pub mod supervisor {
         managed_dir: PathBuf,
         agent_home: PathBuf,
         process: Child,
+        stdin: ChildStdin,
+        stdout: io::BufReader<ChildStdout>,
         _monitor: thread::JoinHandle<()>,
     }
 
@@ -103,9 +105,14 @@ pub mod supervisor {
         }
 
         let request = request.trim_end_matches('\n').trim_end_matches('\r');
-        let response = if let Some(prompt) = request.strip_prefix("ASK ") {
-            let _ = prompt;
-            Ok("ask handling not implemented yet\n".to_string())
+        let response = if let Some(payload) = request.strip_prefix("ASK\t") {
+            let Some((cwd, prompt)) = payload.split_once('\t') else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "ASK request is missing current directory",
+                ));
+            };
+            state.ask(Path::new(cwd), prompt)
         } else if let Some(path) = request.strip_prefix("INSTALL ") {
             state.install(Path::new(path))
         } else if request == "AGENTS" {
@@ -214,22 +221,50 @@ pub mod supervisor {
 
         fn history(&self, path: &Path) -> io::Result<String> {
             let requested_path = path.canonicalize()?;
-            let Some(agent) = self
-                .agents
-                .iter()
-                .filter(|agent| {
-                    requested_path == agent.managed_dir
-                        || requested_path.starts_with(&agent.managed_dir)
-                })
-                .max_by_key(|agent| agent.managed_dir.components().count())
-            else {
+            let Some(agent_index) = self.owning_agent_index(&requested_path) else {
                 return Err(io::Error::new(
                     io::ErrorKind::NotFound,
                     "path is not managed",
                 ));
             };
 
-            format_history(&agent.agent_home)
+            format_history(&self.agents[agent_index].agent_home)
+        }
+
+        fn ask(&mut self, cwd: &Path, prompt: &str) -> io::Result<String> {
+            let Some(requested_path) = explicit_prompt_path(cwd, prompt)? else {
+                return Ok("ask handling not implemented yet\n".to_string());
+            };
+            let Some(agent_index) = self.owning_agent_index(&requested_path) else {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!(
+                        "path is not managed: {}. Run afs install {} or afs install a suitable parent directory.",
+                        requested_path.display(),
+                        install_suggestion_path(&requested_path).display()
+                    ),
+                ));
+            };
+
+            let agent = &mut self.agents[agent_index];
+            let answer = agent.ask(prompt, &requested_path)?;
+            Ok(format_direct_ask_response(
+                &answer,
+                &requested_path,
+                &agent.identity,
+            ))
+        }
+
+        fn owning_agent_index(&self, requested_path: &Path) -> Option<usize> {
+            self.agents
+                .iter()
+                .enumerate()
+                .filter(|(_index, agent)| {
+                    requested_path == agent.managed_dir
+                        || requested_path.starts_with(&agent.managed_dir)
+                })
+                .max_by_key(|(_index, agent)| agent.managed_dir.components().count())
+                .map(|(index, _agent)| index)
         }
 
         fn write_registry(&self) -> io::Result<()> {
@@ -278,16 +313,111 @@ pub mod supervisor {
             agent_home: PathBuf,
             identity: &str,
         ) -> io::Result<()> {
-            let process = start_directory_agent_process(&managed_dir, &agent_home, identity)?;
+            let mut process = start_directory_agent_process(&managed_dir, &agent_home, identity)?;
+            let stdin = process
+                .stdin
+                .take()
+                .ok_or_else(|| io::Error::other("Pi Agent Runtime stdin is unavailable"))?;
+            let stdout = process
+                .stdout
+                .take()
+                .ok_or_else(|| io::Error::other("Pi Agent Runtime stdout is unavailable"))?;
             let monitor = start_directory_monitor(managed_dir.clone(), agent_home.clone())?;
             self.agents.push(RegisteredAgent {
                 identity: identity.to_string(),
                 managed_dir,
                 agent_home,
                 process,
+                stdin,
+                stdout: io::BufReader::new(stdout),
                 _monitor: monitor,
             });
             Ok(())
+        }
+    }
+
+    impl RegisteredAgent {
+        fn ask(&mut self, prompt: &str, requested_path: &Path) -> io::Result<String> {
+            writeln!(self.stdin, "ASK")?;
+            writeln!(self.stdin, "{}", requested_path.display())?;
+            writeln!(self.stdin, "{prompt}")?;
+            self.stdin.flush()?;
+
+            let mut answer = String::new();
+            self.stdout.read_line(&mut answer)?;
+            if answer.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "Pi Agent Runtime closed before answering",
+                ));
+            }
+            Ok(answer)
+        }
+    }
+
+    fn format_direct_ask_response(
+        answer: &str,
+        requested_path: &Path,
+        agent_identity: &str,
+    ) -> String {
+        let mut response = String::new();
+        response.push_str(answer);
+        if !response.ends_with('\n') {
+            response.push('\n');
+        }
+        response.push_str("references:\n");
+        response.push_str(&format!("- {}\n", requested_path.display()));
+        response.push_str("caveat: local index is warming; answer may be incomplete\n");
+        response.push_str(&format!("participating_agents: {agent_identity}\n"));
+        response.push_str("changed_files: none\n");
+        response
+    }
+
+    fn explicit_prompt_path(cwd: &Path, prompt: &str) -> io::Result<Option<PathBuf>> {
+        for token in prompt.split_whitespace() {
+            let token = token.trim_matches(|character: char| {
+                matches!(
+                    character,
+                    '"' | '\''
+                        | '`'
+                        | '('
+                        | ')'
+                        | '['
+                        | ']'
+                        | '{'
+                        | '}'
+                        | '<'
+                        | '>'
+                        | ','
+                        | ':'
+                        | ';'
+                        | '!'
+                        | '?'
+                )
+            });
+            if token.is_empty() {
+                continue;
+            }
+
+            let path = Path::new(token);
+            let candidate = if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                cwd.join(path)
+            };
+            if candidate.exists() {
+                return candidate.canonicalize().map(Some);
+            }
+        }
+
+        Ok(None)
+    }
+
+    fn install_suggestion_path(path: &Path) -> &Path {
+        if path.is_dir() {
+            path
+        } else {
+            path.parent().unwrap_or(path)
         }
     }
 
@@ -777,7 +907,8 @@ pub mod client {
     }
 
     pub fn ask(prompt: &str) -> Result<String, Error> {
-        send_request(&format!("ASK {prompt}"))
+        let cwd = std::env::current_dir().map_err(Error::Io)?;
+        send_request(&format!("ASK\t{}\t{prompt}", cwd.display()))
     }
 
     pub fn install(path: &Path) -> Result<String, Error> {
