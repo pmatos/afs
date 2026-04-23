@@ -86,6 +86,15 @@ fn stop_daemon(daemon: &mut Child) {
     daemon.wait().expect("daemon cleanup should finish");
 }
 
+fn afs_history(afs_home: &std::path::Path, managed_dir: &std::path::Path) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_afs"))
+        .env("AFS_HOME", afs_home)
+        .arg("history")
+        .arg(managed_dir)
+        .output()
+        .expect("afs history should run")
+}
+
 #[test]
 fn ask_reports_daemon_not_running_when_supervisor_socket_is_unavailable() {
     let afs_home = unique_afs_home("ask-no-daemon");
@@ -401,6 +410,305 @@ fn agents_lists_installed_directory_with_live_runtime_status() {
     assert!(
         stdout.contains("queue=0"),
         "afs agents should show Task Queue length"
+    );
+
+    stop_daemon(&mut daemon);
+}
+
+#[test]
+fn history_shows_live_external_change_recorded_from_filesystem_events() {
+    let afs_home = unique_afs_home("history-live-external-change");
+    let managed_dir = unique_afs_home("managed-live-external-change");
+    let pi_runtime = fake_pi_runtime("history-live-external-change-runtime");
+    let socket_path = supervisor_socket(&afs_home);
+    std::fs::create_dir_all(&managed_dir).expect("test should create managed directory");
+    std::fs::write(managed_dir.join("notes.txt"), "hello afs\n")
+        .expect("test should create managed file");
+    let managed_dir = managed_dir
+        .canonicalize()
+        .expect("managed directory should canonicalize");
+    let mut daemon = start_daemon_with_pi_runtime(&afs_home, &pi_runtime);
+
+    assert!(
+        wait_until(Duration::from_secs(2), || socket_path
+            .metadata()
+            .map(|metadata| metadata.file_type().is_socket())
+            .unwrap_or(false)),
+        "daemon should create the Supervisor Socket before install connects"
+    );
+
+    let install = Command::new(env!("CARGO_BIN_EXE_afs"))
+        .env("AFS_HOME", &afs_home)
+        .arg("install")
+        .arg(&managed_dir)
+        .output()
+        .expect("afs install should run");
+    assert!(install.status.success(), "afs install should succeed");
+
+    std::fs::write(managed_dir.join("notes.txt"), "hello afs\nnow tracked\n")
+        .expect("test should modify managed file");
+
+    assert!(
+        wait_until(Duration::from_secs(3), || {
+            let history = afs_history(&afs_home, &managed_dir);
+            history.status.success()
+                && String::from_utf8_lossy(&history.stdout).contains("type=external")
+        }),
+        "afs history should show the live External Change"
+    );
+
+    let history = afs_history(&afs_home, &managed_dir);
+    assert!(history.status.success(), "afs history should succeed");
+    assert_eq!(String::from_utf8_lossy(&history.stderr), "");
+    let stdout = String::from_utf8_lossy(&history.stdout);
+    assert!(
+        stdout
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .contains("timestamp="),
+        "afs history should show a timestamp"
+    );
+    assert!(
+        stdout.contains("type=external"),
+        "afs history should show the History Entry type"
+    );
+    assert!(
+        stdout.contains("summary=External change: notes.txt"),
+        "afs history should show a short summary with the affected path"
+    );
+    assert!(
+        stdout.contains("files=1"),
+        "afs history should show the affected file count"
+    );
+    assert!(
+        stdout.contains("undoable=yes"),
+        "afs history should show current undoability"
+    );
+
+    stop_daemon(&mut daemon);
+}
+
+#[test]
+fn history_normalizes_editor_atomic_save_burst_to_final_file_change() {
+    let afs_home = unique_afs_home("history-editor-save");
+    let managed_dir = unique_afs_home("managed-editor-save");
+    let pi_runtime = fake_pi_runtime("history-editor-save-runtime");
+    let socket_path = supervisor_socket(&afs_home);
+    std::fs::create_dir_all(&managed_dir).expect("test should create managed directory");
+    std::fs::write(managed_dir.join("notes.txt"), "before\n")
+        .expect("test should create managed file");
+    let managed_dir = managed_dir
+        .canonicalize()
+        .expect("managed directory should canonicalize");
+    let mut daemon = start_daemon_with_pi_runtime(&afs_home, &pi_runtime);
+
+    assert!(
+        wait_until(Duration::from_secs(2), || socket_path
+            .metadata()
+            .map(|metadata| metadata.file_type().is_socket())
+            .unwrap_or(false)),
+        "daemon should create the Supervisor Socket before install connects"
+    );
+
+    let install = Command::new(env!("CARGO_BIN_EXE_afs"))
+        .env("AFS_HOME", &afs_home)
+        .arg("install")
+        .arg(&managed_dir)
+        .output()
+        .expect("afs install should run");
+    assert!(install.status.success(), "afs install should succeed");
+
+    let temp_file = managed_dir.join(".notes.txt.swp");
+    std::fs::write(&temp_file, "after\n").expect("editor temp file should be written");
+    std::fs::rename(&temp_file, managed_dir.join("notes.txt"))
+        .expect("editor save should atomically replace final file");
+
+    assert!(
+        wait_until(Duration::from_secs(3), || {
+            let history = afs_history(&afs_home, &managed_dir);
+            history.status.success()
+                && String::from_utf8_lossy(&history.stdout).contains("type=external")
+        }),
+        "afs history should show the normalized External Change"
+    );
+
+    let history = afs_history(&afs_home, &managed_dir);
+    assert!(history.status.success(), "afs history should succeed");
+    let stdout = String::from_utf8_lossy(&history.stdout);
+    let entries = stdout.lines().collect::<Vec<_>>();
+    assert_eq!(
+        entries.len(),
+        1,
+        "editor save burst should become one History Entry"
+    );
+    assert!(
+        entries[0].contains("summary=External change: notes.txt"),
+        "history should describe the final saved path"
+    );
+    assert!(
+        !entries[0].contains(".notes.txt.swp"),
+        "history should not expose the removed editor temp file"
+    );
+    assert!(
+        entries[0].contains("files=1"),
+        "history should count only the final file"
+    );
+
+    stop_daemon(&mut daemon);
+}
+
+#[test]
+fn restart_reconciliation_records_missed_changes_as_one_history_batch() {
+    let afs_home = unique_afs_home("history-reconciliation");
+    let managed_dir = unique_afs_home("managed-reconciliation");
+    let pi_runtime = fake_pi_runtime("history-reconciliation-runtime");
+    let socket_path = supervisor_socket(&afs_home);
+    std::fs::create_dir_all(&managed_dir).expect("test should create managed directory");
+    std::fs::write(managed_dir.join("notes.txt"), "before\n")
+        .expect("test should create managed file");
+    let managed_dir = managed_dir
+        .canonicalize()
+        .expect("managed directory should canonicalize");
+    let mut daemon = start_daemon_with_pi_runtime(&afs_home, &pi_runtime);
+
+    assert!(
+        wait_until(Duration::from_secs(2), || socket_path
+            .metadata()
+            .map(|metadata| metadata.file_type().is_socket())
+            .unwrap_or(false)),
+        "daemon should create the Supervisor Socket before install connects"
+    );
+
+    let install = Command::new(env!("CARGO_BIN_EXE_afs"))
+        .env("AFS_HOME", &afs_home)
+        .arg("install")
+        .arg(&managed_dir)
+        .output()
+        .expect("afs install should run");
+    assert!(install.status.success(), "afs install should succeed");
+
+    stop_daemon(&mut daemon);
+
+    std::fs::write(managed_dir.join("offline-a.txt"), "created while stopped\n")
+        .expect("test should create first offline change");
+    std::fs::write(
+        managed_dir.join("offline-b.txt"),
+        "also created while stopped\n",
+    )
+    .expect("test should create second offline change");
+
+    let mut restarted_daemon = start_daemon_with_pi_runtime(&afs_home, &pi_runtime);
+
+    assert!(
+        wait_until(Duration::from_secs(3), || {
+            let agents = Command::new(env!("CARGO_BIN_EXE_afs"))
+                .env("AFS_HOME", &afs_home)
+                .arg("agents")
+                .output()
+                .expect("afs agents should run");
+            agents.status.success()
+                && String::from_utf8_lossy(&agents.stdout).contains("reconciliation=idle")
+        }),
+        "restarted agent should finish Startup Reconciliation before reporting idle"
+    );
+
+    let history = afs_history(&afs_home, &managed_dir);
+    assert!(history.status.success(), "afs history should succeed");
+    assert_eq!(String::from_utf8_lossy(&history.stderr), "");
+    let stdout = String::from_utf8_lossy(&history.stdout);
+    let entries = stdout.lines().collect::<Vec<_>>();
+    assert_eq!(
+        entries.len(),
+        1,
+        "missed offline changes should become one reconciliation History Entry"
+    );
+    assert!(
+        entries[0].contains("type=reconciliation"),
+        "history should identify the Startup Reconciliation entry"
+    );
+    assert!(
+        entries[0].contains("summary=Startup reconciliation: 2 files changed"),
+        "history should summarize the reconciliation batch"
+    );
+    assert!(
+        entries[0].contains("files=2"),
+        "history should show the batch affected file count"
+    );
+    assert!(
+        entries[0].contains("undoable=yes"),
+        "history should show reconciliation undoability"
+    );
+
+    stop_daemon(&mut restarted_daemon);
+}
+
+#[test]
+fn history_lists_newest_entries_first() {
+    let afs_home = unique_afs_home("history-newest-first");
+    let managed_dir = unique_afs_home("managed-newest-first");
+    let pi_runtime = fake_pi_runtime("history-newest-first-runtime");
+    let socket_path = supervisor_socket(&afs_home);
+    std::fs::create_dir_all(&managed_dir).expect("test should create managed directory");
+    let managed_dir = managed_dir
+        .canonicalize()
+        .expect("managed directory should canonicalize");
+    let mut daemon = start_daemon_with_pi_runtime(&afs_home, &pi_runtime);
+
+    assert!(
+        wait_until(Duration::from_secs(2), || socket_path
+            .metadata()
+            .map(|metadata| metadata.file_type().is_socket())
+            .unwrap_or(false)),
+        "daemon should create the Supervisor Socket before install connects"
+    );
+
+    let install = Command::new(env!("CARGO_BIN_EXE_afs"))
+        .env("AFS_HOME", &afs_home)
+        .arg("install")
+        .arg(&managed_dir)
+        .output()
+        .expect("afs install should run");
+    assert!(install.status.success(), "afs install should succeed");
+
+    std::fs::write(managed_dir.join("first.txt"), "first\n")
+        .expect("test should create first managed change");
+    assert!(
+        wait_until(Duration::from_secs(3), || {
+            let history = afs_history(&afs_home, &managed_dir);
+            history.status.success()
+                && String::from_utf8_lossy(&history.stdout).contains("first.txt")
+        }),
+        "first External Change should reach history"
+    );
+
+    std::fs::write(managed_dir.join("second.txt"), "second\n")
+        .expect("test should create second managed change");
+    assert!(
+        wait_until(Duration::from_secs(3), || {
+            let history = afs_history(&afs_home, &managed_dir);
+            let stdout = String::from_utf8_lossy(&history.stdout);
+            history.status.success()
+                && stdout.lines().count() == 2
+                && stdout
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .contains("second.txt")
+        }),
+        "newest External Change should appear first"
+    );
+
+    let history = afs_history(&afs_home, &managed_dir);
+    let stdout = String::from_utf8_lossy(&history.stdout);
+    let entries = stdout.lines().collect::<Vec<_>>();
+    assert!(
+        entries[0].contains("second.txt"),
+        "newest history entry should be first"
+    );
+    assert!(
+        entries[1].contains("first.txt"),
+        "older history entry should follow"
     );
 
     stop_daemon(&mut daemon);

@@ -72,6 +72,31 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        Some("history") => {
+            let Some(path) = args.next() else {
+                eprintln!("usage: afs history <path>");
+                return ExitCode::FAILURE;
+            };
+
+            match afs::client::history(std::path::Path::new(&path)) {
+                Ok(response) => {
+                    print!("{response}");
+                    ExitCode::SUCCESS
+                }
+                Err(afs::client::Error::DaemonNotRunning) => {
+                    eprintln!("daemon is not running");
+                    ExitCode::FAILURE
+                }
+                Err(afs::client::Error::Supervisor(message)) => {
+                    eprintln!("{message}");
+                    ExitCode::FAILURE
+                }
+                Err(afs::client::Error::Io(error)) => {
+                    eprintln!("{error}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         _ => ExitCode::SUCCESS,
     }
 }
