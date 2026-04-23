@@ -18,6 +18,8 @@ pub mod supervisor {
     const BASELINE_FILE: &str = "baseline.tsv";
     const SNAPSHOT_FILE: &str = "snapshot.tsv";
     const ENTRIES_FILE: &str = "entries.tsv";
+    const CONTENT_SNAPSHOT_DIR: &str = "content-snapshot";
+    const ENTRY_DATA_DIR: &str = "entry-data";
     const REGISTRY_FILE: &str = "registry.tsv";
     const PI_RUNTIME_ENV: &str = "AFS_PI_RUNTIME";
     const SETTLE_WINDOW: Duration = Duration::from_millis(150);
@@ -119,6 +121,27 @@ pub mod supervisor {
             state.agents()
         } else if let Some(path) = request.strip_prefix("HISTORY ") {
             state.history(Path::new(path))
+        } else if let Some(payload) = request.strip_prefix("UNDO\t") {
+            let mut fields = payload.splitn(3, '\t');
+            let Some(path) = fields.next() else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "UNDO request is missing path",
+                ));
+            };
+            let Some(history_entry) = fields.next() else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "UNDO request is missing history entry",
+                ));
+            };
+            let Some(confirmed) = fields.next() else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "UNDO request is missing confirmation mode",
+                ));
+            };
+            state.undo(Path::new(path), history_entry, confirmed == "yes")
         } else {
             Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -176,6 +199,7 @@ pub mod supervisor {
                 std::fs::write(baseline_path, baseline)?;
             }
             ensure_history_snapshot(&managed_dir, &agent_home)?;
+            ensure_content_snapshot(&managed_dir, &agent_home)?;
 
             if !self
                 .agents
@@ -229,6 +253,29 @@ pub mod supervisor {
             };
 
             format_history(&self.agents[agent_index].agent_home)
+        }
+
+        fn undo(
+            &mut self,
+            path: &Path,
+            history_entry: &str,
+            confirmed: bool,
+        ) -> io::Result<String> {
+            let requested_path = path.canonicalize()?;
+            let Some(agent_index) = self.owning_agent_index(&requested_path) else {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "path is not managed",
+                ));
+            };
+
+            let agent = &self.agents[agent_index];
+            undo_history_entry(
+                &agent.managed_dir,
+                &agent.agent_home,
+                history_entry,
+                confirmed,
+            )
         }
 
         fn ask(&mut self, cwd: &Path, prompt: &str) -> io::Result<String> {
@@ -497,6 +544,15 @@ pub mod supervisor {
         write_snapshot(&snapshot_path, &snapshot)
     }
 
+    fn ensure_content_snapshot(managed_dir: &Path, agent_home: &Path) -> io::Result<()> {
+        let snapshot_dir = content_snapshot_dir(agent_home);
+        if snapshot_dir.exists() {
+            return Ok(());
+        }
+
+        refresh_content_snapshot(managed_dir, agent_home)
+    }
+
     fn start_directory_monitor(
         managed_dir: PathBuf,
         agent_home: PathBuf,
@@ -622,8 +678,18 @@ pub mod supervisor {
             return Ok(());
         }
 
-        append_history_entry(agent_home, kind, summary_prefix, &changed_files)?;
-        write_snapshot(&snapshot_path, &current)
+        let entry_id = history_entry_id();
+        let undoable = stage_undo_snapshot(agent_home, &entry_id)?;
+        append_history_entry(
+            agent_home,
+            &entry_id,
+            kind,
+            summary_prefix,
+            &changed_files,
+            undoable,
+        )?;
+        write_snapshot(&snapshot_path, &current)?;
+        refresh_content_snapshot(managed_dir, agent_home)
     }
 
     fn changed_files(previous: &Snapshot, current: &Snapshot) -> Vec<String> {
@@ -638,9 +704,11 @@ pub mod supervisor {
 
     fn append_history_entry(
         agent_home: &Path,
+        id: &str,
         kind: &str,
         summary_prefix: &str,
         files: &[String],
+        undoable: bool,
     ) -> io::Result<()> {
         let history_dir = agent_home.join(HISTORY_DIR);
         std::fs::create_dir_all(&history_dir)?;
@@ -653,12 +721,13 @@ pub mod supervisor {
         let summary = history_summary(summary_prefix, files);
         writeln!(
             entries,
-            "{}\t{}\t{}\t{}\t{}\tyes\t{}",
-            history_entry_id(),
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            id,
             timestamp,
             kind,
             sanitize_field(&summary),
             files.len(),
+            undoable_field(undoable),
             sanitize_field(&files.join(", "))
         )
     }
@@ -675,15 +744,7 @@ pub mod supervisor {
         let _guard = history_lock()
             .lock()
             .map_err(|_| io::Error::other("history lock poisoned"))?;
-        let entries_path = agent_home.join(HISTORY_DIR).join(ENTRIES_FILE);
-        if !entries_path.exists() {
-            return Ok("no history entries\n".to_string());
-        }
-
-        let mut entries = std::fs::read_to_string(entries_path)?
-            .lines()
-            .filter_map(parse_history_entry)
-            .collect::<Vec<_>>();
+        let mut entries = read_history_entries(agent_home)?;
         entries.reverse();
 
         if entries.is_empty() {
@@ -693,19 +754,39 @@ pub mod supervisor {
         let mut output = String::new();
         for entry in entries {
             output.push_str(&format!(
-                "timestamp={} type={} summary={} files={} undoable={}\n",
-                entry.timestamp, entry.kind, entry.summary, entry.file_count, entry.undoable
+                "entry={} timestamp={} type={} summary={} files={} undoable={}\n",
+                entry.id,
+                entry.timestamp,
+                entry.kind,
+                entry.summary,
+                entry.file_count,
+                undoable_field(entry.undoable)
             ));
         }
         Ok(output)
     }
 
+    #[derive(Clone)]
     struct HistoryEntry {
+        id: String,
         timestamp: String,
         kind: String,
         summary: String,
         file_count: usize,
-        undoable: String,
+        undoable: bool,
+        files: Vec<String>,
+    }
+
+    fn read_history_entries(agent_home: &Path) -> io::Result<Vec<HistoryEntry>> {
+        let entries_path = agent_home.join(HISTORY_DIR).join(ENTRIES_FILE);
+        if !entries_path.exists() {
+            return Ok(Vec::new());
+        }
+
+        Ok(std::fs::read_to_string(entries_path)?
+            .lines()
+            .filter_map(parse_history_entry)
+            .collect())
     }
 
     fn parse_history_entry(line: &str) -> Option<HistoryEntry> {
@@ -715,12 +796,267 @@ pub mod supervisor {
         }
 
         Some(HistoryEntry {
+            id: fields[0].to_string(),
             timestamp: fields[1].to_string(),
             kind: fields[2].to_string(),
             summary: fields[3].to_string(),
             file_count: fields[4].parse().ok()?,
-            undoable: fields[5].to_string(),
+            undoable: fields[5] == "yes",
+            files: files_field(fields[6]),
         })
+    }
+
+    fn files_field(field: &str) -> Vec<String> {
+        if field.is_empty() {
+            return Vec::new();
+        }
+
+        field.split(", ").map(ToOwned::to_owned).collect()
+    }
+
+    fn undoable_field(undoable: bool) -> &'static str {
+        if undoable { "yes" } else { "no" }
+    }
+
+    fn undo_history_entry(
+        managed_dir: &Path,
+        agent_home: &Path,
+        requested_entry: &str,
+        confirmed: bool,
+    ) -> io::Result<String> {
+        let _guard = history_lock()
+            .lock()
+            .map_err(|_| io::Error::other("history lock poisoned"))?;
+        let mut entries = read_history_entries(agent_home)?;
+        let Some(latest_index) = entries.iter().rposition(|entry| entry.undoable) else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "no undoable history entries",
+            ));
+        };
+
+        let latest = entries[latest_index].clone();
+        if latest.id != requested_entry {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "only the latest undoable history entry can be undone: {}",
+                    latest.id
+                ),
+            ));
+        }
+
+        if history_entry_requires_confirmation(&latest) && !confirmed {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "undoing an External Change requires --yes in scripted use or interactive confirmation",
+            ));
+        }
+
+        let before_snapshot = entry_before_snapshot_dir(agent_home, &latest.id);
+        if !before_snapshot.is_dir() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "history entry is not undoable",
+            ));
+        }
+
+        restore_managed_content_from_snapshot(&before_snapshot, managed_dir)?;
+        let snapshot = collect_file_snapshot(managed_dir)?;
+        write_snapshot(&agent_home.join(HISTORY_DIR).join(SNAPSHOT_FILE), &snapshot)?;
+        refresh_content_snapshot(managed_dir, agent_home)?;
+
+        entries[latest_index].undoable = false;
+        entries.push(HistoryEntry {
+            id: history_entry_id(),
+            timestamp: unix_timestamp(),
+            kind: "undo".to_string(),
+            summary: sanitize_field(&format!("Undo {}: {}", latest.id, latest.summary)),
+            file_count: latest.file_count,
+            undoable: false,
+            files: latest.files,
+        });
+        write_history_entries(agent_home, &entries)?;
+
+        Ok(format!(
+            "undid history entry {}\nfiles={}\n",
+            latest.id, latest.file_count
+        ))
+    }
+
+    fn history_entry_requires_confirmation(entry: &HistoryEntry) -> bool {
+        matches!(entry.kind.as_str(), "external" | "reconciliation")
+    }
+
+    fn write_history_entries(agent_home: &Path, entries: &[HistoryEntry]) -> io::Result<()> {
+        let history_dir = agent_home.join(HISTORY_DIR);
+        std::fs::create_dir_all(&history_dir)?;
+
+        let mut output = String::new();
+        for entry in entries {
+            output.push_str(&format!(
+                "{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                entry.id,
+                entry.timestamp,
+                entry.kind,
+                sanitize_field(&entry.summary),
+                entry.file_count,
+                undoable_field(entry.undoable),
+                sanitize_field(&entry.files.join(", "))
+            ));
+        }
+
+        std::fs::write(history_dir.join(ENTRIES_FILE), output)
+    }
+
+    fn stage_undo_snapshot(agent_home: &Path, entry_id: &str) -> io::Result<bool> {
+        let current_snapshot = content_snapshot_dir(agent_home);
+        if !current_snapshot.is_dir() {
+            return Ok(false);
+        }
+
+        replace_dir_from_dir(
+            &current_snapshot,
+            &entry_before_snapshot_dir(agent_home, entry_id),
+        )?;
+        Ok(true)
+    }
+
+    fn refresh_content_snapshot(managed_dir: &Path, agent_home: &Path) -> io::Result<()> {
+        replace_dir_from_managed_dir(managed_dir, &content_snapshot_dir(agent_home))
+    }
+
+    fn content_snapshot_dir(agent_home: &Path) -> PathBuf {
+        agent_home.join(HISTORY_DIR).join(CONTENT_SNAPSHOT_DIR)
+    }
+
+    fn entry_before_snapshot_dir(agent_home: &Path, entry_id: &str) -> PathBuf {
+        agent_home
+            .join(HISTORY_DIR)
+            .join(ENTRY_DATA_DIR)
+            .join(entry_id)
+            .join("before")
+    }
+
+    fn replace_dir_from_managed_dir(source: &Path, destination: &Path) -> io::Result<()> {
+        let temporary = temporary_replacement_path(destination);
+        if temporary.exists() {
+            std::fs::remove_dir_all(&temporary)?;
+        }
+        std::fs::create_dir_all(&temporary)?;
+        copy_managed_dir_contents(source, source, &temporary)?;
+        replace_dir(destination, &temporary)
+    }
+
+    fn replace_dir_from_dir(source: &Path, destination: &Path) -> io::Result<()> {
+        let temporary = temporary_replacement_path(destination);
+        if temporary.exists() {
+            std::fs::remove_dir_all(&temporary)?;
+        }
+        std::fs::create_dir_all(&temporary)?;
+        copy_dir_contents(source, &temporary)?;
+        replace_dir(destination, &temporary)
+    }
+
+    fn replace_dir(destination: &Path, temporary: &Path) -> io::Result<()> {
+        if destination.exists() {
+            std::fs::remove_dir_all(destination)?;
+        }
+        if let Some(parent) = destination.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::rename(temporary, destination)
+    }
+
+    fn temporary_replacement_path(destination: &Path) -> PathBuf {
+        let name = destination
+            .file_name()
+            .map(|name| name.to_string_lossy())
+            .unwrap_or_else(|| "snapshot".into());
+        destination.with_file_name(format!(
+            ".{name}.tmp-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|duration| duration.as_nanos())
+                .unwrap_or(0)
+        ))
+    }
+
+    fn restore_managed_content_from_snapshot(
+        snapshot_dir: &Path,
+        managed_dir: &Path,
+    ) -> io::Result<()> {
+        remove_managed_content(managed_dir)?;
+        copy_dir_contents(snapshot_dir, managed_dir)
+    }
+
+    fn remove_managed_content(managed_dir: &Path) -> io::Result<()> {
+        let agent_home = managed_dir.join(AGENT_HOME_DIR);
+        for entry in std::fs::read_dir(managed_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path == agent_home {
+                continue;
+            }
+
+            let metadata = entry.metadata()?;
+            if metadata.is_dir() {
+                std::fs::remove_dir_all(path)?;
+            } else {
+                std::fs::remove_file(path)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn copy_managed_dir_contents(
+        managed_dir: &Path,
+        current_dir: &Path,
+        destination: &Path,
+    ) -> io::Result<()> {
+        for entry in std::fs::read_dir(current_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path == managed_dir.join(AGENT_HOME_DIR) {
+                continue;
+            }
+
+            let target = destination.join(entry.file_name());
+            let metadata = entry.metadata()?;
+            if metadata.is_dir() {
+                std::fs::create_dir_all(&target)?;
+                copy_managed_dir_contents(managed_dir, &path, &target)?;
+            } else if metadata.is_file() {
+                if let Some(parent) = target.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::copy(&path, target)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn copy_dir_contents(source: &Path, destination: &Path) -> io::Result<()> {
+        for entry in std::fs::read_dir(source)? {
+            let entry = entry?;
+            let path = entry.path();
+            let target = destination.join(entry.file_name());
+            let metadata = entry.metadata()?;
+            if metadata.is_dir() {
+                std::fs::create_dir_all(&target)?;
+                copy_dir_contents(&path, &target)?;
+            } else if metadata.is_file() {
+                if let Some(parent) = target.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::copy(&path, target)?;
+            }
+        }
+
+        Ok(())
     }
 
     fn unix_timestamp() -> String {
@@ -931,6 +1267,21 @@ pub mod client {
             std::env::current_dir().map_err(Error::Io)?.join(path)
         };
         send_request(&format!("HISTORY {}", path.display()))
+    }
+
+    pub fn undo(path: &Path, history_entry: &str, confirmed: bool) -> Result<String, Error> {
+        let path = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir().map_err(Error::Io)?.join(path)
+        };
+        let confirmation = if confirmed { "yes" } else { "no" };
+        send_request(&format!(
+            "UNDO\t{}\t{}\t{}",
+            path.display(),
+            history_entry,
+            confirmation
+        ))
     }
 
     fn send_request(request: &str) -> Result<String, Error> {

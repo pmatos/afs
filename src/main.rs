@@ -1,3 +1,4 @@
+use std::io::{self, IsTerminal, Write};
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
@@ -97,6 +98,54 @@ fn main() -> ExitCode {
                 }
             }
         }
+        Some("undo") => {
+            let Some(path) = args.next() else {
+                eprintln!("usage: afs undo <path> <history-entry> [--yes]");
+                return ExitCode::FAILURE;
+            };
+            let Some(history_entry) = args.next() else {
+                eprintln!("usage: afs undo <path> <history-entry> [--yes]");
+                return ExitCode::FAILURE;
+            };
+
+            let confirmed = args.any(|argument| argument == "--yes" || argument == "-y")
+                || confirm_interactive_undo(&history_entry);
+
+            match afs::client::undo(std::path::Path::new(&path), &history_entry, confirmed) {
+                Ok(response) => {
+                    print!("{response}");
+                    ExitCode::SUCCESS
+                }
+                Err(afs::client::Error::DaemonNotRunning) => {
+                    eprintln!("daemon is not running");
+                    ExitCode::FAILURE
+                }
+                Err(afs::client::Error::Supervisor(message)) => {
+                    eprintln!("{message}");
+                    ExitCode::FAILURE
+                }
+                Err(afs::client::Error::Io(error)) => {
+                    eprintln!("{error}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         _ => ExitCode::SUCCESS,
     }
+}
+
+fn confirm_interactive_undo(history_entry: &str) -> bool {
+    if !io::stdin().is_terminal() {
+        return false;
+    }
+
+    print!("Undo history entry {history_entry}? [y/N] ");
+    let _ = io::stdout().flush();
+
+    let mut answer = String::new();
+    if io::stdin().read_line(&mut answer).is_err() {
+        return false;
+    }
+
+    matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
 }

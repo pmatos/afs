@@ -103,6 +103,13 @@ fn afs_history(afs_home: &std::path::Path, managed_dir: &std::path::Path) -> std
         .expect("afs history should run")
 }
 
+fn history_entry_id(history_line: &str) -> &str {
+    history_line
+        .split_whitespace()
+        .find_map(|field| field.strip_prefix("entry="))
+        .expect("history output should include an entry id")
+}
+
 fn afs_ask(afs_home: &std::path::Path, prompt: &str) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_afs"))
         .env("AFS_HOME", afs_home)
@@ -157,6 +164,273 @@ fn daemon_creates_supervisor_home_and_owns_socket_in_foreground() {
             .expect("daemon status should be readable")
             .is_none(),
         "afs daemon should keep running in the foreground"
+    );
+
+    stop_daemon(&mut daemon);
+}
+
+#[test]
+fn undo_external_change_requires_yes_in_scripted_use() {
+    let afs_home = unique_afs_home("undo-external-requires-yes");
+    let managed_dir = unique_afs_home("managed-undo-external-requires-yes");
+    let pi_runtime = fake_pi_runtime("undo-external-requires-yes-runtime");
+    let socket_path = supervisor_socket(&afs_home);
+    std::fs::create_dir_all(&managed_dir).expect("test should create managed directory");
+    let target_file = managed_dir.join("notes.txt");
+    std::fs::write(&target_file, "before\n").expect("test should create managed file");
+    let managed_dir = managed_dir
+        .canonicalize()
+        .expect("managed directory should canonicalize");
+    let target_file = target_file
+        .canonicalize()
+        .expect("target file should canonicalize");
+    let mut daemon = start_daemon_with_pi_runtime(&afs_home, &pi_runtime);
+
+    assert!(
+        wait_until(Duration::from_secs(2), || socket_path
+            .metadata()
+            .map(|metadata| metadata.file_type().is_socket())
+            .unwrap_or(false)),
+        "daemon should create the Supervisor Socket before install connects"
+    );
+
+    let install = Command::new(env!("CARGO_BIN_EXE_afs"))
+        .env("AFS_HOME", &afs_home)
+        .arg("install")
+        .arg(&managed_dir)
+        .output()
+        .expect("afs install should run");
+    assert!(install.status.success(), "afs install should succeed");
+
+    std::fs::write(&target_file, "after\n").expect("test should modify managed file");
+    assert!(
+        wait_until(Duration::from_secs(3), || {
+            let history = afs_history(&afs_home, &managed_dir);
+            history.status.success()
+                && String::from_utf8_lossy(&history.stdout).contains("type=external")
+        }),
+        "afs history should show the External Change"
+    );
+
+    let history = afs_history(&afs_home, &managed_dir);
+    let stdout = String::from_utf8_lossy(&history.stdout);
+    let entry = history_entry_id(stdout.lines().next().expect("history should have an entry"));
+    let undo = Command::new(env!("CARGO_BIN_EXE_afs"))
+        .env("AFS_HOME", &afs_home)
+        .arg("undo")
+        .arg(&managed_dir)
+        .arg(entry)
+        .output()
+        .expect("afs undo should run");
+
+    assert!(
+        !undo.status.success(),
+        "scripted undo of an External Change should require --yes"
+    );
+    assert_eq!(String::from_utf8_lossy(&undo.stdout), "");
+    assert!(
+        String::from_utf8_lossy(&undo.stderr).contains("requires --yes"),
+        "afs undo should explain the scripted confirmation requirement"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&target_file).expect("target file should be readable"),
+        "after\n",
+        "failed undo should leave the filesystem unchanged"
+    );
+
+    stop_daemon(&mut daemon);
+}
+
+#[test]
+fn undo_latest_external_change_with_yes_restores_file_and_records_reversal() {
+    let afs_home = unique_afs_home("undo-external-with-yes");
+    let managed_dir = unique_afs_home("managed-undo-external-with-yes");
+    let pi_runtime = fake_pi_runtime("undo-external-with-yes-runtime");
+    let socket_path = supervisor_socket(&afs_home);
+    std::fs::create_dir_all(&managed_dir).expect("test should create managed directory");
+    let target_file = managed_dir.join("notes.txt");
+    std::fs::write(&target_file, "before\n").expect("test should create managed file");
+    let managed_dir = managed_dir
+        .canonicalize()
+        .expect("managed directory should canonicalize");
+    let target_file = target_file
+        .canonicalize()
+        .expect("target file should canonicalize");
+    let mut daemon = start_daemon_with_pi_runtime(&afs_home, &pi_runtime);
+
+    assert!(
+        wait_until(Duration::from_secs(2), || socket_path
+            .metadata()
+            .map(|metadata| metadata.file_type().is_socket())
+            .unwrap_or(false)),
+        "daemon should create the Supervisor Socket before install connects"
+    );
+
+    let install = Command::new(env!("CARGO_BIN_EXE_afs"))
+        .env("AFS_HOME", &afs_home)
+        .arg("install")
+        .arg(&managed_dir)
+        .output()
+        .expect("afs install should run");
+    assert!(install.status.success(), "afs install should succeed");
+
+    std::fs::write(&target_file, "after\n").expect("test should modify managed file");
+    assert!(
+        wait_until(Duration::from_secs(3), || {
+            let history = afs_history(&afs_home, &managed_dir);
+            history.status.success()
+                && String::from_utf8_lossy(&history.stdout).contains("type=external")
+        }),
+        "afs history should show the External Change"
+    );
+
+    let history = afs_history(&afs_home, &managed_dir);
+    let stdout = String::from_utf8_lossy(&history.stdout);
+    let entry = history_entry_id(stdout.lines().next().expect("history should have an entry"));
+    let undo = Command::new(env!("CARGO_BIN_EXE_afs"))
+        .env("AFS_HOME", &afs_home)
+        .arg("undo")
+        .arg(&managed_dir)
+        .arg(entry)
+        .arg("--yes")
+        .output()
+        .expect("afs undo should run");
+
+    assert!(undo.status.success(), "afs undo --yes should succeed");
+    assert_eq!(String::from_utf8_lossy(&undo.stderr), "");
+    assert!(
+        String::from_utf8_lossy(&undo.stdout).contains(&format!("undid history entry {entry}")),
+        "afs undo should report the undone History Entry"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&target_file).expect("target file should be readable"),
+        "before\n",
+        "undo should restore the previous file contents"
+    );
+
+    assert!(
+        wait_until(Duration::from_secs(3), || {
+            let history = afs_history(&afs_home, &managed_dir);
+            history.status.success()
+                && String::from_utf8_lossy(&history.stdout).contains("type=undo")
+        }),
+        "afs history should show the Undo History Entry"
+    );
+    let history = afs_history(&afs_home, &managed_dir);
+    assert!(history.status.success(), "afs history should succeed");
+    let stdout = String::from_utf8_lossy(&history.stdout);
+    let entries = stdout.lines().collect::<Vec<_>>();
+    assert!(
+        entries[0].contains("type=undo"),
+        "undo should be the newest History Entry"
+    );
+    assert!(
+        entries[0].contains(&format!("summary=Undo {entry}: External change: notes.txt")),
+        "undo history should name the reversed entry"
+    );
+    assert!(
+        entries[0].contains("undoable=no"),
+        "undo entries should not be undoable"
+    );
+    assert!(
+        entries
+            .iter()
+            .any(|line| line.contains(&format!("entry={entry}"))
+                && line.contains("type=external")
+                && line.contains("undoable=no")),
+        "the reversed External Change should no longer be undoable"
+    );
+
+    stop_daemon(&mut daemon);
+}
+
+#[test]
+fn undo_rejects_non_latest_history_entry_without_changing_files() {
+    let afs_home = unique_afs_home("undo-non-latest");
+    let managed_dir = unique_afs_home("managed-undo-non-latest");
+    let pi_runtime = fake_pi_runtime("undo-non-latest-runtime");
+    let socket_path = supervisor_socket(&afs_home);
+    std::fs::create_dir_all(&managed_dir).expect("test should create managed directory");
+    let managed_dir = managed_dir
+        .canonicalize()
+        .expect("managed directory should canonicalize");
+    let first_file = managed_dir.join("first.txt");
+    let second_file = managed_dir.join("second.txt");
+    let mut daemon = start_daemon_with_pi_runtime(&afs_home, &pi_runtime);
+
+    assert!(
+        wait_until(Duration::from_secs(2), || socket_path
+            .metadata()
+            .map(|metadata| metadata.file_type().is_socket())
+            .unwrap_or(false)),
+        "daemon should create the Supervisor Socket before install connects"
+    );
+
+    let install = Command::new(env!("CARGO_BIN_EXE_afs"))
+        .env("AFS_HOME", &afs_home)
+        .arg("install")
+        .arg(&managed_dir)
+        .output()
+        .expect("afs install should run");
+    assert!(install.status.success(), "afs install should succeed");
+
+    std::fs::write(&first_file, "first\n").expect("test should create first changed file");
+    assert!(
+        wait_until(Duration::from_secs(3), || {
+            let history = afs_history(&afs_home, &managed_dir);
+            history.status.success()
+                && String::from_utf8_lossy(&history.stdout).contains("first.txt")
+        }),
+        "first External Change should reach history"
+    );
+
+    std::fs::write(&second_file, "second\n").expect("test should create second changed file");
+    assert!(
+        wait_until(Duration::from_secs(3), || {
+            let history = afs_history(&afs_home, &managed_dir);
+            let stdout = String::from_utf8_lossy(&history.stdout);
+            history.status.success()
+                && stdout.lines().count() == 2
+                && stdout
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .contains("second.txt")
+        }),
+        "second External Change should become the newest history entry"
+    );
+
+    let history = afs_history(&afs_home, &managed_dir);
+    let stdout = String::from_utf8_lossy(&history.stdout);
+    let entries = stdout.lines().collect::<Vec<_>>();
+    let older_entry = history_entry_id(entries[1]);
+    let undo = Command::new(env!("CARGO_BIN_EXE_afs"))
+        .env("AFS_HOME", &afs_home)
+        .arg("undo")
+        .arg(&managed_dir)
+        .arg(older_entry)
+        .arg("--yes")
+        .output()
+        .expect("afs undo should run");
+
+    assert!(
+        !undo.status.success(),
+        "afs undo should reject non-latest History Entries"
+    );
+    assert_eq!(String::from_utf8_lossy(&undo.stdout), "");
+    assert!(
+        String::from_utf8_lossy(&undo.stderr).contains("only the latest undoable"),
+        "afs undo should explain the latest-only restriction"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&first_file).expect("first file should be readable"),
+        "first\n",
+        "rejected undo should leave the older file as-is"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&second_file).expect("second file should be readable"),
+        "second\n",
+        "rejected undo should leave the latest file as-is"
     );
 
     stop_daemon(&mut daemon);
