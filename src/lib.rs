@@ -3,6 +3,7 @@ pub mod supervisor {
     use std::collections::{BTreeMap, BTreeSet};
     use std::fs::OpenOptions;
     use std::io::{self, BufRead, Read, Write};
+    use std::os::fd::AsRawFd;
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::{Path, PathBuf};
     use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
@@ -22,6 +23,8 @@ pub mod supervisor {
     const ENTRY_DATA_DIR: &str = "entry-data";
     const REGISTRY_FILE: &str = "registry.tsv";
     const PI_RUNTIME_ENV: &str = "AFS_PI_RUNTIME";
+    const BROADCAST_REPLY_TIMEOUT_ENV: &str = "AFS_BROADCAST_REPLY_TIMEOUT_MS";
+    const DEFAULT_BROADCAST_REPLY_TIMEOUT: Duration = Duration::from_secs(2);
     const SETTLE_WINDOW: Duration = Duration::from_millis(150);
 
     pub fn run_foreground() -> io::Result<()> {
@@ -84,7 +87,7 @@ pub mod supervisor {
         agent_home: PathBuf,
         process: Child,
         stdin: ChildStdin,
-        stdout: io::BufReader<ChildStdout>,
+        stdout: ChildStdout,
         _monitor: thread::JoinHandle<()>,
     }
 
@@ -280,7 +283,7 @@ pub mod supervisor {
 
         fn ask(&mut self, cwd: &Path, prompt: &str) -> io::Result<String> {
             let Some(requested_path) = explicit_prompt_path(cwd, prompt)? else {
-                return Ok("ask handling not implemented yet\n".to_string());
+                return self.broadcast_ask(prompt);
             };
             let Some(agent_index) = self.owning_agent_index(&requested_path) else {
                 return Err(io::Error::new(
@@ -300,6 +303,51 @@ pub mod supervisor {
                 &requested_path,
                 &agent.identity,
             ))
+        }
+
+        fn broadcast_ask(&mut self, prompt: &str) -> io::Result<String> {
+            let timeout = broadcast_reply_timeout();
+            if self.agents.is_empty() {
+                return Ok(format_broadcast_ask_response(&[], timeout));
+            }
+
+            for agent in &mut self.agents {
+                agent.send_broadcast(prompt)?;
+                set_nonblocking(&agent.stdout, true)?;
+            }
+
+            let deadline = Instant::now() + timeout;
+            let mut pending = (0..self.agents.len()).collect::<BTreeSet<_>>();
+            let mut buffers = vec![Vec::new(); self.agents.len()];
+            let mut replies = Vec::new();
+
+            while !pending.is_empty() && Instant::now() < deadline {
+                let mut made_progress = false;
+                for index in pending.iter().copied().collect::<Vec<_>>() {
+                    let line = {
+                        let agent = &mut self.agents[index];
+                        read_nonblocking_line(&mut agent.stdout, &mut buffers[index])?
+                    };
+
+                    if let Some(line) = line {
+                        pending.remove(&index);
+                        if let Some(reply) = parse_broadcast_reply(&line, &self.agents[index]) {
+                            replies.push(reply);
+                        }
+                        made_progress = true;
+                    }
+                }
+
+                if !made_progress {
+                    thread::sleep(Duration::from_millis(10));
+                }
+            }
+
+            for agent in &self.agents {
+                set_nonblocking(&agent.stdout, false)?;
+            }
+
+            Ok(format_broadcast_ask_response(&replies, timeout))
         }
 
         fn owning_agent_index(&self, requested_path: &Path) -> Option<usize> {
@@ -376,7 +424,7 @@ pub mod supervisor {
                 agent_home,
                 process,
                 stdin,
-                stdout: io::BufReader::new(stdout),
+                stdout,
                 _monitor: monitor,
             });
             Ok(())
@@ -390,16 +438,23 @@ pub mod supervisor {
             writeln!(self.stdin, "{prompt}")?;
             self.stdin.flush()?;
 
-            let mut answer = String::new();
-            self.stdout.read_line(&mut answer)?;
-            if answer.is_empty() {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "Pi Agent Runtime closed before answering",
-                ));
-            }
-            Ok(answer)
+            read_blocking_line(&mut self.stdout)
         }
+
+        fn send_broadcast(&mut self, prompt: &str) -> io::Result<()> {
+            writeln!(self.stdin, "BROADCAST")?;
+            writeln!(self.stdin, "{prompt}")?;
+            self.stdin.flush()
+        }
+    }
+
+    struct BroadcastReply {
+        agent_identity: String,
+        managed_dir: PathBuf,
+        relevance: String,
+        reason: String,
+        answer: String,
+        file_references: Vec<String>,
     }
 
     fn format_direct_ask_response(
@@ -418,6 +473,185 @@ pub mod supervisor {
         response.push_str(&format!("participating_agents: {agent_identity}\n"));
         response.push_str("changed_files: none\n");
         response
+    }
+
+    fn format_broadcast_ask_response(replies: &[BroadcastReply], timeout: Duration) -> String {
+        let mut response = String::new();
+        if replies.is_empty() {
+            response.push_str("no relevant agents replied before broadcast timeout\n");
+        } else {
+            response.push_str("answers:\n");
+            for reply in replies {
+                response.push_str(&format!(
+                    "- agent={} managed_dir={} relevance={} reason={}\n",
+                    reply.agent_identity,
+                    reply.managed_dir.display(),
+                    reply.relevance,
+                    reply.reason
+                ));
+                response.push_str(&format!("  {}\n", reply.answer));
+            }
+        }
+
+        let references = replies
+            .iter()
+            .flat_map(|reply| reply.file_references.iter())
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        response.push_str("references:\n");
+        if references.is_empty() {
+            response.push_str("- none\n");
+        } else {
+            for reference in references {
+                response.push_str(&format!("- {reference}\n"));
+            }
+        }
+
+        let participating_agents = replies
+            .iter()
+            .map(|reply| reply.agent_identity.as_str())
+            .collect::<Vec<_>>();
+        response.push_str(&format!(
+            "participating_agents: {}\n",
+            if participating_agents.is_empty() {
+                "none".to_string()
+            } else {
+                participating_agents.join(", ")
+            }
+        ));
+        response.push_str("changed_files: none\n");
+        response.push_str(&format!("broadcast_timeout_ms: {}\n", timeout.as_millis()));
+        response
+    }
+
+    fn parse_broadcast_reply(line: &str, agent: &RegisteredAgent) -> Option<BroadcastReply> {
+        let mut fields = line.trim_end_matches('\r').splitn(4, '\t');
+        let relevance = fields.next()?;
+        if !matches!(relevance, "possible" | "strong") {
+            return None;
+        }
+
+        let reason = fields.next()?.to_string();
+        let answer = fields.next()?.to_string();
+        let file_references = fields
+            .next()
+            .unwrap_or_default()
+            .split(';')
+            .filter_map(|reference| normalize_broadcast_reference(reference, &agent.managed_dir))
+            .collect::<Vec<_>>();
+
+        Some(BroadcastReply {
+            agent_identity: agent.identity.clone(),
+            managed_dir: agent.managed_dir.clone(),
+            relevance: relevance.to_string(),
+            reason,
+            answer,
+            file_references,
+        })
+    }
+
+    fn normalize_broadcast_reference(reference: &str, managed_dir: &Path) -> Option<String> {
+        let reference = reference.trim();
+        if reference.is_empty() {
+            return None;
+        }
+
+        let path = Path::new(reference);
+        let path = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            managed_dir.join(path)
+        };
+
+        if path.starts_with(managed_dir) {
+            Some(path.display().to_string())
+        } else {
+            None
+        }
+    }
+
+    fn broadcast_reply_timeout() -> Duration {
+        std::env::var(BROADCAST_REPLY_TIMEOUT_ENV)
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|milliseconds| *milliseconds > 0)
+            .map(Duration::from_millis)
+            .unwrap_or(DEFAULT_BROADCAST_REPLY_TIMEOUT)
+    }
+
+    fn read_blocking_line(stdout: &mut ChildStdout) -> io::Result<String> {
+        let mut line = Vec::new();
+        let mut byte = [0_u8; 1];
+
+        loop {
+            match stdout.read(&mut byte) {
+                Ok(0) if line.is_empty() => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "Pi Agent Runtime closed before answering",
+                    ));
+                }
+                Ok(0) => return Ok(String::from_utf8_lossy(&line).to_string()),
+                Ok(_) => {
+                    line.push(byte[0]);
+                    if byte[0] == b'\n' {
+                        return Ok(String::from_utf8_lossy(&line).to_string());
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    fn read_nonblocking_line(
+        stdout: &mut ChildStdout,
+        buffer: &mut Vec<u8>,
+    ) -> io::Result<Option<String>> {
+        let mut byte = [0_u8; 1];
+
+        loop {
+            match stdout.read(&mut byte) {
+                Ok(0) if buffer.is_empty() => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "Pi Agent Runtime closed before answering",
+                    ));
+                }
+                Ok(0) => {
+                    let line = String::from_utf8_lossy(buffer).to_string();
+                    buffer.clear();
+                    return Ok(Some(line));
+                }
+                Ok(_) if byte[0] == b'\n' => {
+                    let line = String::from_utf8_lossy(buffer).to_string();
+                    buffer.clear();
+                    return Ok(Some(line));
+                }
+                Ok(_) => buffer.push(byte[0]),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(None),
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    fn set_nonblocking(stdout: &ChildStdout, nonblocking: bool) -> io::Result<()> {
+        let flags = unsafe { libc::fcntl(stdout.as_raw_fd(), libc::F_GETFL) };
+        if flags < 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        let updated_flags = if nonblocking {
+            flags | libc::O_NONBLOCK
+        } else {
+            flags & !libc::O_NONBLOCK
+        };
+        if unsafe { libc::fcntl(stdout.as_raw_fd(), libc::F_SETFL, updated_flags) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        Ok(())
     }
 
     fn explicit_prompt_path(cwd: &Path, prompt: &str) -> io::Result<Option<PathBuf>> {
@@ -447,6 +681,10 @@ pub mod supervisor {
             }
 
             let path = Path::new(token);
+            if !looks_like_explicit_path_token(token, path) {
+                continue;
+            }
+
             let candidate = if path.is_absolute() {
                 path.to_path_buf()
             } else {
@@ -458,6 +696,16 @@ pub mod supervisor {
         }
 
         Ok(None)
+    }
+
+    fn looks_like_explicit_path_token(token: &str, path: &Path) -> bool {
+        path.is_absolute()
+            || token == "."
+            || token == ".."
+            || token.starts_with("./")
+            || token.starts_with("../")
+            || token.contains('/')
+            || path.extension().is_some()
     }
 
     fn install_suggestion_path(path: &Path) -> &Path {

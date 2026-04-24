@@ -49,6 +49,22 @@ fn start_daemon_with_pi_runtime(afs_home: &std::path::Path, pi_runtime: &std::pa
         .expect("afs daemon should start")
 }
 
+fn start_daemon_with_pi_runtime_and_broadcast_timeout(
+    afs_home: &std::path::Path,
+    pi_runtime: &std::path::Path,
+    timeout_ms: u64,
+) -> Child {
+    Command::new(env!("CARGO_BIN_EXE_afs"))
+        .env("AFS_HOME", afs_home)
+        .env("AFS_PI_RUNTIME", pi_runtime)
+        .env("AFS_BROADCAST_REPLY_TIMEOUT_MS", timeout_ms.to_string())
+        .arg("daemon")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("afs daemon should start")
+}
+
 fn fake_pi_runtime(test_name: &str) -> std::path::PathBuf {
     let runtime_dir = unique_afs_home(test_name);
     std::fs::create_dir_all(&runtime_dir).expect("test should create fake runtime directory");
@@ -70,6 +86,15 @@ while IFS= read -r _line; do
       printf 'prompt=%s\n' "$asked_prompt"
     } >> "$AFS_AGENT_HOME/ask-received"
     printf 'agent %s answered about %s\n' "$AFS_AGENT_ID" "$asked_path"
+  elif [ "$_line" = "BROADCAST" ]; then
+    IFS= read -r asked_prompt
+    printf 'prompt=%s\n' "$asked_prompt" >> "$AFS_AGENT_HOME/broadcast-received"
+    if [ -f "$AFS_AGENT_HOME/broadcast-delay-seconds" ]; then
+      sleep "$(cat "$AFS_AGENT_HOME/broadcast-delay-seconds")"
+    fi
+    if [ -f "$AFS_AGENT_HOME/broadcast-response" ]; then
+      cat "$AFS_AGENT_HOME/broadcast-response"
+    fi
   fi
 done
 "#,
@@ -117,6 +142,18 @@ fn afs_ask(afs_home: &std::path::Path, prompt: &str) -> std::process::Output {
         .arg(prompt)
         .output()
         .expect("afs ask should run")
+}
+
+fn install_managed_dir(
+    afs_home: &std::path::Path,
+    managed_dir: &std::path::Path,
+) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_afs"))
+        .env("AFS_HOME", afs_home)
+        .arg("install")
+        .arg(managed_dir)
+        .output()
+        .expect("afs install should run")
 }
 
 #[test]
@@ -236,6 +273,118 @@ fn undo_external_change_requires_yes_in_scripted_use() {
         std::fs::read_to_string(&target_file).expect("target file should be readable"),
         "after\n",
         "failed undo should leave the filesystem unchanged"
+    );
+
+    stop_daemon(&mut daemon);
+}
+
+#[test]
+fn broad_ask_uses_configured_timeout_and_ignores_late_replies() {
+    let afs_home = unique_afs_home("ask-broadcast-timeout");
+    let fast_dir = unique_afs_home("ask-broadcast-fast");
+    let slow_dir = unique_afs_home("ask-broadcast-slow");
+    let pi_runtime = fake_pi_runtime("ask-broadcast-timeout-runtime");
+    let socket_path = supervisor_socket(&afs_home);
+    std::fs::create_dir_all(&fast_dir).expect("test should create fast managed directory");
+    std::fs::create_dir_all(&slow_dir).expect("test should create slow managed directory");
+    let fast_file = fast_dir.join("workout.md");
+    let slow_file = slow_dir.join("sleep.md");
+    std::fs::write(&fast_file, "run workout\n").expect("test should create fast reference");
+    std::fs::write(&slow_file, "late context\n").expect("test should create slow reference");
+    let fast_dir = fast_dir
+        .canonicalize()
+        .expect("fast directory should canonicalize");
+    let slow_dir = slow_dir
+        .canonicalize()
+        .expect("slow directory should canonicalize");
+    let fast_file = fast_file
+        .canonicalize()
+        .expect("fast reference should canonicalize");
+    let slow_file = slow_file
+        .canonicalize()
+        .expect("slow reference should canonicalize");
+    let mut daemon =
+        start_daemon_with_pi_runtime_and_broadcast_timeout(&afs_home, &pi_runtime, 100);
+
+    assert!(
+        wait_until(Duration::from_secs(2), || socket_path
+            .metadata()
+            .map(|metadata| metadata.file_type().is_socket())
+            .unwrap_or(false)),
+        "daemon should create the Supervisor Socket before install connects"
+    );
+
+    let fast_install = install_managed_dir(&afs_home, &fast_dir);
+    assert!(
+        fast_install.status.success(),
+        "fast afs install should succeed"
+    );
+    let slow_install = install_managed_dir(&afs_home, &slow_dir);
+    assert!(
+        slow_install.status.success(),
+        "slow afs install should succeed"
+    );
+    let fast_identity =
+        std::fs::read_to_string(fast_dir.join(".afs/identity")).expect("fast identity exists");
+    let slow_identity =
+        std::fs::read_to_string(slow_dir.join(".afs/identity")).expect("slow identity exists");
+    std::fs::write(
+        fast_dir.join(".afs/broadcast-response"),
+        format!(
+            "possible\tworkout plan is here\tUse the fast workout context\t{}\n",
+            fast_file.display()
+        ),
+    )
+    .expect("test should configure fast broadcast response");
+    std::fs::write(slow_dir.join(".afs/broadcast-delay-seconds"), "1")
+        .expect("test should configure slow broadcast delay");
+    std::fs::write(
+        slow_dir.join(".afs/broadcast-response"),
+        format!(
+            "strong\tsleep context is here\tThis slow reply missed the timeout\t{}\n",
+            slow_file.display()
+        ),
+    )
+    .expect("test should configure slow broadcast response");
+
+    let started = Instant::now();
+    let ask = afs_ask(&afs_home, "what is the run workout today");
+    let elapsed = started.elapsed();
+
+    assert!(
+        ask.status.success(),
+        "afs ask should succeed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&ask.stdout),
+        String::from_utf8_lossy(&ask.stderr)
+    );
+    assert!(
+        elapsed < Duration::from_millis(900),
+        "afs ask should return after the configured broadcast timeout"
+    );
+    let stdout = String::from_utf8_lossy(&ask.stdout);
+    assert!(
+        stdout.contains("Use the fast workout context"),
+        "afs ask should keep on-time replies"
+    );
+    assert!(
+        stdout.contains(&format!("participating_agents: {}", fast_identity.trim())),
+        "afs ask should report the on-time participant"
+    );
+    assert!(
+        stdout.contains(&format!("- {}", fast_file.display())),
+        "afs ask should include on-time File References"
+    );
+    assert!(
+        !stdout.contains(slow_identity.trim()),
+        "late agents should not be reported as participants"
+    );
+    assert!(
+        !stdout.contains(&slow_file.display().to_string()),
+        "late File References should not be included"
+    );
+    assert!(
+        stdout.contains("broadcast_timeout_ms: 100"),
+        "afs ask should report the configured broadcast timeout"
     );
 
     stop_daemon(&mut daemon);
@@ -502,7 +651,7 @@ fn daemon_replaces_stale_supervisor_socket_when_no_daemon_is_live() {
 }
 
 #[test]
-fn ask_connects_to_live_daemon_and_prints_stub_response() {
+fn ask_connects_to_live_daemon_and_reports_no_broadcast_participants() {
     let afs_home = unique_afs_home("ask-live-daemon");
     let socket_path = supervisor_socket(&afs_home);
     let mut daemon = start_daemon(&afs_home);
@@ -525,11 +674,116 @@ fn ask_connects_to_live_daemon_and_prints_stub_response() {
         output.status.success(),
         "afs ask should reach the live daemon"
     );
-    assert_eq!(
-        String::from_utf8_lossy(&output.stdout),
-        "ask handling not implemented yet\n"
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("no relevant agents replied before broadcast timeout"),
+        "afs ask should explain that no broadcast replies were available"
+    );
+    assert!(
+        stdout.contains("participating_agents: none"),
+        "afs ask should report no Conversation Participants"
+    );
+    assert!(
+        stdout.contains("references:\n- none"),
+        "afs ask should report no File References"
     );
     assert_eq!(String::from_utf8_lossy(&output.stderr), "");
+
+    stop_daemon(&mut daemon);
+}
+
+#[test]
+fn broad_ask_broadcasts_to_registered_agents_and_reports_relevant_references() {
+    let afs_home = unique_afs_home("ask-broadcast-relevant");
+    let health_dir = unique_afs_home("ask-broadcast-health");
+    let recipes_dir = unique_afs_home("ask-broadcast-recipes");
+    let pi_runtime = fake_pi_runtime("ask-broadcast-runtime");
+    let socket_path = supervisor_socket(&afs_home);
+    std::fs::create_dir_all(&health_dir).expect("test should create health managed directory");
+    std::fs::create_dir_all(&recipes_dir).expect("test should create recipes managed directory");
+    let lab_file = health_dir.join("labs-2025.pdf");
+    std::fs::write(&lab_file, "blood panel\n").expect("test should create referenced file");
+    let health_dir = health_dir
+        .canonicalize()
+        .expect("health directory should canonicalize");
+    let recipes_dir = recipes_dir
+        .canonicalize()
+        .expect("recipes directory should canonicalize");
+    let lab_file = lab_file
+        .canonicalize()
+        .expect("referenced file should canonicalize");
+    let mut daemon =
+        start_daemon_with_pi_runtime_and_broadcast_timeout(&afs_home, &pi_runtime, 100);
+
+    assert!(
+        wait_until(Duration::from_secs(2), || socket_path
+            .metadata()
+            .map(|metadata| metadata.file_type().is_socket())
+            .unwrap_or(false)),
+        "daemon should create the Supervisor Socket before install connects"
+    );
+
+    let health_install = install_managed_dir(&afs_home, &health_dir);
+    assert!(
+        health_install.status.success(),
+        "health afs install should succeed"
+    );
+    let recipes_install = install_managed_dir(&afs_home, &recipes_dir);
+    assert!(
+        recipes_install.status.success(),
+        "recipes afs install should succeed"
+    );
+    let health_identity =
+        std::fs::read_to_string(health_dir.join(".afs/identity")).expect("health identity exists");
+    let recipes_identity = std::fs::read_to_string(recipes_dir.join(".afs/identity"))
+        .expect("recipes identity exists");
+    std::fs::write(
+        health_dir.join(".afs/broadcast-response"),
+        format!(
+            "strong\tblood tests are in this managed directory\tFound the 2025 blood panel\t{}\n",
+            lab_file.display()
+        ),
+    )
+    .expect("test should configure relevant broadcast response");
+
+    let ask = afs_ask(&afs_home, "find my last blood tests from 2025");
+
+    assert!(
+        ask.status.success(),
+        "afs ask should succeed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&ask.stdout),
+        String::from_utf8_lossy(&ask.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&ask.stderr), "");
+    let stdout = String::from_utf8_lossy(&ask.stdout);
+    assert!(
+        stdout.contains("Found the 2025 blood panel"),
+        "afs ask should include the relevant agent answer"
+    );
+    assert!(
+        stdout.contains(&format!("- {}", lab_file.display())),
+        "afs ask should include returned File References"
+    );
+    assert!(
+        stdout.contains(&format!("participating_agents: {}", health_identity.trim())),
+        "afs ask should name the Directory Agent that participated"
+    );
+    assert!(
+        !stdout.contains(recipes_identity.trim()),
+        "silent irrelevant agents should not be reported as participants"
+    );
+    assert!(
+        std::fs::read_to_string(health_dir.join(".afs/broadcast-received"))
+            .expect("health agent should receive broadcast")
+            .contains("find my last blood tests from 2025"),
+        "relevant agent should receive the Broadcast Request"
+    );
+    assert!(
+        std::fs::read_to_string(recipes_dir.join(".afs/broadcast-received"))
+            .expect("recipes agent should receive broadcast")
+            .contains("find my last blood tests from 2025"),
+        "silent agent should still receive the Broadcast Request"
+    );
 
     stop_daemon(&mut daemon);
 }
