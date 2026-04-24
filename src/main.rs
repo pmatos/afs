@@ -5,6 +5,32 @@ fn main() -> ExitCode {
     let mut args = std::env::args().skip(1);
 
     match args.next().as_deref() {
+        Some("login") => {
+            let mut provider: Option<String> = None;
+            while let Some(arg) = args.next() {
+                match arg.as_str() {
+                    "--provider" => provider = args.next(),
+                    other if other.starts_with("--provider=") => {
+                        provider = Some(other["--provider=".len()..].to_string());
+                    }
+                    _ => {
+                        eprintln!("usage: afs login --provider <claude|openai>");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            }
+
+            match afs::login::run(provider.as_deref()) {
+                Ok(message) => {
+                    print!("{message}");
+                    ExitCode::SUCCESS
+                }
+                Err(error) => {
+                    eprintln!("{error}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         Some("daemon") => match afs::supervisor::run_foreground() {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
