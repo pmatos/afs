@@ -1583,6 +1583,93 @@ fn removing_nested_managed_directory_merges_history_and_archives_agent_home() {
 }
 
 #[test]
+fn removing_nested_managed_directory_surfaces_child_history_in_parent() {
+    let afs_home = unique_afs_home("nested-remove-visibility");
+    let parent_dir = unique_afs_home("nested-remove-visibility-parent");
+    let pi_runtime = fake_pi_runtime("nested-remove-visibility-runtime");
+    let socket_path = supervisor_socket(&afs_home);
+    let child_dir = parent_dir.join("child");
+    std::fs::create_dir_all(&child_dir).expect("test should create child directory");
+    let child_file = child_dir.join("notes.txt");
+    std::fs::write(&child_file, "initial child content\n").expect("test should create child file");
+    let parent_dir = parent_dir
+        .canonicalize()
+        .expect("parent managed directory should canonicalize");
+    let child_dir = child_dir
+        .canonicalize()
+        .expect("child managed directory should canonicalize");
+    let child_file = child_file
+        .canonicalize()
+        .expect("child file should canonicalize");
+    let mut daemon = start_daemon_with_pi_runtime(&afs_home, &pi_runtime);
+
+    assert!(
+        wait_until(Duration::from_secs(2), || socket_path
+            .metadata()
+            .map(|metadata| metadata.file_type().is_socket())
+            .unwrap_or(false)),
+        "daemon should create the Supervisor Socket before install connects"
+    );
+
+    assert!(
+        install_managed_dir(&afs_home, &parent_dir).status.success(),
+        "parent afs install should succeed"
+    );
+    assert!(
+        install_managed_dir(&afs_home, &child_dir).status.success(),
+        "child afs install should succeed"
+    );
+
+    std::fs::write(&child_file, "child edit pre-removal\n")
+        .expect("test should write child file before removal");
+    assert!(
+        wait_until(Duration::from_secs(3), || {
+            let child_history = afs_history(&afs_home, &child_dir);
+            child_history.status.success()
+                && String::from_utf8_lossy(&child_history.stdout)
+                    .contains("summary=External change: notes.txt")
+        }),
+        "child history should contain an external change entry before removal"
+    );
+
+    let remove = remove_managed_dir(&afs_home, &child_dir);
+    assert!(
+        remove.status.success(),
+        "afs remove should succeed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&remove.stdout),
+        String::from_utf8_lossy(&remove.stderr)
+    );
+
+    let parent_history = afs_history(&afs_home, &parent_dir);
+    assert!(
+        parent_history.status.success(),
+        "afs history on parent should succeed"
+    );
+    let parent_stdout = String::from_utf8_lossy(&parent_history.stdout);
+    let child_entry_line = parent_stdout
+        .lines()
+        .find(|line| line.contains("summary=External change: child/notes.txt"))
+        .unwrap_or_else(|| panic!(
+            "parent history should surface the child's external change rewritten to a parent-relative path; got:\n{parent_stdout}"
+        ));
+    assert!(
+        child_entry_line.contains("origin=child"),
+        "merged child entry should carry an origin=child provenance marker; got:\n{child_entry_line}"
+    );
+
+    let ownership_line = parent_stdout
+        .lines()
+        .find(|line| line.contains("summary=Ownership merge: child"))
+        .expect("parent history should still include the ownership-merge marker");
+    assert!(
+        ownership_line.contains("origin=") && !ownership_line.contains("origin=child"),
+        "local parent-authored entries should not carry a child origin; got:\n{ownership_line}"
+    );
+
+    stop_daemon(&mut daemon);
+}
+
+#[test]
 fn ask_answer_for_managed_path_includes_file_reference_and_index_caveat() {
     let afs_home = unique_afs_home("ask-reference-caveat");
     let managed_dir = unique_afs_home("ask-reference-caveat-managed");

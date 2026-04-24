@@ -270,6 +270,13 @@ pub mod supervisor {
                     "Ownership merge",
                     &managed_dir,
                 )?;
+                let child_origin = relative_managed_path(&parent_managed_dir, &managed_dir)?;
+                merge_archived_child_history(
+                    &archived_agent_home,
+                    &parent_managed_dir,
+                    &parent_agent_home,
+                    &child_origin,
+                )?;
                 self.write_registry()?;
 
                 Ok((removed_identity, archived_agent_home))
@@ -1350,6 +1357,7 @@ pub mod supervisor {
                 files: &[],
                 undoable: false,
                 undoes: None,
+                origin: None,
             },
         )
     }
@@ -1540,6 +1548,7 @@ pub mod supervisor {
                 files: &changed_files,
                 undoable: true,
                 undoes: None,
+                origin: None,
             },
         )?;
         Ok(Some(RecordedChange {
@@ -1574,8 +1583,96 @@ pub mod supervisor {
                 files: &changed_files,
                 undoable: false,
                 undoes: None,
+                origin: None,
             },
         )
+    }
+
+    fn merge_archived_child_history(
+        archived_child_home: &Path,
+        parent_managed_dir: &Path,
+        parent_agent_home: &Path,
+        child_origin: &str,
+    ) -> io::Result<()> {
+        let _guard = history_lock()
+            .lock()
+            .map_err(|_| io::Error::other("history lock poisoned"))?;
+        let child_git_dir = history_repo_dir(archived_child_home);
+        let mut commits = git_log_records(&child_git_dir)?;
+        commits.reverse();
+
+        let parent_git_dir = history_repo_dir(parent_agent_home);
+        let mut seen: BTreeSet<String> = BTreeSet::new();
+        for record in commits {
+            let Some(entry_id) = record.trailers.get("Afs-Entry-Id").cloned() else {
+                continue;
+            };
+            if !seen.insert(entry_id.clone()) {
+                continue;
+            }
+            let kind = record.trailers.get("Afs-Kind").cloned().unwrap_or_default();
+            if kind == "baseline" {
+                continue;
+            }
+            let original_summary = record
+                .trailers
+                .get("Afs-Summary")
+                .cloned()
+                .unwrap_or_default();
+            let original_files: Vec<String> = record
+                .trailers
+                .get("Afs-Files")
+                .map(|field| {
+                    if field.is_empty() {
+                        Vec::new()
+                    } else {
+                        field.split(", ").map(ToOwned::to_owned).collect()
+                    }
+                })
+                .unwrap_or_default();
+            let rewritten_files: Vec<String> = original_files
+                .iter()
+                .map(|file| prefix_child_path(child_origin, file))
+                .collect();
+            let rewritten_summary =
+                rewrite_summary_paths(&original_summary, &original_files, &rewritten_files);
+            git_commit_index(
+                &parent_git_dir,
+                parent_managed_dir,
+                &GitCommitRequest {
+                    entry_id: &entry_id,
+                    kind: &kind,
+                    summary: &rewritten_summary,
+                    files: &rewritten_files,
+                    undoable: false,
+                    undoes: None,
+                    origin: Some(child_origin),
+                },
+            )?;
+        }
+        Ok(())
+    }
+
+    fn prefix_child_path(origin: &str, file: &str) -> String {
+        if file.is_empty() || origin.is_empty() {
+            return file.to_string();
+        }
+        format!("{origin}/{file}")
+    }
+
+    fn rewrite_summary_paths(
+        summary: &str,
+        original_files: &[String],
+        rewritten_files: &[String],
+    ) -> String {
+        let mut result = summary.to_string();
+        for (original, rewritten) in original_files.iter().zip(rewritten_files.iter()) {
+            if original.is_empty() || original == rewritten {
+                continue;
+            }
+            result = result.replacen(original, rewritten, 1);
+        }
+        result
     }
 
     fn archive_agent_home(
@@ -1687,9 +1784,20 @@ pub mod supervisor {
                 .get("Afs-File-Count")
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(0);
+            let origin = record
+                .trailers
+                .get("Afs-Origin")
+                .cloned()
+                .unwrap_or_default();
             output.push_str(&format!(
-                "entry={} timestamp={} type={} summary={} files={} undoable={}\n",
-                entry_id, record.timestamp_secs, kind, summary, file_count, state.latest_undoable
+                "entry={} timestamp={} type={} summary={} files={} undoable={} origin={}\n",
+                entry_id,
+                record.timestamp_secs,
+                kind,
+                summary,
+                file_count,
+                state.latest_undoable,
+                origin,
             ));
         }
         Ok(output)
@@ -1827,6 +1935,7 @@ pub mod supervisor {
                 files: &latest.files,
                 undoable: false,
                 undoes: Some(&latest.entry_id),
+                origin: None,
             },
         )?;
         git_stage_and_commit(
@@ -1840,6 +1949,7 @@ pub mod supervisor {
                 files: &latest.files,
                 undoable: false,
                 undoes: None,
+                origin: None,
             },
         )?;
 
@@ -2009,6 +2119,7 @@ pub mod supervisor {
         files: &'a [String],
         undoable: bool,
         undoes: Option<&'a str>,
+        origin: Option<&'a str>,
     }
 
     fn git_stage_work_tree(
@@ -2132,6 +2243,9 @@ pub mod supervisor {
         ));
         if let Some(undoes) = request.undoes {
             message.push_str(&format!("Afs-Undoes: {}\n", sanitize_field(undoes)));
+        }
+        if let Some(origin) = request.origin {
+            message.push_str(&format!("Afs-Origin: {}\n", sanitize_field(origin)));
         }
         message
     }
