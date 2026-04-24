@@ -213,6 +213,18 @@ fn install_managed_dir(
         .expect("afs install should run")
 }
 
+fn remove_managed_dir(
+    afs_home: &std::path::Path,
+    managed_dir: &std::path::Path,
+) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_afs"))
+        .env("AFS_HOME", afs_home)
+        .arg("remove")
+        .arg(managed_dir)
+        .output()
+        .expect("afs remove should run")
+}
+
 #[test]
 fn ask_reports_daemon_not_running_when_supervisor_socket_is_unavailable() {
     let afs_home = unique_afs_home("ask-no-daemon");
@@ -1331,6 +1343,226 @@ fn ask_routes_explicit_nested_managed_path_directly_to_deepest_owner() {
     assert!(
         !parent_dir.join(".afs/ask-received").exists(),
         "ancestor agent should not receive a direct path ask owned by a nested agent"
+    );
+
+    stop_daemon(&mut daemon);
+}
+
+#[test]
+fn installing_nested_managed_directory_splits_parent_history_ownership() {
+    let afs_home = unique_afs_home("nested-install-split");
+    let parent_dir = unique_afs_home("nested-install-parent");
+    let pi_runtime = fake_pi_runtime("nested-install-runtime");
+    let socket_path = supervisor_socket(&afs_home);
+    let child_dir = parent_dir.join("child");
+    std::fs::create_dir_all(&child_dir).expect("test should create child directory");
+    let child_file = child_dir.join("notes.txt");
+    std::fs::write(&child_file, "before split\n").expect("test should create child file");
+    let parent_dir = parent_dir
+        .canonicalize()
+        .expect("parent managed directory should canonicalize");
+    let child_dir = child_dir
+        .canonicalize()
+        .expect("child managed directory should canonicalize");
+    let child_file = child_file
+        .canonicalize()
+        .expect("child file should canonicalize");
+    let mut daemon = start_daemon_with_pi_runtime(&afs_home, &pi_runtime);
+
+    assert!(
+        wait_until(Duration::from_secs(2), || socket_path
+            .metadata()
+            .map(|metadata| metadata.file_type().is_socket())
+            .unwrap_or(false)),
+        "daemon should create the Supervisor Socket before install connects"
+    );
+
+    let parent_install = install_managed_dir(&afs_home, &parent_dir);
+    assert!(
+        parent_install.status.success(),
+        "parent afs install should succeed"
+    );
+    let child_install = install_managed_dir(&afs_home, &child_dir);
+    assert!(
+        child_install.status.success(),
+        "child afs install should succeed"
+    );
+
+    let parent_history = afs_history(&afs_home, &parent_dir);
+    assert!(
+        parent_history.status.success(),
+        "parent afs history should succeed"
+    );
+    let parent_stdout = String::from_utf8_lossy(&parent_history.stdout);
+    assert!(
+        parent_stdout.contains("type=ownership"),
+        "parent history should record the ownership split"
+    );
+    assert!(
+        parent_stdout.contains("summary=Ownership split: child"),
+        "parent ownership history should name the nested child"
+    );
+
+    std::fs::write(&child_file, "after split\n").expect("test should modify child file");
+    assert!(
+        wait_until(Duration::from_secs(3), || {
+            let child_history = afs_history(&afs_home, &child_dir);
+            child_history.status.success()
+                && String::from_utf8_lossy(&child_history.stdout).contains("External change")
+        }),
+        "child history should record child edits after the split"
+    );
+
+    let parent_history = afs_history(&afs_home, &parent_dir);
+    assert!(
+        parent_history.status.success(),
+        "parent afs history should still succeed"
+    );
+    let parent_stdout = String::from_utf8_lossy(&parent_history.stdout);
+    assert!(
+        !parent_stdout.contains("External change: child/notes.txt"),
+        "parent history should not record child-owned edits after the split"
+    );
+
+    stop_daemon(&mut daemon);
+}
+
+#[test]
+fn removing_nested_managed_directory_merges_history_and_archives_agent_home() {
+    let afs_home = unique_afs_home("nested-remove-merge");
+    let parent_dir = unique_afs_home("nested-remove-parent");
+    let pi_runtime = fake_pi_runtime("nested-remove-runtime");
+    let socket_path = supervisor_socket(&afs_home);
+    let child_dir = parent_dir.join("child");
+    std::fs::create_dir_all(&child_dir).expect("test should create child directory");
+    let child_file = child_dir.join("notes.txt");
+    std::fs::write(&child_file, "before child history\n").expect("test should create child file");
+    let parent_dir = parent_dir
+        .canonicalize()
+        .expect("parent managed directory should canonicalize");
+    let child_dir = child_dir
+        .canonicalize()
+        .expect("child managed directory should canonicalize");
+    let child_file = child_file
+        .canonicalize()
+        .expect("child file should canonicalize");
+    let mut daemon = start_daemon_with_pi_runtime(&afs_home, &pi_runtime);
+
+    assert!(
+        wait_until(Duration::from_secs(2), || socket_path
+            .metadata()
+            .map(|metadata| metadata.file_type().is_socket())
+            .unwrap_or(false)),
+        "daemon should create the Supervisor Socket before install connects"
+    );
+
+    let parent_install = install_managed_dir(&afs_home, &parent_dir);
+    assert!(
+        parent_install.status.success(),
+        "parent afs install should succeed"
+    );
+    let child_install = install_managed_dir(&afs_home, &child_dir);
+    assert!(
+        child_install.status.success(),
+        "child afs install should succeed"
+    );
+    let child_identity =
+        std::fs::read_to_string(child_dir.join(".afs/identity")).expect("child identity exists");
+
+    std::fs::write(&child_file, "child history before removal\n")
+        .expect("test should modify child file before removal");
+    assert!(
+        wait_until(Duration::from_secs(3), || {
+            let child_history = afs_history(&afs_home, &child_dir);
+            child_history.status.success()
+                && String::from_utf8_lossy(&child_history.stdout)
+                    .contains("summary=External change: notes.txt")
+        }),
+        "child history should contain a local entry before removal"
+    );
+
+    let remove = remove_managed_dir(&afs_home, &child_dir);
+    assert!(
+        remove.status.success(),
+        "afs remove should succeed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&remove.stdout),
+        String::from_utf8_lossy(&remove.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&remove.stderr), "");
+    let remove_stdout = String::from_utf8_lossy(&remove.stdout);
+    assert!(
+        remove_stdout.contains("removed managed directory"),
+        "afs remove should report the removed child"
+    );
+    assert!(
+        remove_stdout.contains("archived_agent_home "),
+        "afs remove should report the archive location"
+    );
+
+    assert!(
+        !child_dir.join(".afs").exists(),
+        "removed child Agent Home should be moved out of the child subtree"
+    );
+    let archive_root = parent_dir.join(".afs/archives");
+    let archived_home = std::fs::read_dir(&archive_root)
+        .expect("parent archive root should exist")
+        .map(|entry| entry.expect("archive entry should be readable").path())
+        .find(|path| path.join("identity").is_file())
+        .expect("parent should archive the removed child Agent Home");
+    assert_eq!(
+        std::fs::read_to_string(archived_home.join("identity"))
+            .expect("archived identity should be readable"),
+        child_identity,
+        "archive should preserve the child identity"
+    );
+    assert!(
+        std::fs::read_to_string(archived_home.join("history/entries.tsv"))
+            .expect("archived child history should be readable")
+            .contains("External change: notes.txt"),
+        "archive should preserve the child history"
+    );
+
+    let parent_history = afs_history(&afs_home, &parent_dir);
+    assert!(
+        parent_history.status.success(),
+        "parent afs history should succeed"
+    );
+    let parent_stdout = String::from_utf8_lossy(&parent_history.stdout);
+    assert!(
+        parent_stdout.contains("type=ownership"),
+        "parent history should include ownership entries"
+    );
+    assert!(
+        parent_stdout.contains("summary=Ownership merge: child"),
+        "parent history should record the child merge"
+    );
+
+    std::fs::write(&child_file, "parent owns child content now\n")
+        .expect("test should modify child content after removal");
+    assert!(
+        wait_until(Duration::from_secs(3), || {
+            let parent_history = afs_history(&afs_home, &parent_dir);
+            parent_history.status.success()
+                && String::from_utf8_lossy(&parent_history.stdout)
+                    .contains("summary=External change: child/notes.txt")
+        }),
+        "parent history should record child-path edits after removal"
+    );
+
+    let agents = Command::new(env!("CARGO_BIN_EXE_afs"))
+        .env("AFS_HOME", &afs_home)
+        .arg("agents")
+        .output()
+        .expect("afs agents should run");
+    assert!(agents.status.success(), "afs agents should succeed");
+    let agents_stdout = String::from_utf8_lossy(&agents.stdout);
+    assert!(
+        agents_stdout.contains(&parent_dir.display().to_string()),
+        "parent agent should remain registered"
+    );
+    assert!(
+        !agents_stdout.contains(&child_dir.display().to_string()),
+        "removed child agent should leave the registry"
     );
 
     stop_daemon(&mut daemon);

@@ -55,6 +55,31 @@ fn main() -> ExitCode {
                 }
             }
         }
+        Some("remove") => {
+            let Some(path) = args.next() else {
+                eprintln!("usage: afs remove <path>");
+                return ExitCode::FAILURE;
+            };
+
+            match afs::client::remove(std::path::Path::new(&path)) {
+                Ok(response) => {
+                    print!("{response}");
+                    ExitCode::SUCCESS
+                }
+                Err(afs::client::Error::DaemonNotRunning) => {
+                    eprintln!("daemon is not running");
+                    ExitCode::FAILURE
+                }
+                Err(afs::client::Error::Supervisor(message)) => {
+                    eprintln!("{message}");
+                    ExitCode::FAILURE
+                }
+                Err(afs::client::Error::Io(error)) => {
+                    eprintln!("{error}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         Some("agents") => match afs::client::agents() {
             Ok(response) => {
                 print!("{response}");

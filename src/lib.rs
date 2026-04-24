@@ -22,6 +22,7 @@ pub mod supervisor {
     const CONTENT_SNAPSHOT_DIR: &str = "content-snapshot";
     const ENTRY_DATA_DIR: &str = "entry-data";
     const REGISTRY_FILE: &str = "registry.tsv";
+    const ARCHIVES_DIR: &str = "archives";
     const PI_RUNTIME_ENV: &str = "AFS_PI_RUNTIME";
     const BROADCAST_REPLY_TIMEOUT_ENV: &str = "AFS_BROADCAST_REPLY_TIMEOUT_MS";
     const DEFAULT_BROADCAST_REPLY_TIMEOUT: Duration = Duration::from_secs(2);
@@ -89,7 +90,12 @@ pub mod supervisor {
         stdin: ChildStdin,
         stdout: ChildStdout,
         queued_tasks: usize,
-        _monitor: thread::JoinHandle<()>,
+        monitor: Option<DirectoryMonitor>,
+    }
+
+    struct DirectoryMonitor {
+        stop: mpsc::Sender<()>,
+        handle: thread::JoinHandle<()>,
     }
 
     impl SupervisorState {
@@ -121,6 +127,8 @@ pub mod supervisor {
             state.ask(Path::new(cwd), prompt)
         } else if let Some(path) = request.strip_prefix("INSTALL ") {
             state.install(Path::new(path))
+        } else if let Some(path) = request.strip_prefix("REMOVE ") {
+            state.remove(Path::new(path))
         } else if request == "AGENTS" {
             state.agents()
         } else if let Some(path) = request.strip_prefix("HISTORY ") {
@@ -174,6 +182,7 @@ pub mod supervisor {
                     "managed path must be a directory",
                 ));
             }
+            let parent_agent_index = self.parent_agent_index(&managed_dir);
 
             let agent_home = managed_dir.join(AGENT_HOME_DIR);
             let history_dir = agent_home.join(HISTORY_DIR);
@@ -214,6 +223,16 @@ pub mod supervisor {
                 self.write_registry()?;
             }
 
+            if !was_already_managed && let Some(parent_agent_index) = parent_agent_index {
+                let parent = &self.agents[parent_agent_index];
+                record_ownership_event(
+                    &parent.managed_dir,
+                    &parent.agent_home,
+                    "Ownership split",
+                    &managed_dir,
+                )?;
+            }
+
             let status = if was_already_managed {
                 "already managed directory"
             } else {
@@ -224,6 +243,69 @@ pub mod supervisor {
                 "{status} {}\nagent {}\n",
                 managed_dir.display(),
                 identity.trim()
+            ))
+        }
+
+        fn remove(&mut self, path: &Path) -> io::Result<String> {
+            let managed_dir = path.canonicalize()?;
+            let Some(agent_index) = self
+                .agents
+                .iter()
+                .position(|agent| agent.managed_dir == managed_dir)
+            else {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "managed directory is not installed",
+                ));
+            };
+            let Some(parent_agent_index) = self.parent_agent_index(&managed_dir) else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "removing a managed directory requires an installed parent",
+                ));
+            };
+
+            let parent_managed_dir = self.agents[parent_agent_index].managed_dir.clone();
+            let parent_agent_home = self.agents[parent_agent_index].agent_home.clone();
+            self.agents[parent_agent_index].stop_monitor()?;
+            let remove_result: io::Result<(String, PathBuf)> = (|| {
+                let removed_agent = self.agents.remove(agent_index);
+                let removed_identity = removed_agent.identity.clone();
+                let removed_agent_home = removed_agent.agent_home.clone();
+                removed_agent.stop()?;
+                let archived_agent_home =
+                    archive_agent_home(&removed_agent_home, &parent_agent_home, &removed_identity)?;
+                record_ownership_event(
+                    &parent_managed_dir,
+                    &parent_agent_home,
+                    "Ownership merge",
+                    &managed_dir,
+                )?;
+                self.write_registry()?;
+
+                Ok((removed_identity, archived_agent_home))
+            })();
+
+            let parent_restart_result = self
+                .agents
+                .iter_mut()
+                .find(|agent| agent.managed_dir == parent_managed_dir)
+                .map(RegisteredAgent::start_monitor)
+                .transpose()?;
+            if parent_restart_result.is_none() {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "parent managed directory is no longer registered",
+                ));
+            }
+
+            let (removed_identity, archived_agent_home) = remove_result?;
+
+            Ok(format!(
+                "removed managed directory {}\nagent {}\narchived_agent_home {}\n",
+                managed_dir.display(),
+                removed_identity.trim(),
+                archived_agent_home.display()
             ))
         }
 
@@ -554,6 +636,17 @@ pub mod supervisor {
                 .map(|(index, _agent)| index)
         }
 
+        fn parent_agent_index(&self, managed_dir: &Path) -> Option<usize> {
+            self.agents
+                .iter()
+                .enumerate()
+                .filter(|(_index, agent)| {
+                    managed_dir != agent.managed_dir && managed_dir.starts_with(&agent.managed_dir)
+                })
+                .max_by_key(|(_index, agent)| agent.managed_dir.components().count())
+                .map(|(index, _agent)| index)
+        }
+
         fn write_registry(&self) -> io::Result<()> {
             let mut registry = String::from("identity\tmanaged_dir\tagent_home\n");
             for agent in &self.agents {
@@ -618,13 +711,39 @@ pub mod supervisor {
                 stdin,
                 stdout,
                 queued_tasks: 0,
-                _monitor: monitor,
+                monitor: Some(monitor),
             });
             Ok(())
         }
     }
 
     impl RegisteredAgent {
+        fn stop(mut self) -> io::Result<()> {
+            self.stop_monitor()?;
+            if self.process.try_wait()?.is_none() {
+                self.process.kill()?;
+            }
+            let _ = self.process.wait()?;
+            Ok(())
+        }
+
+        fn stop_monitor(&mut self) -> io::Result<()> {
+            if let Some(monitor) = self.monitor.take() {
+                monitor.stop()?;
+            }
+            Ok(())
+        }
+
+        fn start_monitor(&mut self) -> io::Result<()> {
+            if self.monitor.is_none() {
+                self.monitor = Some(start_directory_monitor(
+                    self.managed_dir.clone(),
+                    self.agent_home.clone(),
+                )?);
+            }
+            Ok(())
+        }
+
         fn ask(&mut self, prompt: &str, requested_path: &Path) -> io::Result<String> {
             writeln!(self.stdin, "ASK")?;
             writeln!(self.stdin, "{}", requested_path.display())?;
@@ -664,6 +783,15 @@ pub mod supervisor {
             self.stdin.flush()?;
 
             read_blocking_line(&mut self.stdout)
+        }
+    }
+
+    impl DirectoryMonitor {
+        fn stop(self) -> io::Result<()> {
+            let _ = self.stop.send(());
+            self.handle
+                .join()
+                .map_err(|_| io::Error::other("directory monitor thread panicked"))
         }
     }
 
@@ -1245,16 +1373,22 @@ pub mod supervisor {
     fn start_directory_monitor(
         managed_dir: PathBuf,
         agent_home: PathBuf,
-    ) -> io::Result<thread::JoinHandle<()>> {
+    ) -> io::Result<DirectoryMonitor> {
         let (ready_sender, ready_receiver) = mpsc::channel();
+        let (stop_sender, stop_receiver) = mpsc::channel();
         let handle = thread::spawn(move || {
-            if let Err(error) = monitor_directory(managed_dir, agent_home, ready_sender) {
+            if let Err(error) =
+                monitor_directory(managed_dir, agent_home, ready_sender, stop_receiver)
+            {
                 eprintln!("directory monitor stopped: {error}");
             }
         });
 
         match ready_receiver.recv_timeout(Duration::from_secs(2)) {
-            Ok(Ok(())) => Ok(handle),
+            Ok(Ok(())) => Ok(DirectoryMonitor {
+                stop: stop_sender,
+                handle,
+            }),
             Ok(Err(message)) => Err(io::Error::other(message)),
             Err(error) => Err(io::Error::other(format!(
                 "directory monitor did not start: {error}"
@@ -1266,6 +1400,7 @@ pub mod supervisor {
         managed_dir: PathBuf,
         agent_home: PathBuf,
         ready_sender: mpsc::Sender<Result<(), String>>,
+        stop_receiver: mpsc::Receiver<()>,
     ) -> io::Result<()> {
         let (sender, receiver) = mpsc::channel();
         let mut watcher: RecommendedWatcher = notify::recommended_watcher(move |event| {
@@ -1282,7 +1417,11 @@ pub mod supervisor {
         let _ = ready_sender.send(Ok(()));
 
         loop {
-            match receiver.recv() {
+            if stop_receiver.try_recv().is_ok() {
+                return Ok(());
+            }
+
+            match receiver.recv_timeout(Duration::from_millis(50)) {
                 Ok(Ok(event)) => {
                     if event_affects_managed_subtree(&managed_dir, &event.paths) {
                         wait_for_settled_events(&receiver, &managed_dir);
@@ -1290,7 +1429,8 @@ pub mod supervisor {
                     }
                 }
                 Ok(Err(_error)) => {}
-                Err(_closed) => return Ok(()),
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => return Ok(()),
             }
         }
     }
@@ -1327,7 +1467,11 @@ pub mod supervisor {
 
     fn is_managed_content_path(managed_dir: &Path, path: &Path) -> bool {
         let agent_home = managed_dir.join(AGENT_HOME_DIR);
-        path != managed_dir && path.starts_with(managed_dir) && !path.starts_with(agent_home)
+        path != managed_dir
+            && path.starts_with(managed_dir)
+            && !path.starts_with(agent_home)
+            && !path_has_agent_home_component(managed_dir, path)
+            && !is_nested_managed_path(managed_dir, path)
     }
 
     fn record_external_change(managed_dir: &Path, agent_home: &Path) -> io::Result<()> {
@@ -1393,6 +1537,68 @@ pub mod supervisor {
         }))
     }
 
+    fn record_ownership_event(
+        managed_dir: &Path,
+        agent_home: &Path,
+        summary_prefix: &str,
+        affected_dir: &Path,
+    ) -> io::Result<()> {
+        let _guard = history_lock()
+            .lock()
+            .map_err(|_| io::Error::other("history lock poisoned"))?;
+        let snapshot_path = agent_home.join(HISTORY_DIR).join(SNAPSHOT_FILE);
+        let previous = read_snapshot(&snapshot_path)?;
+        let current = collect_file_snapshot(managed_dir)?;
+        let changed_files = changed_files(&previous, &current);
+        let affected = relative_managed_path(managed_dir, affected_dir)?;
+        let summary = format!("{summary_prefix}: {affected}");
+        append_history_entry_with_summary(
+            agent_home,
+            &history_entry_id(),
+            "ownership",
+            &summary,
+            &changed_files,
+            false,
+        )?;
+        write_snapshot(&snapshot_path, &current)?;
+        refresh_content_snapshot(managed_dir, agent_home)
+    }
+
+    fn archive_agent_home(
+        removed_agent_home: &Path,
+        parent_agent_home: &Path,
+        identity: &str,
+    ) -> io::Result<PathBuf> {
+        let archive_root = parent_agent_home.join(ARCHIVES_DIR);
+        std::fs::create_dir_all(&archive_root)?;
+        let archive_name = format!(
+            "{}-{}",
+            archive_safe_name(identity.trim()),
+            unix_timestamp_nanos()
+        );
+        let archived_agent_home = archive_root.join(archive_name);
+        std::fs::rename(removed_agent_home, &archived_agent_home)?;
+        Ok(archived_agent_home)
+    }
+
+    fn archive_safe_name(value: &str) -> String {
+        let sanitized = value
+            .chars()
+            .map(|character| {
+                if character.is_ascii_alphanumeric() || matches!(character, '-' | '_') {
+                    character
+                } else {
+                    '-'
+                }
+            })
+            .collect::<String>();
+        if sanitized.is_empty() {
+            "agent".to_string()
+        } else {
+            sanitized
+        }
+    }
+
     fn changed_files(previous: &Snapshot, current: &Snapshot) -> Vec<String> {
         let mut paths = BTreeSet::new();
         paths.extend(previous.keys().cloned());
@@ -1411,6 +1617,18 @@ pub mod supervisor {
         files: &[String],
         undoable: bool,
     ) -> io::Result<()> {
+        let summary = history_summary(summary_prefix, files);
+        append_history_entry_with_summary(agent_home, id, kind, &summary, files, undoable)
+    }
+
+    fn append_history_entry_with_summary(
+        agent_home: &Path,
+        id: &str,
+        kind: &str,
+        summary: &str,
+        files: &[String],
+        undoable: bool,
+    ) -> io::Result<()> {
         let history_dir = agent_home.join(HISTORY_DIR);
         std::fs::create_dir_all(&history_dir)?;
         let entries_path = history_dir.join(ENTRIES_FILE);
@@ -1419,14 +1637,13 @@ pub mod supervisor {
             .append(true)
             .open(entries_path)?;
         let timestamp = unix_timestamp();
-        let summary = history_summary(summary_prefix, files);
         writeln!(
             entries,
             "{}\t{}\t{}\t{}\t{}\t{}\t{}",
             id,
             timestamp,
             kind,
-            sanitize_field(&summary),
+            sanitize_field(summary),
             files.len(),
             undoable_field(undoable),
             sanitize_field(&files.join(", "))
@@ -1723,6 +1940,9 @@ pub mod supervisor {
             if path == managed_dir.join(AGENT_HOME_DIR) {
                 continue;
             }
+            if is_nested_managed_root(managed_dir, &path) {
+                continue;
+            }
 
             let target = destination.join(entry.file_name());
             let metadata = entry.metadata()?;
@@ -1768,11 +1988,15 @@ pub mod supervisor {
     }
 
     fn history_entry_id() -> String {
-        let nanos = SystemTime::now()
+        let nanos = unix_timestamp_nanos();
+        format!("history-{}-{nanos}", std::process::id())
+    }
+
+    fn unix_timestamp_nanos() -> u128 {
+        SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|duration| duration.as_nanos())
-            .unwrap_or(0);
-        format!("history-{}-{nanos}", std::process::id())
+            .unwrap_or(0)
     }
 
     fn sanitize_field(value: &str) -> String {
@@ -1794,6 +2018,9 @@ pub mod supervisor {
             let entry = entry?;
             let path = entry.path();
             if path == managed_dir.join(AGENT_HOME_DIR) {
+                continue;
+            }
+            if is_nested_managed_root(managed_dir, &path) {
                 continue;
             }
 
@@ -1912,6 +2139,9 @@ pub mod supervisor {
             if path == managed_dir.join(AGENT_HOME_DIR) {
                 continue;
             }
+            if is_nested_managed_root(managed_dir, &path) {
+                continue;
+            }
 
             let metadata = entry.metadata()?;
             if metadata.is_dir() {
@@ -1926,6 +2156,42 @@ pub mod supervisor {
             }
         }
         Ok(())
+    }
+
+    fn is_nested_managed_root(managed_dir: &Path, path: &Path) -> bool {
+        path != managed_dir
+            && path.starts_with(managed_dir)
+            && path.join(AGENT_HOME_DIR).join("identity").is_file()
+    }
+
+    fn is_nested_managed_path(managed_dir: &Path, path: &Path) -> bool {
+        if !path.starts_with(managed_dir) {
+            return false;
+        }
+
+        let mut current = path;
+        loop {
+            if is_nested_managed_root(managed_dir, current) {
+                return true;
+            }
+            let Some(parent) = current.parent() else {
+                return false;
+            };
+            if parent == current || !parent.starts_with(managed_dir) {
+                return false;
+            }
+            current = parent;
+        }
+    }
+
+    fn path_has_agent_home_component(managed_dir: &Path, path: &Path) -> bool {
+        let Ok(relative) = path.strip_prefix(managed_dir) else {
+            return false;
+        };
+
+        relative
+            .components()
+            .any(|component| component.as_os_str() == AGENT_HOME_DIR)
     }
 }
 
@@ -1955,6 +2221,15 @@ pub mod client {
             std::env::current_dir().map_err(Error::Io)?.join(path)
         };
         send_request(&format!("INSTALL {}", path.display()))
+    }
+
+    pub fn remove(path: &Path) -> Result<String, Error> {
+        let path = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir().map_err(Error::Io)?.join(path)
+        };
+        send_request(&format!("REMOVE {}", path.display()))
     }
 
     pub fn agents() -> Result<String, Error> {
