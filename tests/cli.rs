@@ -217,10 +217,19 @@ fn remove_managed_dir(
     afs_home: &std::path::Path,
     managed_dir: &std::path::Path,
 ) -> std::process::Output {
+    remove_managed_dir_with_flags(afs_home, managed_dir, &[])
+}
+
+fn remove_managed_dir_with_flags(
+    afs_home: &std::path::Path,
+    managed_dir: &std::path::Path,
+    flags: &[&str],
+) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_afs"))
         .env("AFS_HOME", afs_home)
         .arg("remove")
         .arg(managed_dir)
+        .args(flags)
         .output()
         .expect("afs remove should run")
 }
@@ -1775,6 +1784,404 @@ fn transitive_removal_chains_origin_and_rewrites_ownership_summaries() {
             .lines()
             .any(|line| line.contains("summary=Ownership split: child/grandchild")),
         "grandparent history should rewrite the merged ownership-split summary to child/grandchild; got:\n{stdout}"
+    );
+
+    stop_daemon(&mut daemon);
+}
+
+#[test]
+fn removing_top_level_managed_directory_archives_agent_home_under_supervisor_home() {
+    let afs_home = unique_afs_home("top-level-remove-archive");
+    let managed_dir = unique_afs_home("top-level-remove-archive-managed");
+    let pi_runtime = fake_pi_runtime("top-level-remove-archive-runtime");
+    let socket_path = supervisor_socket(&afs_home);
+    std::fs::create_dir_all(&managed_dir).expect("test should create managed directory");
+    let target_file = managed_dir.join("notes.txt");
+    std::fs::write(&target_file, "before remove\n").expect("test should create target file");
+    let managed_dir = managed_dir
+        .canonicalize()
+        .expect("managed directory should canonicalize");
+    let target_file = target_file
+        .canonicalize()
+        .expect("target file should canonicalize");
+    let mut daemon = start_daemon_with_pi_runtime(&afs_home, &pi_runtime);
+
+    assert!(
+        wait_until(Duration::from_secs(2), || socket_path
+            .metadata()
+            .map(|metadata| metadata.file_type().is_socket())
+            .unwrap_or(false)),
+        "daemon should create the Supervisor Socket before install connects"
+    );
+
+    assert!(
+        install_managed_dir(&afs_home, &managed_dir)
+            .status
+            .success(),
+        "top-level afs install should succeed"
+    );
+    let identity =
+        std::fs::read_to_string(managed_dir.join(".afs/identity")).expect("identity exists");
+
+    std::fs::write(&target_file, "after external change\n")
+        .expect("test should modify file before removal");
+    assert!(
+        wait_until(Duration::from_secs(3), || {
+            let history = afs_history(&afs_home, &managed_dir);
+            history.status.success()
+                && String::from_utf8_lossy(&history.stdout)
+                    .contains("summary=External change: notes.txt")
+        }),
+        "managed directory should have a live external-change entry before removal"
+    );
+
+    let remove = remove_managed_dir(&afs_home, &managed_dir);
+    assert!(
+        remove.status.success(),
+        "afs remove should succeed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&remove.stdout),
+        String::from_utf8_lossy(&remove.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&remove.stderr), "");
+    let remove_stdout = String::from_utf8_lossy(&remove.stdout);
+    assert!(
+        remove_stdout.contains("removed managed directory"),
+        "afs remove should report the removed directory; got:\n{remove_stdout}"
+    );
+    assert!(
+        remove_stdout.contains("archived_agent_home "),
+        "afs remove should report the archive location; got:\n{remove_stdout}"
+    );
+
+    assert!(
+        !managed_dir.join(".afs").exists(),
+        "removed Agent Home should move out of the managed directory"
+    );
+    let archive_root = afs_home.join("archives");
+    let archived_home = std::fs::read_dir(&archive_root)
+        .expect("supervisor archive root should exist")
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .find(|path| {
+            std::fs::read_to_string(path.join("identity"))
+                .map(|archived_identity| archived_identity == identity)
+                .unwrap_or(false)
+        })
+        .expect("supervisor archive should contain the removed Agent Home");
+    let archived_log = Command::new("git")
+        .arg("-c")
+        .arg("safe.directory=*")
+        .arg(format!(
+            "--git-dir={}",
+            archived_home.join("history/repo").display()
+        ))
+        .arg("log")
+        .arg("--format=%B")
+        .output()
+        .expect("git log on archived history should run");
+    assert!(
+        archived_log.status.success(),
+        "archived history should be a readable git repo: {}",
+        String::from_utf8_lossy(&archived_log.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&archived_log.stdout).contains("External change: notes.txt"),
+        "archive should preserve the pre-removal history"
+    );
+
+    let agents = Command::new(env!("CARGO_BIN_EXE_afs"))
+        .env("AFS_HOME", &afs_home)
+        .arg("agents")
+        .output()
+        .expect("afs agents should run");
+    assert!(agents.status.success(), "afs agents should succeed");
+    assert_eq!(
+        String::from_utf8_lossy(&agents.stdout),
+        "no agents registered\n",
+        "afs agents should report no registrations after top-level remove"
+    );
+
+    stop_daemon(&mut daemon);
+}
+
+#[test]
+fn removing_top_level_managed_directory_with_discard_history_deletes_agent_home() {
+    let afs_home = unique_afs_home("top-level-remove-discard");
+    let managed_dir = unique_afs_home("top-level-remove-discard-managed");
+    let pi_runtime = fake_pi_runtime("top-level-remove-discard-runtime");
+    let socket_path = supervisor_socket(&afs_home);
+    std::fs::create_dir_all(&managed_dir).expect("test should create managed directory");
+    let managed_dir = managed_dir
+        .canonicalize()
+        .expect("managed directory should canonicalize");
+    let mut daemon = start_daemon_with_pi_runtime(&afs_home, &pi_runtime);
+
+    assert!(
+        wait_until(Duration::from_secs(2), || socket_path
+            .metadata()
+            .map(|metadata| metadata.file_type().is_socket())
+            .unwrap_or(false)),
+        "daemon should create the Supervisor Socket before install connects"
+    );
+
+    assert!(
+        install_managed_dir(&afs_home, &managed_dir)
+            .status
+            .success(),
+        "top-level afs install should succeed"
+    );
+
+    let remove = remove_managed_dir_with_flags(&afs_home, &managed_dir, &["--discard-history"]);
+    assert!(
+        remove.status.success(),
+        "afs remove --discard-history should succeed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&remove.stdout),
+        String::from_utf8_lossy(&remove.stderr)
+    );
+    let remove_stdout = String::from_utf8_lossy(&remove.stdout);
+    assert!(
+        remove_stdout.contains("discarded_agent_home "),
+        "afs remove --discard-history should report a discarded_agent_home line; got:\n{remove_stdout}"
+    );
+    assert!(
+        !remove_stdout.contains("archived_agent_home "),
+        "afs remove --discard-history should not report an archive location; got:\n{remove_stdout}"
+    );
+
+    assert!(
+        !managed_dir.join(".afs").exists(),
+        "managed Agent Home should be deleted on --discard-history"
+    );
+    let archive_root = afs_home.join("archives");
+    let archive_is_empty = !archive_root.exists()
+        || std::fs::read_dir(&archive_root)
+            .expect("archive root readable")
+            .next()
+            .is_none();
+    assert!(
+        archive_is_empty,
+        "supervisor archive root should remain empty when --discard-history is set"
+    );
+
+    let agents = Command::new(env!("CARGO_BIN_EXE_afs"))
+        .env("AFS_HOME", &afs_home)
+        .arg("agents")
+        .output()
+        .expect("afs agents should run");
+    assert_eq!(
+        String::from_utf8_lossy(&agents.stdout),
+        "no agents registered\n",
+        "afs agents should reflect the removal even with --discard-history"
+    );
+
+    stop_daemon(&mut daemon);
+}
+
+#[test]
+fn removing_nested_managed_directory_with_discard_history_skips_archive_and_merge() {
+    let afs_home = unique_afs_home("nested-remove-discard");
+    let parent_dir = unique_afs_home("nested-remove-discard-parent");
+    let pi_runtime = fake_pi_runtime("nested-remove-discard-runtime");
+    let socket_path = supervisor_socket(&afs_home);
+    let child_dir = parent_dir.join("child");
+    std::fs::create_dir_all(&child_dir).expect("test should create child directory");
+    let child_file = child_dir.join("notes.txt");
+    std::fs::write(&child_file, "child content\n").expect("test should create child file");
+    let parent_dir = parent_dir
+        .canonicalize()
+        .expect("parent managed directory should canonicalize");
+    let child_dir = child_dir
+        .canonicalize()
+        .expect("child managed directory should canonicalize");
+    let child_file = child_file
+        .canonicalize()
+        .expect("child file should canonicalize");
+    let mut daemon = start_daemon_with_pi_runtime(&afs_home, &pi_runtime);
+
+    assert!(
+        wait_until(Duration::from_secs(2), || socket_path
+            .metadata()
+            .map(|metadata| metadata.file_type().is_socket())
+            .unwrap_or(false)),
+        "daemon should create the Supervisor Socket before install connects"
+    );
+
+    assert!(
+        install_managed_dir(&afs_home, &parent_dir).status.success(),
+        "parent afs install should succeed"
+    );
+    assert!(
+        install_managed_dir(&afs_home, &child_dir).status.success(),
+        "child afs install should succeed"
+    );
+
+    std::fs::write(&child_file, "child edit pre-removal\n")
+        .expect("test should modify child before removal");
+    assert!(
+        wait_until(Duration::from_secs(3), || {
+            let child_history = afs_history(&afs_home, &child_dir);
+            child_history.status.success()
+                && String::from_utf8_lossy(&child_history.stdout)
+                    .contains("summary=External change: notes.txt")
+        }),
+        "child history should record an external change before removal"
+    );
+
+    let remove = remove_managed_dir_with_flags(&afs_home, &child_dir, &["--discard-history"]);
+    assert!(
+        remove.status.success(),
+        "nested afs remove --discard-history should succeed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&remove.stdout),
+        String::from_utf8_lossy(&remove.stderr)
+    );
+    let remove_stdout = String::from_utf8_lossy(&remove.stdout);
+    assert!(
+        remove_stdout.contains("discarded_agent_home "),
+        "nested --discard-history should report a discarded_agent_home; got:\n{remove_stdout}"
+    );
+    assert!(
+        !remove_stdout.contains("archived_agent_home "),
+        "nested --discard-history should not report an archive location; got:\n{remove_stdout}"
+    );
+
+    assert!(
+        !child_dir.join(".afs").exists(),
+        "child Agent Home should be deleted on --discard-history"
+    );
+    let parent_archive_root = parent_dir.join(".afs/archives");
+    let archive_is_empty = !parent_archive_root.exists()
+        || std::fs::read_dir(&parent_archive_root)
+            .expect("parent archive root readable")
+            .next()
+            .is_none();
+    assert!(
+        archive_is_empty,
+        "parent archive root should remain empty when --discard-history is set"
+    );
+
+    let parent_history = afs_history(&afs_home, &parent_dir);
+    assert!(
+        parent_history.status.success(),
+        "afs history on parent should succeed"
+    );
+    let parent_stdout = String::from_utf8_lossy(&parent_history.stdout);
+    assert!(
+        parent_stdout.contains("Ownership merge: child (history discarded)"),
+        "parent history should record that child history was discarded; got:\n{parent_stdout}"
+    );
+    assert!(
+        !parent_stdout.contains("External change: child/notes.txt"),
+        "parent history should NOT carry merged child entries after --discard-history; got:\n{parent_stdout}"
+    );
+
+    stop_daemon(&mut daemon);
+}
+
+#[test]
+fn removing_top_level_managed_directory_that_no_longer_exists_unregisters_cleanly() {
+    let afs_home = unique_afs_home("top-level-remove-missing");
+    let managed_dir = unique_afs_home("top-level-remove-missing-managed");
+    let pi_runtime = fake_pi_runtime("top-level-remove-missing-runtime");
+    let socket_path = supervisor_socket(&afs_home);
+    std::fs::create_dir_all(&managed_dir).expect("test should create managed directory");
+    let managed_dir = managed_dir
+        .canonicalize()
+        .expect("managed directory should canonicalize");
+    let mut daemon = start_daemon_with_pi_runtime(&afs_home, &pi_runtime);
+
+    assert!(
+        wait_until(Duration::from_secs(2), || socket_path
+            .metadata()
+            .map(|metadata| metadata.file_type().is_socket())
+            .unwrap_or(false)),
+        "daemon should create the Supervisor Socket before install connects"
+    );
+
+    assert!(
+        install_managed_dir(&afs_home, &managed_dir)
+            .status
+            .success(),
+        "top-level afs install should succeed"
+    );
+
+    std::fs::remove_dir_all(&managed_dir).expect("test should wipe the managed directory off disk");
+
+    let remove = remove_managed_dir_with_flags(&afs_home, &managed_dir, &["--discard-history"]);
+    assert!(
+        remove.status.success(),
+        "afs remove on a missing directory should succeed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&remove.stdout),
+        String::from_utf8_lossy(&remove.stderr)
+    );
+
+    let agents = Command::new(env!("CARGO_BIN_EXE_afs"))
+        .env("AFS_HOME", &afs_home)
+        .arg("agents")
+        .output()
+        .expect("afs agents should run");
+    assert_eq!(
+        String::from_utf8_lossy(&agents.stdout),
+        "no agents registered\n",
+        "afs agents should report no registrations after removing a missing directory"
+    );
+
+    let registry_path = afs_home.join("registry.tsv");
+    let registry_has_live_entry = std::fs::read_to_string(&registry_path)
+        .map(|contents| contents.lines().skip(1).any(|line| !line.trim().is_empty()))
+        .unwrap_or(false);
+    assert!(
+        !registry_has_live_entry,
+        "registry should not keep a stale entry for the removed directory"
+    );
+
+    stop_daemon(&mut daemon);
+}
+
+#[test]
+fn removing_top_level_managed_directory_that_contains_supervisor_home_is_rejected() {
+    let managed_dir = unique_afs_home("top-level-remove-supervisor-inside");
+    std::fs::create_dir_all(&managed_dir).expect("test should create managed directory");
+    let managed_dir = managed_dir
+        .canonicalize()
+        .expect("managed directory should canonicalize");
+    let afs_home = managed_dir.join(".afs-supervisor");
+    let pi_runtime = fake_pi_runtime("top-level-remove-supervisor-inside-runtime");
+    let socket_path = supervisor_socket(&afs_home);
+    let mut daemon = start_daemon_with_pi_runtime(&afs_home, &pi_runtime);
+
+    assert!(
+        wait_until(Duration::from_secs(2), || socket_path
+            .metadata()
+            .map(|metadata| metadata.file_type().is_socket())
+            .unwrap_or(false)),
+        "daemon should create the Supervisor Socket before install connects"
+    );
+
+    assert!(
+        install_managed_dir(&afs_home, &managed_dir)
+            .status
+            .success(),
+        "top-level afs install should succeed"
+    );
+
+    let remove = remove_managed_dir(&afs_home, &managed_dir);
+    assert!(
+        !remove.status.success(),
+        "afs remove should fail when the supervisor home is inside the managed directory"
+    );
+    let stderr = String::from_utf8_lossy(&remove.stderr);
+    assert!(
+        stderr.contains("cannot remove a managed directory that contains the AFS supervisor home"),
+        "afs remove should explain the supervisor-home collision; got stderr:\n{stderr}"
+    );
+
+    let agents = Command::new(env!("CARGO_BIN_EXE_afs"))
+        .env("AFS_HOME", &afs_home)
+        .arg("agents")
+        .output()
+        .expect("afs agents should run");
+    assert!(
+        String::from_utf8_lossy(&agents.stdout).contains(&managed_dir.display().to_string()),
+        "managed directory should remain registered after rejected removal"
     );
 
     stop_daemon(&mut daemon);
