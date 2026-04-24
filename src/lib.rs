@@ -1634,8 +1634,17 @@ pub mod supervisor {
                 .iter()
                 .map(|file| prefix_child_path(child_origin, file))
                 .collect();
-            let rewritten_summary =
-                rewrite_summary_paths(&original_summary, &original_files, &rewritten_files);
+            let rewritten_summary = if kind == "ownership" {
+                rewrite_ownership_summary(&original_summary, child_origin)
+            } else {
+                rewrite_summary_paths(&original_summary, &original_files, &rewritten_files)
+            };
+            let existing_origin = record
+                .trailers
+                .get("Afs-Origin")
+                .cloned()
+                .unwrap_or_default();
+            let chained_origin = chain_origins(child_origin, &existing_origin);
             git_commit_index(
                 &parent_git_dir,
                 parent_managed_dir,
@@ -1646,7 +1655,7 @@ pub mod supervisor {
                     files: &rewritten_files,
                     undoable: false,
                     undoes: None,
-                    origin: Some(child_origin),
+                    origin: Some(&chained_origin),
                 },
             )?;
         }
@@ -1658,6 +1667,14 @@ pub mod supervisor {
             return file.to_string();
         }
         format!("{origin}/{file}")
+    }
+
+    fn chain_origins(outer: &str, inner: &str) -> String {
+        match (outer.is_empty(), inner.is_empty()) {
+            (true, _) => inner.to_string(),
+            (_, true) => outer.to_string(),
+            _ => format!("{outer}/{inner}"),
+        }
     }
 
     fn rewrite_summary_paths(
@@ -1673,6 +1690,18 @@ pub mod supervisor {
             result = result.replacen(original, rewritten, 1);
         }
         result
+    }
+
+    fn rewrite_ownership_summary(summary: &str, origin_prefix: &str) -> String {
+        if origin_prefix.is_empty() {
+            return summary.to_string();
+        }
+        match summary.split_once(": ") {
+            Some((prefix, path)) if !path.is_empty() => {
+                format!("{prefix}: {origin_prefix}/{path}")
+            }
+            _ => summary.to_string(),
+        }
     }
 
     fn archive_agent_home(

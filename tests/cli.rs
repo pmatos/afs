@@ -1670,6 +1670,117 @@ fn removing_nested_managed_directory_surfaces_child_history_in_parent() {
 }
 
 #[test]
+fn transitive_removal_chains_origin_and_rewrites_ownership_summaries() {
+    let afs_home = unique_afs_home("nested-remove-transitive");
+    let grandparent_dir = unique_afs_home("nested-remove-transitive-gp");
+    let pi_runtime = fake_pi_runtime("nested-remove-transitive-runtime");
+    let socket_path = supervisor_socket(&afs_home);
+    let child_dir = grandparent_dir.join("child");
+    let grandchild_dir = child_dir.join("grandchild");
+    std::fs::create_dir_all(&grandchild_dir).expect("test should create nested layout");
+    let grandchild_file = grandchild_dir.join("notes.txt");
+    std::fs::write(&grandchild_file, "initial grandchild content\n")
+        .expect("test should create grandchild file");
+    let grandparent_dir = grandparent_dir
+        .canonicalize()
+        .expect("grandparent should canonicalize");
+    let child_dir = child_dir.canonicalize().expect("child should canonicalize");
+    let grandchild_dir = grandchild_dir
+        .canonicalize()
+        .expect("grandchild should canonicalize");
+    let grandchild_file = grandchild_file
+        .canonicalize()
+        .expect("grandchild file should canonicalize");
+    let mut daemon = start_daemon_with_pi_runtime(&afs_home, &pi_runtime);
+
+    assert!(
+        wait_until(Duration::from_secs(2), || socket_path
+            .metadata()
+            .map(|metadata| metadata.file_type().is_socket())
+            .unwrap_or(false)),
+        "daemon should create the Supervisor Socket before install connects"
+    );
+
+    assert!(
+        install_managed_dir(&afs_home, &grandparent_dir)
+            .status
+            .success(),
+        "grandparent install should succeed"
+    );
+    assert!(
+        install_managed_dir(&afs_home, &child_dir).status.success(),
+        "child install should succeed"
+    );
+    assert!(
+        install_managed_dir(&afs_home, &grandchild_dir)
+            .status
+            .success(),
+        "grandchild install should succeed"
+    );
+
+    std::fs::write(&grandchild_file, "grandchild edit pre-removal\n")
+        .expect("test should edit grandchild file");
+    assert!(
+        wait_until(Duration::from_secs(3), || {
+            let history = afs_history(&afs_home, &grandchild_dir);
+            history.status.success()
+                && String::from_utf8_lossy(&history.stdout)
+                    .contains("summary=External change: notes.txt")
+        }),
+        "grandchild history should record the external change before removal"
+    );
+
+    let remove_grandchild = remove_managed_dir(&afs_home, &grandchild_dir);
+    assert!(
+        remove_grandchild.status.success(),
+        "afs remove grandchild should succeed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&remove_grandchild.stdout),
+        String::from_utf8_lossy(&remove_grandchild.stderr)
+    );
+
+    let remove_child = remove_managed_dir(&afs_home, &child_dir);
+    assert!(
+        remove_child.status.success(),
+        "afs remove child should succeed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&remove_child.stdout),
+        String::from_utf8_lossy(&remove_child.stderr)
+    );
+
+    let grandparent_history = afs_history(&afs_home, &grandparent_dir);
+    assert!(
+        grandparent_history.status.success(),
+        "afs history on grandparent should succeed"
+    );
+    let stdout = String::from_utf8_lossy(&grandparent_history.stdout);
+
+    let external_line = stdout
+        .lines()
+        .find(|line| line.contains("summary=External change: child/grandchild/notes.txt"))
+        .unwrap_or_else(|| {
+            panic!("grandparent history should surface the grandchild external change rewritten to child/grandchild/notes.txt; got:\n{stdout}")
+        });
+    assert!(
+        external_line.contains("origin=child/grandchild"),
+        "transitively-merged entries should chain their origin provenance; got:\n{external_line}"
+    );
+
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line.contains("summary=Ownership merge: child/grandchild")),
+        "grandparent history should rewrite the merged ownership summary to child/grandchild; got:\n{stdout}"
+    );
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line.contains("summary=Ownership split: child/grandchild")),
+        "grandparent history should rewrite the merged ownership-split summary to child/grandchild; got:\n{stdout}"
+    );
+
+    stop_daemon(&mut daemon);
+}
+
+#[test]
 fn ask_answer_for_managed_path_includes_file_reference_and_index_caveat() {
     let afs_home = unique_afs_home("ask-reference-caveat");
     let managed_dir = unique_afs_home("ask-reference-caveat-managed");
