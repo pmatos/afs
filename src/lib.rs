@@ -177,6 +177,14 @@ pub mod supervisor {
                     "managed path must be a directory",
                 ));
             }
+
+            if crate::config::Config::load(&self.home)?.is_none() {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "authentication required: run `afs login --provider claude|openai` before installing a managed directory",
+                ));
+            }
+
             let parent_agent_index = self.parent_agent_index(&managed_dir);
 
             let agent_home = managed_dir.join(AGENT_HOME_DIR);
@@ -693,11 +701,11 @@ pub mod supervisor {
             let stdin = process
                 .stdin
                 .take()
-                .ok_or_else(|| io::Error::other("Pi Agent Runtime stdin is unavailable"))?;
+                .ok_or_else(|| io::Error::other("AFS agent runtime stdin is unavailable"))?;
             let stdout = process
                 .stdout
                 .take()
-                .ok_or_else(|| io::Error::other("Pi Agent Runtime stdout is unavailable"))?;
+                .ok_or_else(|| io::Error::other("AFS agent runtime stdout is unavailable"))?;
             let monitor = start_directory_monitor(managed_dir.clone(), agent_home.clone())?;
             self.agents.push(RegisteredAgent {
                 identity: identity.to_string(),
@@ -1153,7 +1161,7 @@ pub mod supervisor {
                 Ok(0) if line.is_empty() => {
                     return Err(io::Error::new(
                         io::ErrorKind::UnexpectedEof,
-                        "Pi Agent Runtime closed before answering",
+                        "AFS agent runtime closed before answering",
                     ));
                 }
                 Ok(0) => return Ok(String::from_utf8_lossy(&line).to_string()),
@@ -1180,7 +1188,7 @@ pub mod supervisor {
                 Ok(0) if buffer.is_empty() => {
                     return Err(io::Error::new(
                         io::ErrorKind::UnexpectedEof,
-                        "Pi Agent Runtime closed before answering",
+                        "AFS agent runtime closed before answering",
                     ));
                 }
                 Ok(0) => {
@@ -1286,17 +1294,25 @@ pub mod supervisor {
         agent_home: &Path,
         identity: &str,
     ) -> io::Result<Child> {
+        let afs_home = home()?;
+        let config = crate::config::Config::load(&afs_home)?.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "AFS is not configured. Run `afs login --provider claude|openai` to authenticate.",
+            )
+        })?;
         let runtime = pi_runtime_command();
-        Command::new(&runtime)
-            .arg("agent")
-            .arg("--rpc")
-            .arg("stdio")
-            .arg("--managed-dir")
-            .arg(managed_dir)
-            .arg("--agent-home")
-            .arg(agent_home)
-            .arg("--identity")
-            .arg(identity)
+        let mut command = Command::new(&runtime);
+        command
+            .arg("--mode")
+            .arg("rpc")
+            .arg("--provider")
+            .arg(config.provider.as_cli_str());
+        if let Some(model) = config.model.as_deref() {
+            command.arg("--model").arg(model);
+        }
+        command
+            .current_dir(managed_dir)
             .env("AFS_AGENT_ID", identity)
             .env("AFS_AGENT_HOME", agent_home)
             .env("AFS_MANAGED_DIR", managed_dir)
@@ -1310,7 +1326,7 @@ pub mod supervisor {
                     io::Error::new(
                         io::ErrorKind::NotFound,
                         format!(
-                            "Pi Agent Runtime command not found: {} (set {PI_RUNTIME_ENV})",
+                            "AFS agent runtime not found: {} (set {PI_RUNTIME_ENV})",
                             runtime.display()
                         ),
                     )
@@ -1320,7 +1336,7 @@ pub mod supervisor {
             })
     }
 
-    fn pi_runtime_command() -> PathBuf {
+    pub fn pi_runtime_command() -> PathBuf {
         std::env::var_os(PI_RUNTIME_ENV)
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("pi"))
@@ -2463,5 +2479,247 @@ pub mod client {
             io::ErrorKind::InvalidData,
             "supervisor returned an invalid response",
         )))
+    }
+}
+
+pub mod login {
+    use std::io::{self, IsTerminal};
+    use std::path::PathBuf;
+    use std::process::{Command, Stdio};
+
+    use crate::config::{AuthMethod, Config, Provider};
+    use crate::supervisor;
+
+    pub const ALLOW_NO_TTY_ENV: &str = "AFS_LOGIN_ALLOW_NO_TTY";
+
+    #[derive(Debug)]
+    pub enum Error {
+        MissingProvider,
+        UnsupportedProvider(String),
+        NoTty,
+        Io(io::Error),
+        AgentRuntimeNotFound(PathBuf),
+        VerificationFailed(String),
+    }
+
+    impl std::fmt::Display for Error {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Error::MissingProvider => {
+                    write!(f, "specify `--provider claude` or `--provider openai`")
+                }
+                Error::UnsupportedProvider(name) => write!(
+                    f,
+                    "provider `{name}` is not supported in this version; use `claude` or `openai`"
+                ),
+                Error::NoTty => write!(f, "`afs login` must be run in an interactive terminal"),
+                Error::AgentRuntimeNotFound(path) => write!(
+                    f,
+                    "AFS agent runtime not found: {} (set AFS_PI_RUNTIME)",
+                    path.display()
+                ),
+                Error::VerificationFailed(message) => write!(f, "{message}"),
+                Error::Io(error) => write!(f, "{error}"),
+            }
+        }
+    }
+
+    impl From<io::Error> for Error {
+        fn from(error: io::Error) -> Self {
+            Error::Io(error)
+        }
+    }
+
+    pub fn run(provider_arg: Option<&str>) -> Result<String, Error> {
+        let provider = match provider_arg {
+            None => return Err(Error::MissingProvider),
+            Some(raw) => {
+                Provider::parse(raw).ok_or_else(|| Error::UnsupportedProvider(raw.to_string()))?
+            }
+        };
+
+        if !tty_ok() {
+            return Err(Error::NoTty);
+        }
+
+        let home_dir = user_home()?;
+        let runtime = supervisor::pi_runtime_command();
+        let status = Command::new(&runtime)
+            .arg("--provider")
+            .arg(provider.as_cli_str())
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .map_err(|error| {
+                if error.kind() == io::ErrorKind::NotFound {
+                    Error::AgentRuntimeNotFound(runtime.clone())
+                } else {
+                    Error::Io(error)
+                }
+            })?
+            .wait()?;
+
+        verify_auth(&home_dir, provider, status.success())?;
+
+        let afs_home = supervisor::home()?;
+        let config = Config {
+            provider,
+            model: None,
+            auth_method: AuthMethod::Oauth,
+            api_key_env: None,
+        };
+        config.save(&afs_home)?;
+
+        Ok(format!(
+            "authenticated with {}. run `afs install <path>` to activate a managed directory.\n",
+            provider.as_cli_str()
+        ))
+    }
+
+    fn tty_ok() -> bool {
+        if std::env::var_os(ALLOW_NO_TTY_ENV).is_some() {
+            return true;
+        }
+        io::stdin().is_terminal() && io::stdout().is_terminal()
+    }
+
+    fn user_home() -> io::Result<PathBuf> {
+        std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "HOME is not set"))
+    }
+
+    fn verify_auth(
+        home_dir: &std::path::Path,
+        provider: Provider,
+        exit_ok: bool,
+    ) -> Result<(), Error> {
+        let auth_path = home_dir.join(".pi").join("agent").join("auth.json");
+        let body = std::fs::read_to_string(&auth_path).map_err(|error| match error.kind() {
+            io::ErrorKind::NotFound => Error::VerificationFailed(
+                "authentication did not complete; please try again".to_string(),
+            ),
+            _ => Error::Io(error),
+        })?;
+        let value: serde_json::Value = serde_json::from_str(&body).map_err(|_| {
+            Error::VerificationFailed("authentication store is corrupted".to_string())
+        })?;
+        let entry = value.get(provider.auth_json_key()).ok_or_else(|| {
+            Error::VerificationFailed(
+                "authentication did not complete; please try again".to_string(),
+            )
+        })?;
+        if entry.get("type").is_none() {
+            return Err(Error::VerificationFailed(
+                "authentication did not complete; please try again".to_string(),
+            ));
+        }
+        if !exit_ok {
+            return Err(Error::VerificationFailed(
+                "authentication did not complete; please try again".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+pub mod config {
+    use std::io;
+    use std::path::{Path, PathBuf};
+
+    use serde::{Deserialize, Serialize};
+
+    pub const CONFIG_FILE: &str = "config.json";
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum AuthMethod {
+        Oauth,
+        ApiKey,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum Provider {
+        Claude,
+        Openai,
+    }
+
+    impl Provider {
+        pub fn as_cli_str(&self) -> &'static str {
+            match self {
+                Provider::Claude => "claude",
+                Provider::Openai => "openai",
+            }
+        }
+
+        pub fn auth_json_key(&self) -> &'static str {
+            match self {
+                Provider::Claude => "anthropic",
+                Provider::Openai => "openai",
+            }
+        }
+
+        pub fn parse(input: &str) -> Option<Self> {
+            match input {
+                "claude" => Some(Provider::Claude),
+                "openai" => Some(Provider::Openai),
+                _ => None,
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct Config {
+        pub provider: Provider,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub model: Option<String>,
+        pub auth_method: AuthMethod,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub api_key_env: Option<String>,
+    }
+
+    impl Config {
+        pub fn load(afs_home: &Path) -> io::Result<Option<Config>> {
+            let path = config_path(afs_home);
+            let body = match std::fs::read_to_string(&path) {
+                Ok(body) => body,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => return Err(error),
+            };
+            let config: Config = serde_json::from_str(&body).map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("{} is not valid AFS config: {error}", path.display()),
+                )
+            })?;
+            config.validate().map_err(|message| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("{} is not valid AFS config: {message}", path.display()),
+                )
+            })?;
+            Ok(Some(config))
+        }
+
+        pub fn save(&self, afs_home: &Path) -> io::Result<()> {
+            self.validate()
+                .map_err(|message| io::Error::new(io::ErrorKind::InvalidInput, message))?;
+            std::fs::create_dir_all(afs_home)?;
+            let body = serde_json::to_string_pretty(self).map_err(io::Error::other)?;
+            std::fs::write(config_path(afs_home), body)
+        }
+
+        fn validate(&self) -> Result<(), String> {
+            if matches!(self.auth_method, AuthMethod::ApiKey) && self.api_key_env.is_none() {
+                return Err("auth_method \"api_key\" requires api_key_env".to_string());
+            }
+            Ok(())
+        }
+    }
+
+    pub fn config_path(afs_home: &Path) -> PathBuf {
+        afs_home.join(CONFIG_FILE)
     }
 }

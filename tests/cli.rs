@@ -38,7 +38,96 @@ fn start_daemon(afs_home: &std::path::Path) -> Child {
         .expect("afs daemon should start")
 }
 
+fn write_default_config(afs_home: &std::path::Path) {
+    std::fs::create_dir_all(afs_home).expect("test should create afs home");
+    let path = afs_home.join("config.json");
+    if path.exists() {
+        return;
+    }
+    std::fs::write(&path, r#"{"provider":"claude","auth_method":"oauth"}"#)
+        .expect("test should write default config");
+}
+
+fn write_config(afs_home: &std::path::Path, body: &str) {
+    std::fs::create_dir_all(afs_home).expect("test should create afs home");
+    std::fs::write(afs_home.join("config.json"), body).expect("test should write config");
+}
+
+fn fake_pi_login_runtime(test_name: &str, succeed: bool, provider: &str) -> std::path::PathBuf {
+    let runtime_dir = unique_afs_home(test_name);
+    std::fs::create_dir_all(&runtime_dir).expect("test should create fake login runtime directory");
+    let runtime = runtime_dir.join("pi");
+    let auth_key = match provider {
+        "claude" => "anthropic",
+        "openai" => "openai",
+        other => panic!("fake login runtime does not support provider {other}"),
+    };
+    let script = if succeed {
+        format!(
+            r#"#!/bin/sh
+mkdir -p "$HOME/.pi/agent"
+cat > "$HOME/.pi/agent/auth.json" <<'JSON'
+{{"{key}":{{"type":"oauth","accessToken":"fake","refreshToken":"fake","expiresAt":9999999999999}}}}
+JSON
+exit 0
+"#,
+            key = auth_key
+        )
+    } else {
+        String::from(
+            r#"#!/bin/sh
+exit 1
+"#,
+        )
+    };
+    std::fs::write(&runtime, script).expect("test should write fake login runtime");
+    let mut permissions = std::fs::metadata(&runtime)
+        .expect("test should read fake runtime metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&runtime, permissions)
+        .expect("test should set fake runtime permissions");
+    runtime
+}
+
+fn fake_pi_login_runtime_exits_zero_no_auth(test_name: &str) -> std::path::PathBuf {
+    let runtime_dir = unique_afs_home(test_name);
+    std::fs::create_dir_all(&runtime_dir).expect("test should create fake login runtime directory");
+    let runtime = runtime_dir.join("pi");
+    std::fs::write(&runtime, "#!/bin/sh\nexit 0\n").expect("test should write fake login runtime");
+    let mut permissions = std::fs::metadata(&runtime)
+        .expect("test should read fake runtime metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&runtime, permissions)
+        .expect("test should set fake runtime permissions");
+    runtime
+}
+
+fn run_afs_login(
+    home_dir: &std::path::Path,
+    afs_home: &std::path::Path,
+    pi_runtime: &std::path::Path,
+    extra_args: &[&str],
+    allow_no_tty: bool,
+) -> std::process::Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_afs"));
+    command
+        .env("HOME", home_dir)
+        .env("AFS_HOME", afs_home)
+        .env("AFS_PI_RUNTIME", pi_runtime)
+        .arg("login");
+    if allow_no_tty {
+        command.env("AFS_LOGIN_ALLOW_NO_TTY", "1");
+    }
+    for arg in extra_args {
+        command.arg(arg);
+    }
+    command.output().expect("afs login should run")
+}
+
 fn start_daemon_with_pi_runtime(afs_home: &std::path::Path, pi_runtime: &std::path::Path) -> Child {
+    write_default_config(afs_home);
     Command::new(env!("CARGO_BIN_EXE_afs"))
         .env("AFS_HOME", afs_home)
         .env("AFS_PI_RUNTIME", pi_runtime)
@@ -54,6 +143,7 @@ fn start_daemon_with_pi_runtime_and_broadcast_timeout(
     pi_runtime: &std::path::Path,
     timeout_ms: u64,
 ) -> Child {
+    write_default_config(afs_home);
     Command::new(env!("CARGO_BIN_EXE_afs"))
         .env("AFS_HOME", afs_home)
         .env("AFS_PI_RUNTIME", pi_runtime)
@@ -72,6 +162,16 @@ fn fake_pi_runtime(test_name: &str) -> std::path::PathBuf {
     std::fs::write(
         &runtime,
         r#"#!/bin/sh
+{
+  printf 'argv=%s\n' "$*"
+  for arg in "$@"; do
+    printf 'arg=%s\n' "$arg"
+  done
+  printf 'env_HOME=%s\n' "$HOME"
+  printf 'env_ANTHROPIC_API_KEY=%s\n' "${ANTHROPIC_API_KEY-}"
+  printf 'env_OPENAI_API_KEY=%s\n' "${OPENAI_API_KEY-}"
+  printf 'done=1\n'
+} > "$AFS_AGENT_HOME/spawn-observed"
 {
   printf 'identity=%s\n' "$AFS_AGENT_ID"
   printf 'managed_dir=%s\n' "$AFS_MANAGED_DIR"
@@ -2561,6 +2661,443 @@ fn gitignored_files_in_managed_dir_are_still_tracked_and_restored_on_undo() {
         std::fs::read_to_string(&ignored_path).expect("ignored file should still be readable"),
         "before\n",
         "undo should restore .gitignored file contents captured at baseline"
+    );
+
+    stop_daemon(&mut daemon);
+}
+
+#[test]
+fn install_without_config_fails_with_authentication_required_message() {
+    let afs_home = unique_afs_home("install-no-config");
+    let mut daemon = start_daemon(&afs_home);
+    assert!(
+        wait_until(Duration::from_secs(2), || supervisor_socket(&afs_home)
+            .metadata()
+            .map(|metadata| metadata.file_type().is_socket())
+            .unwrap_or(false)),
+        "afs daemon should create a Unix supervisor socket"
+    );
+
+    let managed_dir = unique_afs_home("install-no-config-target");
+    std::fs::create_dir_all(&managed_dir).expect("test should create target directory");
+
+    let output = install_managed_dir(&afs_home, &managed_dir);
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    assert!(
+        !output.status.success(),
+        "afs install should fail without config. stderr={stderr}"
+    );
+    assert!(
+        stderr.contains("authentication required"),
+        "stderr should mention authentication. got: {stderr}"
+    );
+    assert!(
+        stderr.contains("afs login"),
+        "stderr should direct the user to `afs login`. got: {stderr}"
+    );
+    for token in ["Pi", "pi ", "pi,", "pi."] {
+        assert!(
+            !stderr.contains(token),
+            "stderr should not leak the word pi. got: {stderr}"
+        );
+    }
+    assert!(
+        !managed_dir.join(".afs").exists(),
+        "install failure should not leave a partial .afs/ directory"
+    );
+
+    stop_daemon(&mut daemon);
+}
+
+#[test]
+fn install_with_valid_config_spawns_agent_runtime_with_provider_and_model() {
+    let afs_home = unique_afs_home("install-with-config");
+    let pi_runtime = fake_pi_runtime("install-with-config-runtime");
+
+    write_config(
+        &afs_home,
+        r#"{"provider":"claude","model":"claude-sonnet-4-6","auth_method":"oauth"}"#,
+    );
+
+    let mut daemon = start_daemon_with_pi_runtime(&afs_home, &pi_runtime);
+    assert!(
+        wait_until(Duration::from_secs(2), || supervisor_socket(&afs_home)
+            .metadata()
+            .map(|metadata| metadata.file_type().is_socket())
+            .unwrap_or(false)),
+        "afs daemon should create a Unix supervisor socket"
+    );
+
+    let managed_dir = unique_afs_home("install-with-config-target");
+    std::fs::create_dir_all(&managed_dir).expect("test should create target directory");
+
+    let output = install_managed_dir(&afs_home, &managed_dir);
+    assert!(
+        output.status.success(),
+        "afs install should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let managed_dir_canonical = managed_dir
+        .canonicalize()
+        .expect("canonicalize managed dir");
+    let spawn_observed = managed_dir_canonical.join(".afs").join("spawn-observed");
+    assert!(
+        wait_until(Duration::from_secs(2), || std::fs::read_to_string(
+            &spawn_observed
+        )
+        .map(|body| body.contains("done=1"))
+        .unwrap_or(false)),
+        "fake agent runtime should record its spawn observations"
+    );
+    let observed =
+        std::fs::read_to_string(&spawn_observed).expect("test should read spawn observations");
+    assert!(
+        observed.contains("arg=--mode") && observed.contains("arg=rpc"),
+        "runtime should be spawned in RPC mode. got:\n{observed}"
+    );
+    assert!(
+        observed.contains("arg=--provider") && observed.contains("arg=claude"),
+        "runtime should receive --provider claude. got:\n{observed}"
+    );
+    assert!(
+        observed.contains("arg=--model") && observed.contains("arg=claude-sonnet-4-6"),
+        "runtime should receive --model from config. got:\n{observed}"
+    );
+
+    stop_daemon(&mut daemon);
+}
+
+#[test]
+fn install_with_config_without_model_omits_model_flag() {
+    let afs_home = unique_afs_home("install-config-no-model");
+    let pi_runtime = fake_pi_runtime("install-config-no-model-runtime");
+
+    write_config(&afs_home, r#"{"provider":"openai","auth_method":"oauth"}"#);
+
+    let mut daemon = start_daemon_with_pi_runtime(&afs_home, &pi_runtime);
+    assert!(
+        wait_until(Duration::from_secs(2), || supervisor_socket(&afs_home)
+            .metadata()
+            .map(|metadata| metadata.file_type().is_socket())
+            .unwrap_or(false)),
+        "afs daemon should create a Unix supervisor socket"
+    );
+
+    let managed_dir = unique_afs_home("install-config-no-model-target");
+    std::fs::create_dir_all(&managed_dir).expect("test should create target directory");
+
+    let output = install_managed_dir(&afs_home, &managed_dir);
+    assert!(
+        output.status.success(),
+        "afs install should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let managed_dir_canonical = managed_dir
+        .canonicalize()
+        .expect("canonicalize managed dir");
+    let spawn_observed = managed_dir_canonical.join(".afs").join("spawn-observed");
+    assert!(
+        wait_until(Duration::from_secs(2), || std::fs::read_to_string(
+            &spawn_observed
+        )
+        .map(|body| body.contains("done=1"))
+        .unwrap_or(false)),
+        "fake agent runtime should record its spawn observations"
+    );
+    let observed =
+        std::fs::read_to_string(&spawn_observed).expect("test should read spawn observations");
+    assert!(
+        observed.contains("arg=--provider") && observed.contains("arg=openai"),
+        "runtime should receive --provider openai. got:\n{observed}"
+    );
+    assert!(
+        !observed.contains("arg=--model"),
+        "runtime should not receive --model when unset in config. got:\n{observed}"
+    );
+
+    stop_daemon(&mut daemon);
+}
+
+#[test]
+fn install_with_api_key_config_forwards_named_env_var_to_runtime() {
+    let afs_home = unique_afs_home("install-api-key");
+    let runtime_dir = unique_afs_home("install-api-key-runtime");
+    std::fs::create_dir_all(&runtime_dir).expect("test should create fake runtime dir");
+    let pi_runtime = runtime_dir.join("pi");
+    // Re-use the shared fake script via a helper function body inlined:
+    std::fs::write(
+        &pi_runtime,
+        r#"#!/bin/sh
+{
+  printf 'env_ANTHROPIC_API_KEY=%s\n' "${ANTHROPIC_API_KEY-}"
+  for arg in "$@"; do
+    printf 'arg=%s\n' "$arg"
+  done
+  printf 'done=1\n'
+} > "$AFS_AGENT_HOME/spawn-observed"
+# Keep the child alive to mimic an agent; the test only inspects spawn-observed.
+cat >/dev/null
+"#,
+    )
+    .expect("test should write fake runtime");
+    let mut permissions = std::fs::metadata(&pi_runtime)
+        .expect("test should read runtime metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&pi_runtime, permissions)
+        .expect("test should set runtime permissions");
+
+    write_config(
+        &afs_home,
+        r#"{"provider":"claude","auth_method":"api_key","api_key_env":"ANTHROPIC_API_KEY"}"#,
+    );
+
+    let mut daemon = Command::new(env!("CARGO_BIN_EXE_afs"))
+        .env("AFS_HOME", &afs_home)
+        .env("AFS_PI_RUNTIME", &pi_runtime)
+        .env("ANTHROPIC_API_KEY", "fake-key-for-test")
+        .arg("daemon")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("afs daemon should start");
+    assert!(
+        wait_until(Duration::from_secs(2), || supervisor_socket(&afs_home)
+            .metadata()
+            .map(|metadata| metadata.file_type().is_socket())
+            .unwrap_or(false)),
+        "afs daemon should create a Unix supervisor socket"
+    );
+
+    let managed_dir = unique_afs_home("install-api-key-target");
+    std::fs::create_dir_all(&managed_dir).expect("test should create target directory");
+
+    let output = install_managed_dir(&afs_home, &managed_dir);
+    assert!(
+        output.status.success(),
+        "afs install should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let managed_dir_canonical = managed_dir
+        .canonicalize()
+        .expect("canonicalize managed dir");
+    let spawn_observed = managed_dir_canonical.join(".afs").join("spawn-observed");
+    assert!(
+        wait_until(Duration::from_secs(2), || std::fs::read_to_string(
+            &spawn_observed
+        )
+        .map(|body| body.contains("done=1"))
+        .unwrap_or(false)),
+        "fake agent runtime should record its spawn observations"
+    );
+    let observed =
+        std::fs::read_to_string(&spawn_observed).expect("test should read spawn observations");
+    assert!(
+        observed.contains("env_ANTHROPIC_API_KEY=fake-key-for-test"),
+        "runtime should receive the api_key_env value. got:\n{observed}"
+    );
+
+    stop_daemon(&mut daemon);
+}
+
+#[test]
+fn login_writes_config_after_runtime_populates_auth_json() {
+    let afs_home = unique_afs_home("login-success");
+    let home_dir = unique_afs_home("login-success-home");
+    std::fs::create_dir_all(&home_dir).expect("test should create home dir");
+    let pi_runtime = fake_pi_login_runtime("login-success-runtime", true, "claude");
+
+    let output = run_afs_login(
+        &home_dir,
+        &afs_home,
+        &pi_runtime,
+        &["--provider", "claude"],
+        true,
+    );
+    assert!(
+        output.status.success(),
+        "afs login should succeed. stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let config_body = std::fs::read_to_string(afs_home.join("config.json"))
+        .expect("config.json should exist after login");
+    assert!(
+        config_body.contains("\"provider\": \"claude\""),
+        "config should record provider. got: {config_body}"
+    );
+    assert!(
+        config_body.contains("\"auth_method\": \"oauth\""),
+        "config should record oauth auth_method. got: {config_body}"
+    );
+    assert!(
+        !config_body.contains("\"model\""),
+        "login should not pin a model. got: {config_body}"
+    );
+}
+
+#[test]
+fn login_fails_when_runtime_exits_without_populating_auth_json() {
+    let afs_home = unique_afs_home("login-no-auth");
+    let home_dir = unique_afs_home("login-no-auth-home");
+    std::fs::create_dir_all(&home_dir).expect("test should create home dir");
+    let pi_runtime = fake_pi_login_runtime_exits_zero_no_auth("login-no-auth-runtime");
+
+    let output = run_afs_login(
+        &home_dir,
+        &afs_home,
+        &pi_runtime,
+        &["--provider", "claude"],
+        true,
+    );
+    assert!(
+        !output.status.success(),
+        "afs login should fail when auth was not written"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("authentication did not complete"),
+        "stderr should explain verification failure. got: {stderr}"
+    );
+    assert!(
+        !afs_home.join("config.json").exists(),
+        "config.json should not be written on login failure"
+    );
+}
+
+#[test]
+fn login_fails_when_runtime_exits_nonzero() {
+    let afs_home = unique_afs_home("login-runtime-failed");
+    let home_dir = unique_afs_home("login-runtime-failed-home");
+    std::fs::create_dir_all(&home_dir).expect("test should create home dir");
+    let pi_runtime = fake_pi_login_runtime("login-runtime-failed-runtime", false, "claude");
+
+    let output = run_afs_login(
+        &home_dir,
+        &afs_home,
+        &pi_runtime,
+        &["--provider", "claude"],
+        true,
+    );
+    assert!(
+        !output.status.success(),
+        "afs login should fail when runtime exits non-zero"
+    );
+    assert!(
+        !afs_home.join("config.json").exists(),
+        "config.json should not be written on runtime failure"
+    );
+}
+
+#[test]
+fn login_rejects_missing_provider_argument() {
+    let afs_home = unique_afs_home("login-missing-provider");
+    let home_dir = unique_afs_home("login-missing-provider-home");
+    std::fs::create_dir_all(&home_dir).expect("test should create home dir");
+    let pi_runtime = fake_pi_login_runtime("login-missing-provider-runtime", true, "claude");
+
+    let output = run_afs_login(&home_dir, &afs_home, &pi_runtime, &[], true);
+    assert!(
+        !output.status.success(),
+        "afs login without --provider should fail"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("claude") && stderr.contains("openai"),
+        "stderr should name supported providers. got: {stderr}"
+    );
+}
+
+#[test]
+fn login_rejects_unsupported_provider() {
+    let afs_home = unique_afs_home("login-bad-provider");
+    let home_dir = unique_afs_home("login-bad-provider-home");
+    std::fs::create_dir_all(&home_dir).expect("test should create home dir");
+    let pi_runtime = fake_pi_login_runtime("login-bad-provider-runtime", true, "claude");
+
+    let output = run_afs_login(
+        &home_dir,
+        &afs_home,
+        &pi_runtime,
+        &["--provider", "gemini"],
+        true,
+    );
+    assert!(
+        !output.status.success(),
+        "afs login with unsupported provider should fail"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("gemini") || stderr.contains("not supported"),
+        "stderr should explain unsupported provider. got: {stderr}"
+    );
+    assert!(
+        !stderr.to_lowercase().contains(" pi "),
+        "stderr should not leak pi branding. got: {stderr}"
+    );
+}
+
+#[test]
+fn login_requires_interactive_terminal() {
+    let afs_home = unique_afs_home("login-no-tty");
+    let home_dir = unique_afs_home("login-no-tty-home");
+    std::fs::create_dir_all(&home_dir).expect("test should create home dir");
+    let pi_runtime = fake_pi_login_runtime("login-no-tty-runtime", true, "claude");
+
+    let output = run_afs_login(
+        &home_dir,
+        &afs_home,
+        &pi_runtime,
+        &["--provider", "claude"],
+        false,
+    );
+    assert!(
+        !output.status.success(),
+        "afs login should refuse without a terminal"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("interactive terminal"),
+        "stderr should mention the tty requirement. got: {stderr}"
+    );
+}
+
+#[test]
+fn install_with_api_key_config_missing_api_key_env_field_fails_cleanly() {
+    let afs_home = unique_afs_home("install-api-key-missing-env");
+    let pi_runtime = fake_pi_runtime("install-api-key-missing-env-runtime");
+
+    // Write a broken config: api_key auth_method without api_key_env field.
+    write_config(
+        &afs_home,
+        r#"{"provider":"claude","auth_method":"api_key"}"#,
+    );
+
+    let mut daemon = start_daemon_with_pi_runtime(&afs_home, &pi_runtime);
+    assert!(
+        wait_until(Duration::from_secs(2), || supervisor_socket(&afs_home)
+            .metadata()
+            .map(|metadata| metadata.file_type().is_socket())
+            .unwrap_or(false)),
+        "afs daemon should create a Unix supervisor socket"
+    );
+
+    let managed_dir = unique_afs_home("install-api-key-missing-env-target");
+    std::fs::create_dir_all(&managed_dir).expect("test should create target directory");
+
+    let output = install_managed_dir(&afs_home, &managed_dir);
+    assert!(
+        !output.status.success(),
+        "afs install with broken config should fail"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("api_key_env"),
+        "stderr should mention the missing field. got: {stderr}"
     );
 
     stop_daemon(&mut daemon);
