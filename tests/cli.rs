@@ -2,7 +2,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+use std::os::unix::fs::{FileTypeExt, PermissionsExt, symlink};
 use std::os::unix::net::{UnixListener, UnixStream};
 
 fn unique_afs_home(test_name: &str) -> std::path::PathBuf {
@@ -3098,6 +3098,340 @@ fn install_with_api_key_config_missing_api_key_env_field_fails_cleanly() {
     assert!(
         stderr.contains("api_key_env"),
         "stderr should mention the missing field. got: {stderr}"
+    );
+
+    stop_daemon(&mut daemon);
+}
+
+#[test]
+fn ask_routes_explicit_symlink_path_to_owning_nested_child() {
+    let afs_home = unique_afs_home("ask-symlink-nested-child");
+    let parent_dir = unique_afs_home("ask-symlink-parent");
+    let pi_runtime = fake_pi_runtime("ask-symlink-runtime");
+    let socket_path = supervisor_socket(&afs_home);
+    let child_dir = parent_dir.join("child");
+    std::fs::create_dir_all(&child_dir).expect("test should create nested managed directory");
+    let target_file = child_dir.join("notes.txt");
+    std::fs::write(&target_file, "child notes\n").expect("test should create target file");
+    let parent_dir = parent_dir
+        .canonicalize()
+        .expect("parent managed directory should canonicalize");
+    let child_dir = child_dir
+        .canonicalize()
+        .expect("child managed directory should canonicalize");
+    let target_file = target_file
+        .canonicalize()
+        .expect("target file should canonicalize");
+    let link_path = parent_dir.join("link-to-child-notes");
+    symlink(&target_file, &link_path).expect("test should create symlink into nested child");
+
+    let mut daemon = start_daemon_with_pi_runtime(&afs_home, &pi_runtime);
+    assert!(
+        wait_until(Duration::from_secs(2), || socket_path
+            .metadata()
+            .map(|metadata| metadata.file_type().is_socket())
+            .unwrap_or(false)),
+        "daemon should create the Supervisor Socket before install connects"
+    );
+
+    let parent_install = install_managed_dir(&afs_home, &parent_dir);
+    assert!(
+        parent_install.status.success(),
+        "parent install should succeed\nstderr:\n{}",
+        String::from_utf8_lossy(&parent_install.stderr)
+    );
+    let child_install = install_managed_dir(&afs_home, &child_dir);
+    assert!(
+        child_install.status.success(),
+        "child install should succeed\nstderr:\n{}",
+        String::from_utf8_lossy(&child_install.stderr)
+    );
+
+    let ask = afs_ask(&afs_home, &format!("summarize {}", link_path.display()));
+    assert!(
+        ask.status.success(),
+        "afs ask via symlink should succeed\nstderr:\n{}",
+        String::from_utf8_lossy(&ask.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&ask.stderr), "");
+
+    let stdout = String::from_utf8_lossy(&ask.stdout);
+    assert!(
+        stdout.contains(&format!("answered about {}", target_file.display())),
+        "afs ask should route to the canonical target owner\nstdout:\n{}",
+        stdout
+    );
+    assert!(
+        wait_until(Duration::from_secs(2), || child_dir
+            .join(".afs/ask-received")
+            .is_file()),
+        "nested child should receive the ask for the symlink target"
+    );
+    assert!(
+        std::fs::read_to_string(child_dir.join(".afs/ask-received"))
+            .expect("child ask marker should be readable")
+            .contains(&target_file.display().to_string()),
+        "child should receive the canonical target path, not the symlink path"
+    );
+    assert!(
+        !parent_dir.join(".afs/ask-received").exists(),
+        "parent should not receive ask when symlink resolves into nested child"
+    );
+
+    stop_daemon(&mut daemon);
+}
+
+#[test]
+fn ask_reports_symlink_to_external_target_as_unmanaged() {
+    let afs_home = unique_afs_home("ask-symlink-external");
+    let managed_dir = unique_afs_home("ask-symlink-external-managed");
+    let external_dir = unique_afs_home("ask-symlink-external-target");
+    let pi_runtime = fake_pi_runtime("ask-symlink-external-runtime");
+    let socket_path = supervisor_socket(&afs_home);
+
+    std::fs::create_dir_all(&managed_dir).expect("test should create managed dir");
+    std::fs::create_dir_all(&external_dir).expect("test should create external dir");
+    let external_secret = external_dir.join("secret.txt");
+    std::fs::write(&external_secret, "secret\n").expect("test should create external target");
+    let managed_dir = managed_dir
+        .canonicalize()
+        .expect("managed dir should canonicalize");
+    let external_secret = external_secret
+        .canonicalize()
+        .expect("external secret should canonicalize");
+    let link_path = managed_dir.join("link-to-external");
+    symlink(&external_secret, &link_path).expect("test should create symlink to external target");
+
+    let mut daemon = start_daemon_with_pi_runtime(&afs_home, &pi_runtime);
+    assert!(
+        wait_until(Duration::from_secs(2), || socket_path
+            .metadata()
+            .map(|metadata| metadata.file_type().is_socket())
+            .unwrap_or(false)),
+        "daemon should create the Supervisor Socket before install connects"
+    );
+
+    let install = install_managed_dir(&afs_home, &managed_dir);
+    assert!(
+        install.status.success(),
+        "managed install should succeed\nstderr:\n{}",
+        String::from_utf8_lossy(&install.stderr)
+    );
+
+    let ask = afs_ask(&afs_home, &format!("inspect {}", link_path.display()));
+    assert!(
+        !ask.status.success(),
+        "afs ask should fail when symlink target escapes managed dir"
+    );
+    let stderr = String::from_utf8_lossy(&ask.stderr);
+    assert!(
+        stderr.contains("path is not managed:"),
+        "stderr should report unmanaged canonical target\nstderr:\n{}",
+        stderr
+    );
+    assert!(
+        stderr.contains(&external_secret.display().to_string()),
+        "stderr should name the canonical external target\nstderr:\n{}",
+        stderr
+    );
+    assert!(
+        !managed_dir.join(".afs/ask-received").exists(),
+        "managed agent should not receive ask routed through external symlink"
+    );
+
+    stop_daemon(&mut daemon);
+}
+
+#[test]
+fn install_via_symlinked_path_stores_canonical_registry_entry() {
+    let afs_home = unique_afs_home("install-symlink-alias");
+    let real_dir = unique_afs_home("install-symlink-real");
+    let alias_parent = unique_afs_home("install-symlink-aliases");
+    let pi_runtime = fake_pi_runtime("install-symlink-runtime");
+    let socket_path = supervisor_socket(&afs_home);
+
+    std::fs::create_dir_all(&real_dir).expect("test should create real dir");
+    std::fs::create_dir_all(&alias_parent).expect("test should create alias parent");
+    let real_dir = real_dir
+        .canonicalize()
+        .expect("real dir should canonicalize");
+    let alias_path = alias_parent.join("alias");
+    symlink(&real_dir, &alias_path).expect("test should create alias symlink");
+
+    let mut daemon = start_daemon_with_pi_runtime(&afs_home, &pi_runtime);
+    assert!(
+        wait_until(Duration::from_secs(2), || socket_path
+            .metadata()
+            .map(|metadata| metadata.file_type().is_socket())
+            .unwrap_or(false)),
+        "daemon should create the Supervisor Socket before install connects"
+    );
+
+    let alias_install = install_managed_dir(&afs_home, &alias_path);
+    assert!(
+        alias_install.status.success(),
+        "install via alias should succeed\nstderr:\n{}",
+        String::from_utf8_lossy(&alias_install.stderr)
+    );
+
+    let registry = std::fs::read_to_string(afs_home.join("registry.tsv"))
+        .expect("registry should be readable");
+    let entries: Vec<&str> = registry
+        .lines()
+        .skip(1)
+        .filter(|line| !line.is_empty())
+        .collect();
+    assert_eq!(
+        entries.len(),
+        1,
+        "registry should record the alias install as a single canonical entry\nregistry:\n{}",
+        registry
+    );
+    let fields: Vec<&str> = entries[0].split('\t').collect();
+    assert_eq!(
+        fields.get(1).copied(),
+        Some(real_dir.to_string_lossy().as_ref()),
+        "registry should store canonical managed_dir, not the alias path\nregistry:\n{}",
+        registry
+    );
+
+    let duplicate = install_managed_dir(&afs_home, &real_dir);
+    assert!(
+        duplicate.status.success(),
+        "installing the canonical path after the alias should succeed"
+    );
+    assert!(
+        String::from_utf8_lossy(&duplicate.stdout).contains("already managed directory"),
+        "second install resolving to the same canonical path should report already managed"
+    );
+
+    stop_daemon(&mut daemon);
+}
+
+#[test]
+fn install_survives_self_referential_symlink_loop_inside_managed_dir() {
+    let afs_home = unique_afs_home("install-symlink-loop");
+    let managed_dir = unique_afs_home("install-symlink-loop-dir");
+    let pi_runtime = fake_pi_runtime("install-symlink-loop-runtime");
+    let socket_path = supervisor_socket(&afs_home);
+
+    std::fs::create_dir_all(&managed_dir).expect("test should create managed dir");
+    let managed_dir = managed_dir
+        .canonicalize()
+        .expect("managed dir should canonicalize");
+    let loop_path = managed_dir.join("loop");
+    symlink(&loop_path, &loop_path).expect("test should create self-referential symlink");
+
+    let mut daemon = start_daemon_with_pi_runtime(&afs_home, &pi_runtime);
+    assert!(
+        wait_until(Duration::from_secs(2), || socket_path
+            .metadata()
+            .map(|metadata| metadata.file_type().is_socket())
+            .unwrap_or(false)),
+        "daemon should create the Supervisor Socket before install connects"
+    );
+
+    let install = install_managed_dir(&afs_home, &managed_dir);
+    assert!(
+        install.status.success(),
+        "install should not fail when managed dir contains a symlink loop\nstderr:\n{}",
+        String::from_utf8_lossy(&install.stderr)
+    );
+
+    let history = afs_history(&afs_home, &managed_dir);
+    assert!(
+        history.status.success(),
+        "history should succeed for managed dir with symlink loop\nstderr:\n{}",
+        String::from_utf8_lossy(&history.stderr)
+    );
+
+    let change_path = managed_dir.join("notes.txt");
+    std::fs::write(&change_path, "hello\n").expect("test should write post-install change");
+    assert!(
+        wait_until(Duration::from_secs(3), || {
+            let out = afs_history(&afs_home, &managed_dir);
+            out.status.success() && String::from_utf8_lossy(&out.stdout).contains("External change")
+        }),
+        "external change should be recorded despite symlink loop in managed dir"
+    );
+
+    stop_daemon(&mut daemon);
+}
+
+#[test]
+fn broadcast_reply_filters_out_reference_symlink_escaping_managed_dir() {
+    let afs_home = unique_afs_home("broadcast-symlink-escape");
+    let managed_dir = unique_afs_home("broadcast-symlink-managed");
+    let external_dir = unique_afs_home("broadcast-symlink-external");
+    let pi_runtime = fake_pi_runtime("broadcast-symlink-runtime");
+    let socket_path = supervisor_socket(&afs_home);
+
+    std::fs::create_dir_all(&managed_dir).expect("test should create managed dir");
+    std::fs::create_dir_all(&external_dir).expect("test should create external dir");
+    let sensitive_file = external_dir.join("sensitive.txt");
+    std::fs::write(&sensitive_file, "top secret\n").expect("test should create external secret");
+    let managed_dir = managed_dir
+        .canonicalize()
+        .expect("managed dir should canonicalize");
+    let sensitive_file = sensitive_file
+        .canonicalize()
+        .expect("sensitive file should canonicalize");
+    let benign_file = managed_dir.join("benign.txt");
+    std::fs::write(&benign_file, "public\n").expect("test should create benign file");
+    let benign_file = benign_file
+        .canonicalize()
+        .expect("benign file should canonicalize");
+    let escape_link = managed_dir.join("escape");
+    symlink(&sensitive_file, &escape_link).expect("test should create escape symlink");
+
+    let mut daemon =
+        start_daemon_with_pi_runtime_and_broadcast_timeout(&afs_home, &pi_runtime, 200);
+    assert!(
+        wait_until(Duration::from_secs(2), || socket_path
+            .metadata()
+            .map(|metadata| metadata.file_type().is_socket())
+            .unwrap_or(false)),
+        "daemon should create the Supervisor Socket before install connects"
+    );
+
+    let install = install_managed_dir(&afs_home, &managed_dir);
+    assert!(
+        install.status.success(),
+        "managed install should succeed\nstderr:\n{}",
+        String::from_utf8_lossy(&install.stderr)
+    );
+
+    std::fs::write(
+        managed_dir.join(".afs/broadcast-response"),
+        format!(
+            "strong\tfound potentially sensitive content\tI reviewed the files\t{};{}\n",
+            escape_link.display(),
+            benign_file.display()
+        ),
+    )
+    .expect("test should write broadcast response fixture");
+
+    let ask = afs_ask(&afs_home, "scan for sensitive content");
+    assert!(
+        ask.status.success(),
+        "afs ask should succeed\nstderr:\n{}",
+        String::from_utf8_lossy(&ask.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&ask.stdout);
+    assert!(
+        stdout.contains(&format!("- {}", benign_file.display())),
+        "broadcast response should include the benign in-tree reference\nstdout:\n{}",
+        stdout
+    );
+    assert!(
+        !stdout.contains(&sensitive_file.display().to_string()),
+        "broadcast response should not leak the canonical external target\nstdout:\n{}",
+        stdout
+    );
+    assert!(
+        !stdout.contains(&escape_link.display().to_string()),
+        "broadcast response should filter the escape symlink path\nstdout:\n{}",
+        stdout
     );
 
     stop_daemon(&mut daemon);

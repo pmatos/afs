@@ -1136,11 +1136,15 @@ pub mod supervisor {
             managed_dir.join(path)
         };
 
-        if path.starts_with(managed_dir) {
-            Some(path.display().to_string())
-        } else {
-            None
+        if matches!(path.try_exists(), Ok(true)) {
+            let canonical = path.canonicalize().ok()?;
+            return canonical
+                .starts_with(managed_dir)
+                .then(|| canonical.display().to_string());
         }
+
+        path.starts_with(managed_dir)
+            .then(|| path.display().to_string())
     }
 
     fn broadcast_reply_timeout() -> Duration {
@@ -1395,8 +1399,8 @@ pub mod supervisor {
             if path == managed_dir.join(AGENT_HOME_DIR) {
                 continue;
             }
-            let metadata = entry.metadata()?;
-            if !metadata.is_dir() {
+            let file_type = entry.file_type()?;
+            if file_type.is_symlink() || !file_type.is_dir() {
                 continue;
             }
             if is_nested_managed_root(managed_dir, &path) {
