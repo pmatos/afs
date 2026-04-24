@@ -2020,6 +2020,7 @@ pub mod supervisor {
         let mut add = git_base_command(git_dir, Some(work_tree));
         add.arg("add")
             .arg("--all")
+            .arg("--force")
             .arg("--")
             .arg(".")
             .arg(format!(":(exclude,top){AGENT_HOME_DIR}"));

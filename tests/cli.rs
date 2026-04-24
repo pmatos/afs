@@ -2301,3 +2301,69 @@ fn history_backend_does_not_touch_surrounding_project_git_repository() {
 
     stop_daemon(&mut daemon);
 }
+
+#[test]
+fn gitignored_files_in_managed_dir_are_still_tracked_and_restored_on_undo() {
+    let afs_home = unique_afs_home("gitignore-tracked");
+    let managed_dir = unique_afs_home("managed-gitignore-tracked");
+    let pi_runtime = fake_pi_runtime("gitignore-tracked-runtime");
+    let socket_path = supervisor_socket(&afs_home);
+    std::fs::create_dir_all(&managed_dir).expect("test should create managed directory");
+    std::fs::write(managed_dir.join(".gitignore"), "ignored.log\n")
+        .expect("test should create .gitignore");
+    let ignored_path = managed_dir.join("ignored.log");
+    std::fs::write(&ignored_path, "before\n").expect("test should create ignored file");
+    let managed_dir = managed_dir
+        .canonicalize()
+        .expect("managed directory should canonicalize");
+    let ignored_path = ignored_path
+        .canonicalize()
+        .expect("ignored file should canonicalize");
+    let mut daemon = start_daemon_with_pi_runtime(&afs_home, &pi_runtime);
+
+    assert!(
+        wait_until(Duration::from_secs(2), || socket_path
+            .metadata()
+            .map(|metadata| metadata.file_type().is_socket())
+            .unwrap_or(false)),
+        "daemon should create the Supervisor Socket before install connects"
+    );
+
+    let install = install_managed_dir(&afs_home, &managed_dir);
+    assert!(install.status.success(), "afs install should succeed");
+
+    std::fs::write(&ignored_path, "after\n").expect("test should modify ignored file");
+    assert!(
+        wait_until(Duration::from_secs(3), || {
+            let history = afs_history(&afs_home, &managed_dir);
+            history.status.success()
+                && String::from_utf8_lossy(&history.stdout).contains("ignored.log")
+        }),
+        "AFS history should record changes to .gitignored files"
+    );
+
+    let history = afs_history(&afs_home, &managed_dir);
+    let stdout = String::from_utf8_lossy(&history.stdout);
+    let entry = history_entry_id(stdout.lines().next().expect("history should have an entry"));
+    let undo = Command::new(env!("CARGO_BIN_EXE_afs"))
+        .env("AFS_HOME", &afs_home)
+        .arg("undo")
+        .arg(&managed_dir)
+        .arg(entry)
+        .arg("--yes")
+        .output()
+        .expect("afs undo should run");
+    assert!(
+        undo.status.success(),
+        "afs undo --yes should succeed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&undo.stdout),
+        String::from_utf8_lossy(&undo.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&ignored_path).expect("ignored file should still be readable"),
+        "before\n",
+        "undo should restore .gitignored file contents captured at baseline"
+    );
+
+    stop_daemon(&mut daemon);
+}
