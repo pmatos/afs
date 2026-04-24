@@ -1746,16 +1746,12 @@ fn install_creates_agent_home_and_history_baseline_through_live_supervisor() {
             .is_file()
     );
     assert!(
-        wait_until(Duration::from_secs(2), || managed_dir
-            .join(".afs/runtime-started")
-            .is_file()),
-        "afs install should start the configured Pi Agent Runtime"
-    );
-    assert!(
-        std::fs::read_to_string(managed_dir.join(".afs/runtime-started"))
-            .expect("runtime marker should be readable")
-            .contains("rpc=stdio"),
-        "Pi Agent Runtime should be started in stdio RPC mode"
+        wait_until(Duration::from_secs(2), || {
+            std::fs::read_to_string(managed_dir.join(".afs/runtime-started"))
+                .map(|content| content.contains("rpc=stdio"))
+                .unwrap_or(false)
+        }),
+        "afs install should start the configured Pi Agent Runtime in stdio RPC mode"
     );
 
     stop_daemon(&mut daemon);
