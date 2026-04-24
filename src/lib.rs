@@ -1,7 +1,6 @@
 pub mod supervisor {
     use notify::{RecommendedWatcher, RecursiveMode, Watcher};
     use std::collections::{BTreeMap, BTreeSet};
-    use std::fs::OpenOptions;
     use std::io::{self, BufRead, Read, Write};
     use std::os::fd::AsRawFd;
     use std::os::unix::net::{UnixListener, UnixStream};
@@ -16,11 +15,7 @@ pub mod supervisor {
     const SOCKET_FILE: &str = "supervisor.sock";
     const AGENT_HOME_DIR: &str = ".afs";
     const HISTORY_DIR: &str = "history";
-    const BASELINE_FILE: &str = "baseline.tsv";
-    const SNAPSHOT_FILE: &str = "snapshot.tsv";
-    const ENTRIES_FILE: &str = "entries.tsv";
-    const CONTENT_SNAPSHOT_DIR: &str = "content-snapshot";
-    const ENTRY_DATA_DIR: &str = "entry-data";
+    const HISTORY_REPO_DIR: &str = "repo";
     const REGISTRY_FILE: &str = "registry.tsv";
     const ARCHIVES_DIR: &str = "archives";
     const PI_RUNTIME_ENV: &str = "AFS_PI_RUNTIME";
@@ -206,13 +201,7 @@ pub mod supervisor {
                 )?;
             }
 
-            let baseline_path = history_dir.join(BASELINE_FILE);
-            if !baseline_path.exists() {
-                let baseline = history_baseline(&managed_dir)?;
-                std::fs::write(baseline_path, baseline)?;
-            }
-            ensure_history_snapshot(&managed_dir, &agent_home)?;
-            ensure_content_snapshot(&managed_dir, &agent_home)?;
+            ensure_history_baseline_commit(&managed_dir, &agent_home)?;
 
             if !self
                 .agents
@@ -1338,36 +1327,61 @@ pub mod supervisor {
         Ok(format!("agent-{}-{nanos}\n", std::process::id()))
     }
 
-    #[derive(Clone, Debug, Eq, PartialEq)]
-    struct SnapshotEntry {
-        len: u64,
-        hash: u64,
-    }
-
-    type Snapshot = BTreeMap<String, SnapshotEntry>;
-
     fn history_lock() -> &'static Mutex<()> {
         static HISTORY_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         HISTORY_LOCK.get_or_init(|| Mutex::new(()))
     }
 
-    fn ensure_history_snapshot(managed_dir: &Path, agent_home: &Path) -> io::Result<()> {
-        let snapshot_path = agent_home.join(HISTORY_DIR).join(SNAPSHOT_FILE);
-        if snapshot_path.exists() {
+    fn ensure_history_baseline_commit(managed_dir: &Path, agent_home: &Path) -> io::Result<()> {
+        let git_dir = history_repo_dir(agent_home);
+        git_init_if_missing(&git_dir)?;
+        if git_has_commits(&git_dir)? {
             return Ok(());
         }
-
-        let snapshot = collect_file_snapshot(managed_dir)?;
-        write_snapshot(&snapshot_path, &snapshot)
+        let nested = nested_managed_relative_paths(managed_dir)?;
+        git_stage_and_commit(
+            &git_dir,
+            managed_dir,
+            &nested,
+            &GitCommitRequest {
+                entry_id: &history_entry_id(),
+                kind: "baseline",
+                summary: "Install baseline",
+                files: &[],
+                undoable: false,
+                undoes: None,
+            },
+        )
     }
 
-    fn ensure_content_snapshot(managed_dir: &Path, agent_home: &Path) -> io::Result<()> {
-        let snapshot_dir = content_snapshot_dir(agent_home);
-        if snapshot_dir.exists() {
-            return Ok(());
-        }
+    fn nested_managed_relative_paths(managed_dir: &Path) -> io::Result<Vec<String>> {
+        let mut results = Vec::new();
+        collect_nested_managed_relative_paths(managed_dir, managed_dir, &mut results)?;
+        Ok(results)
+    }
 
-        refresh_content_snapshot(managed_dir, agent_home)
+    fn collect_nested_managed_relative_paths(
+        managed_dir: &Path,
+        current_dir: &Path,
+        results: &mut Vec<String>,
+    ) -> io::Result<()> {
+        for entry in std::fs::read_dir(current_dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path == managed_dir.join(AGENT_HOME_DIR) {
+                continue;
+            }
+            let metadata = entry.metadata()?;
+            if !metadata.is_dir() {
+                continue;
+            }
+            if is_nested_managed_root(managed_dir, &path) {
+                results.push(relative_managed_path(managed_dir, &path)?);
+                continue;
+            }
+            collect_nested_managed_relative_paths(managed_dir, &path, results)?;
+        }
+        Ok(())
     }
 
     fn start_directory_monitor(
@@ -1487,12 +1501,7 @@ pub mod supervisor {
 
     fn record_startup_reconciliation(managed_dir: &Path, agent_home: &Path) -> io::Result<()> {
         std::fs::create_dir_all(agent_home.join(HISTORY_DIR))?;
-        let snapshot_path = agent_home.join(HISTORY_DIR).join(SNAPSHOT_FILE);
-        if !snapshot_path.exists() {
-            let snapshot = collect_file_snapshot(managed_dir)?;
-            return write_snapshot(&snapshot_path, &snapshot);
-        }
-
+        ensure_history_baseline_commit(managed_dir, agent_home)?;
         record_snapshot_delta(
             managed_dir,
             agent_home,
@@ -1511,26 +1520,28 @@ pub mod supervisor {
         let _guard = history_lock()
             .lock()
             .map_err(|_| io::Error::other("history lock poisoned"))?;
-        let snapshot_path = agent_home.join(HISTORY_DIR).join(SNAPSHOT_FILE);
-        let previous = read_snapshot(&snapshot_path)?;
-        let current = collect_file_snapshot(managed_dir)?;
-        let changed_files = changed_files(&previous, &current);
+        let git_dir = history_repo_dir(agent_home);
+        let nested = nested_managed_relative_paths(managed_dir)?;
+        git_stage_work_tree(&git_dir, managed_dir, &nested)?;
+        let changed_files = git_staged_changes_vs_head(&git_dir)?;
         if changed_files.is_empty() {
             return Ok(None);
         }
 
         let entry_id = history_entry_id();
-        let undoable = stage_undo_snapshot(agent_home, &entry_id)?;
-        append_history_entry(
-            agent_home,
-            &entry_id,
-            kind,
-            summary_prefix,
-            &changed_files,
-            undoable,
+        let summary = history_summary(summary_prefix, &changed_files);
+        git_commit_index(
+            &git_dir,
+            managed_dir,
+            &GitCommitRequest {
+                entry_id: &entry_id,
+                kind,
+                summary: &summary,
+                files: &changed_files,
+                undoable: true,
+                undoes: None,
+            },
         )?;
-        write_snapshot(&snapshot_path, &current)?;
-        refresh_content_snapshot(managed_dir, agent_home)?;
         Ok(Some(RecordedChange {
             history_entry: entry_id,
             files: changed_files,
@@ -1546,22 +1557,25 @@ pub mod supervisor {
         let _guard = history_lock()
             .lock()
             .map_err(|_| io::Error::other("history lock poisoned"))?;
-        let snapshot_path = agent_home.join(HISTORY_DIR).join(SNAPSHOT_FILE);
-        let previous = read_snapshot(&snapshot_path)?;
-        let current = collect_file_snapshot(managed_dir)?;
-        let changed_files = changed_files(&previous, &current);
+        let git_dir = history_repo_dir(agent_home);
+        let nested = nested_managed_relative_paths(managed_dir)?;
+        git_stage_work_tree(&git_dir, managed_dir, &nested)?;
+        let changed_files = git_staged_changes_vs_head(&git_dir)?;
         let affected = relative_managed_path(managed_dir, affected_dir)?;
         let summary = format!("{summary_prefix}: {affected}");
-        append_history_entry_with_summary(
-            agent_home,
-            &history_entry_id(),
-            "ownership",
-            &summary,
-            &changed_files,
-            false,
-        )?;
-        write_snapshot(&snapshot_path, &current)?;
-        refresh_content_snapshot(managed_dir, agent_home)
+        let entry_id = history_entry_id();
+        git_commit_index(
+            &git_dir,
+            managed_dir,
+            &GitCommitRequest {
+                entry_id: &entry_id,
+                kind: "ownership",
+                summary: &summary,
+                files: &changed_files,
+                undoable: false,
+                undoes: None,
+            },
+        )
     }
 
     fn archive_agent_home(
@@ -1599,57 +1613,6 @@ pub mod supervisor {
         }
     }
 
-    fn changed_files(previous: &Snapshot, current: &Snapshot) -> Vec<String> {
-        let mut paths = BTreeSet::new();
-        paths.extend(previous.keys().cloned());
-        paths.extend(current.keys().cloned());
-        paths
-            .into_iter()
-            .filter(|path| previous.get(path) != current.get(path))
-            .collect()
-    }
-
-    fn append_history_entry(
-        agent_home: &Path,
-        id: &str,
-        kind: &str,
-        summary_prefix: &str,
-        files: &[String],
-        undoable: bool,
-    ) -> io::Result<()> {
-        let summary = history_summary(summary_prefix, files);
-        append_history_entry_with_summary(agent_home, id, kind, &summary, files, undoable)
-    }
-
-    fn append_history_entry_with_summary(
-        agent_home: &Path,
-        id: &str,
-        kind: &str,
-        summary: &str,
-        files: &[String],
-        undoable: bool,
-    ) -> io::Result<()> {
-        let history_dir = agent_home.join(HISTORY_DIR);
-        std::fs::create_dir_all(&history_dir)?;
-        let entries_path = history_dir.join(ENTRIES_FILE);
-        let mut entries = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(entries_path)?;
-        let timestamp = unix_timestamp();
-        writeln!(
-            entries,
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}",
-            id,
-            timestamp,
-            kind,
-            sanitize_field(summary),
-            files.len(),
-            undoable_field(undoable),
-            sanitize_field(&files.join(", "))
-        )
-    }
-
     fn history_summary(prefix: &str, files: &[String]) -> String {
         match files {
             [] => format!("{prefix}: no files changed"),
@@ -1662,74 +1625,74 @@ pub mod supervisor {
         let _guard = history_lock()
             .lock()
             .map_err(|_| io::Error::other("history lock poisoned"))?;
-        let mut entries = read_history_entries(agent_home)?;
-        entries.reverse();
+        let git_dir = history_repo_dir(agent_home);
+        let mut commits = git_log_records(&git_dir)?;
+        commits.reverse();
 
-        if entries.is_empty() {
+        struct EntryState {
+            representative: GitHistoryRecord,
+            latest_undoable: String,
+        }
+
+        let mut by_id: BTreeMap<String, EntryState> = BTreeMap::new();
+        let mut order: Vec<String> = Vec::new();
+        for record in commits {
+            let Some(entry_id) = record.trailers.get("Afs-Entry-Id") else {
+                continue;
+            };
+            let kind = record
+                .trailers
+                .get("Afs-Kind")
+                .map(String::as_str)
+                .unwrap_or("");
+            if kind == "baseline" {
+                continue;
+            }
+            let undoable = record
+                .trailers
+                .get("Afs-Undoable")
+                .cloned()
+                .unwrap_or_else(|| "no".to_string());
+            let entry_id = entry_id.clone();
+            if let Some(state) = by_id.get_mut(&entry_id) {
+                state.latest_undoable = undoable;
+            } else {
+                order.push(entry_id.clone());
+                by_id.insert(
+                    entry_id,
+                    EntryState {
+                        representative: record,
+                        latest_undoable: undoable,
+                    },
+                );
+            }
+        }
+
+        if order.is_empty() {
             return Ok("no history entries\n".to_string());
         }
 
         let mut output = String::new();
-        for entry in entries {
+        for entry_id in order.iter().rev() {
+            let state = &by_id[entry_id];
+            let record = &state.representative;
+            let kind = record.trailers.get("Afs-Kind").cloned().unwrap_or_default();
+            let summary = record
+                .trailers
+                .get("Afs-Summary")
+                .cloned()
+                .unwrap_or_default();
+            let file_count: usize = record
+                .trailers
+                .get("Afs-File-Count")
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(0);
             output.push_str(&format!(
                 "entry={} timestamp={} type={} summary={} files={} undoable={}\n",
-                entry.id,
-                entry.timestamp,
-                entry.kind,
-                entry.summary,
-                entry.file_count,
-                undoable_field(entry.undoable)
+                entry_id, record.timestamp_secs, kind, summary, file_count, state.latest_undoable
             ));
         }
         Ok(output)
-    }
-
-    #[derive(Clone)]
-    struct HistoryEntry {
-        id: String,
-        timestamp: String,
-        kind: String,
-        summary: String,
-        file_count: usize,
-        undoable: bool,
-        files: Vec<String>,
-    }
-
-    fn read_history_entries(agent_home: &Path) -> io::Result<Vec<HistoryEntry>> {
-        let entries_path = agent_home.join(HISTORY_DIR).join(ENTRIES_FILE);
-        if !entries_path.exists() {
-            return Ok(Vec::new());
-        }
-
-        Ok(std::fs::read_to_string(entries_path)?
-            .lines()
-            .filter_map(parse_history_entry)
-            .collect())
-    }
-
-    fn parse_history_entry(line: &str) -> Option<HistoryEntry> {
-        let fields = line.split('\t').collect::<Vec<_>>();
-        if fields.len() != 7 {
-            return None;
-        }
-
-        Some(HistoryEntry {
-            id: fields[0].to_string(),
-            timestamp: fields[1].to_string(),
-            kind: fields[2].to_string(),
-            summary: fields[3].to_string(),
-            file_count: fields[4].parse().ok()?,
-            undoable: fields[5] == "yes",
-            files: files_field(fields[6]),
-        })
-    }
-
-    fn files_field(field: &str) -> Vec<String> {
-        if field.is_empty() {
-            return Vec::new();
-        }
-
-        field.split(", ").map(ToOwned::to_owned).collect()
     }
 
     fn undoable_field(undoable: bool) -> &'static str {
@@ -1745,168 +1708,146 @@ pub mod supervisor {
         let _guard = history_lock()
             .lock()
             .map_err(|_| io::Error::other("history lock poisoned"))?;
-        let mut entries = read_history_entries(agent_home)?;
-        let Some(latest_index) = entries.iter().rposition(|entry| entry.undoable) else {
+        let git_dir = history_repo_dir(agent_home);
+
+        struct UndoCandidate {
+            entry_id: String,
+            kind: String,
+            summary: String,
+            files: Vec<String>,
+            representative_commit: String,
+            latest_undoable: bool,
+        }
+
+        let mut commits = git_log_records(&git_dir)?;
+        commits.reverse();
+
+        let mut by_id: BTreeMap<String, UndoCandidate> = BTreeMap::new();
+        let mut order: Vec<String> = Vec::new();
+        for record in commits {
+            let Some(entry_id) = record.trailers.get("Afs-Entry-Id").cloned() else {
+                continue;
+            };
+            let kind = record.trailers.get("Afs-Kind").cloned().unwrap_or_default();
+            if kind == "baseline" {
+                continue;
+            }
+            let summary = record
+                .trailers
+                .get("Afs-Summary")
+                .cloned()
+                .unwrap_or_default();
+            let files = record
+                .trailers
+                .get("Afs-Files")
+                .map(|field| {
+                    if field.is_empty() {
+                        Vec::new()
+                    } else {
+                        field.split(", ").map(ToOwned::to_owned).collect()
+                    }
+                })
+                .unwrap_or_default();
+            let undoable = record
+                .trailers
+                .get("Afs-Undoable")
+                .map(|value| value == "yes")
+                .unwrap_or(false);
+
+            if let Some(existing) = by_id.get_mut(&entry_id) {
+                existing.latest_undoable = undoable;
+            } else {
+                order.push(entry_id.clone());
+                by_id.insert(
+                    entry_id.clone(),
+                    UndoCandidate {
+                        entry_id,
+                        kind,
+                        summary,
+                        files,
+                        representative_commit: record.commit,
+                        latest_undoable: undoable,
+                    },
+                );
+            }
+        }
+
+        let Some(latest_id) = order
+            .iter()
+            .rev()
+            .find(|id| by_id[id.as_str()].latest_undoable)
+            .cloned()
+        else {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "no undoable history entries",
             ));
         };
 
-        let latest = entries[latest_index].clone();
-        if latest.id != requested_entry {
+        let latest = by_id
+            .remove(&latest_id)
+            .expect("latest undoable id must exist in by_id");
+        if latest.entry_id != requested_entry {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!(
                     "only the latest undoable history entry can be undone: {}",
-                    latest.id
+                    latest.entry_id
                 ),
             ));
         }
 
-        if history_entry_requires_confirmation(&latest) && !confirmed {
+        if matches!(latest.kind.as_str(), "external" | "reconciliation") && !confirmed {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "undoing an External Change requires --yes in scripted use or interactive confirmation",
             ));
         }
 
-        let before_snapshot = entry_before_snapshot_dir(agent_home, &latest.id);
-        if !before_snapshot.is_dir() {
+        let Some(parent_commit) = git_parent_commit(&git_dir, &latest.representative_commit)?
+        else {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "history entry is not undoable",
             ));
-        }
+        };
+        git_restore_tree(&git_dir, managed_dir, &parent_commit)?;
 
-        restore_managed_content_from_snapshot(&before_snapshot, managed_dir)?;
-        let snapshot = collect_file_snapshot(managed_dir)?;
-        write_snapshot(&agent_home.join(HISTORY_DIR).join(SNAPSHOT_FILE), &snapshot)?;
-        refresh_content_snapshot(managed_dir, agent_home)?;
-
-        entries[latest_index].undoable = false;
-        entries.push(HistoryEntry {
-            id: history_entry_id(),
-            timestamp: unix_timestamp(),
-            kind: "undo".to_string(),
-            summary: sanitize_field(&format!("Undo {}: {}", latest.id, latest.summary)),
-            file_count: latest.file_count,
-            undoable: false,
-            files: latest.files,
-        });
-        write_history_entries(agent_home, &entries)?;
+        let nested = nested_managed_relative_paths(managed_dir)?;
+        let undo_entry_id = history_entry_id();
+        let undo_summary = sanitize_field(&format!("Undo {}: {}", latest.entry_id, latest.summary));
+        git_stage_and_commit(
+            &git_dir,
+            managed_dir,
+            &nested,
+            &GitCommitRequest {
+                entry_id: &undo_entry_id,
+                kind: "undo",
+                summary: &undo_summary,
+                files: &latest.files,
+                undoable: false,
+                undoes: Some(&latest.entry_id),
+            },
+        )?;
+        git_stage_and_commit(
+            &git_dir,
+            managed_dir,
+            &nested,
+            &GitCommitRequest {
+                entry_id: &latest.entry_id,
+                kind: &latest.kind,
+                summary: &latest.summary,
+                files: &latest.files,
+                undoable: false,
+                undoes: None,
+            },
+        )?;
 
         Ok(format!(
             "undid history entry {}\nfiles={}\n",
-            latest.id, latest.file_count
+            latest.entry_id,
+            latest.files.len()
         ))
-    }
-
-    fn history_entry_requires_confirmation(entry: &HistoryEntry) -> bool {
-        matches!(entry.kind.as_str(), "external" | "reconciliation")
-    }
-
-    fn write_history_entries(agent_home: &Path, entries: &[HistoryEntry]) -> io::Result<()> {
-        let history_dir = agent_home.join(HISTORY_DIR);
-        std::fs::create_dir_all(&history_dir)?;
-
-        let mut output = String::new();
-        for entry in entries {
-            output.push_str(&format!(
-                "{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
-                entry.id,
-                entry.timestamp,
-                entry.kind,
-                sanitize_field(&entry.summary),
-                entry.file_count,
-                undoable_field(entry.undoable),
-                sanitize_field(&entry.files.join(", "))
-            ));
-        }
-
-        std::fs::write(history_dir.join(ENTRIES_FILE), output)
-    }
-
-    fn stage_undo_snapshot(agent_home: &Path, entry_id: &str) -> io::Result<bool> {
-        let current_snapshot = content_snapshot_dir(agent_home);
-        if !current_snapshot.is_dir() {
-            return Ok(false);
-        }
-
-        replace_dir_from_dir(
-            &current_snapshot,
-            &entry_before_snapshot_dir(agent_home, entry_id),
-        )?;
-        Ok(true)
-    }
-
-    fn refresh_content_snapshot(managed_dir: &Path, agent_home: &Path) -> io::Result<()> {
-        replace_dir_from_managed_dir(managed_dir, &content_snapshot_dir(agent_home))
-    }
-
-    fn content_snapshot_dir(agent_home: &Path) -> PathBuf {
-        agent_home.join(HISTORY_DIR).join(CONTENT_SNAPSHOT_DIR)
-    }
-
-    fn entry_before_snapshot_dir(agent_home: &Path, entry_id: &str) -> PathBuf {
-        agent_home
-            .join(HISTORY_DIR)
-            .join(ENTRY_DATA_DIR)
-            .join(entry_id)
-            .join("before")
-    }
-
-    fn replace_dir_from_managed_dir(source: &Path, destination: &Path) -> io::Result<()> {
-        let temporary = temporary_replacement_path(destination);
-        if temporary.exists() {
-            std::fs::remove_dir_all(&temporary)?;
-        }
-        std::fs::create_dir_all(&temporary)?;
-        copy_managed_dir_contents(source, source, &temporary)?;
-        replace_dir(destination, &temporary)
-    }
-
-    fn replace_dir_from_dir(source: &Path, destination: &Path) -> io::Result<()> {
-        let temporary = temporary_replacement_path(destination);
-        if temporary.exists() {
-            std::fs::remove_dir_all(&temporary)?;
-        }
-        std::fs::create_dir_all(&temporary)?;
-        copy_dir_contents(source, &temporary)?;
-        replace_dir(destination, &temporary)
-    }
-
-    fn replace_dir(destination: &Path, temporary: &Path) -> io::Result<()> {
-        if destination.exists() {
-            std::fs::remove_dir_all(destination)?;
-        }
-        if let Some(parent) = destination.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        std::fs::rename(temporary, destination)
-    }
-
-    fn temporary_replacement_path(destination: &Path) -> PathBuf {
-        let name = destination
-            .file_name()
-            .map(|name| name.to_string_lossy())
-            .unwrap_or_else(|| "snapshot".into());
-        destination.with_file_name(format!(
-            ".{name}.tmp-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|duration| duration.as_nanos())
-                .unwrap_or(0)
-        ))
-    }
-
-    fn restore_managed_content_from_snapshot(
-        snapshot_dir: &Path,
-        managed_dir: &Path,
-    ) -> io::Result<()> {
-        remove_managed_content(managed_dir)?;
-        copy_dir_contents(snapshot_dir, managed_dir)
     }
 
     fn remove_managed_content(managed_dir: &Path) -> io::Result<()> {
@@ -1929,64 +1870,6 @@ pub mod supervisor {
         Ok(())
     }
 
-    fn copy_managed_dir_contents(
-        managed_dir: &Path,
-        current_dir: &Path,
-        destination: &Path,
-    ) -> io::Result<()> {
-        for entry in std::fs::read_dir(current_dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            if path == managed_dir.join(AGENT_HOME_DIR) {
-                continue;
-            }
-            if is_nested_managed_root(managed_dir, &path) {
-                continue;
-            }
-
-            let target = destination.join(entry.file_name());
-            let metadata = entry.metadata()?;
-            if metadata.is_dir() {
-                std::fs::create_dir_all(&target)?;
-                copy_managed_dir_contents(managed_dir, &path, &target)?;
-            } else if metadata.is_file() {
-                if let Some(parent) = target.parent() {
-                    std::fs::create_dir_all(parent)?;
-                }
-                std::fs::copy(&path, target)?;
-            }
-        }
-
-        Ok(())
-    }
-
-    fn copy_dir_contents(source: &Path, destination: &Path) -> io::Result<()> {
-        for entry in std::fs::read_dir(source)? {
-            let entry = entry?;
-            let path = entry.path();
-            let target = destination.join(entry.file_name());
-            let metadata = entry.metadata()?;
-            if metadata.is_dir() {
-                std::fs::create_dir_all(&target)?;
-                copy_dir_contents(&path, &target)?;
-            } else if metadata.is_file() {
-                if let Some(parent) = target.parent() {
-                    std::fs::create_dir_all(parent)?;
-                }
-                std::fs::copy(&path, target)?;
-            }
-        }
-
-        Ok(())
-    }
-
-    fn unix_timestamp() -> String {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_secs().to_string())
-            .unwrap_or_else(|_| "0".to_string())
-    }
-
     fn history_entry_id() -> String {
         let nanos = unix_timestamp_nanos();
         format!("history-{}-{nanos}", std::process::id())
@@ -2003,159 +1886,12 @@ pub mod supervisor {
         value.replace(['\t', '\n', '\r'], " ")
     }
 
-    fn collect_file_snapshot(managed_dir: &Path) -> io::Result<Snapshot> {
-        let mut snapshot = BTreeMap::new();
-        collect_snapshot_files(managed_dir, managed_dir, &mut snapshot)?;
-        Ok(snapshot)
-    }
-
-    fn collect_snapshot_files(
-        managed_dir: &Path,
-        current_dir: &Path,
-        snapshot: &mut Snapshot,
-    ) -> io::Result<()> {
-        for entry in std::fs::read_dir(current_dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            if path == managed_dir.join(AGENT_HOME_DIR) {
-                continue;
-            }
-            if is_nested_managed_root(managed_dir, &path) {
-                continue;
-            }
-
-            let metadata = entry.metadata()?;
-            if metadata.is_dir() {
-                collect_snapshot_files(managed_dir, &path, snapshot)?;
-            } else if metadata.is_file() {
-                let relative_path = relative_managed_path(managed_dir, &path)?;
-                snapshot.insert(
-                    relative_path,
-                    SnapshotEntry {
-                        len: metadata.len(),
-                        hash: file_hash(&path)?,
-                    },
-                );
-            }
-        }
-        Ok(())
-    }
-
     fn relative_managed_path(managed_dir: &Path, path: &Path) -> io::Result<String> {
         Ok(path
             .strip_prefix(managed_dir)
             .map_err(io::Error::other)?
             .to_string_lossy()
             .replace('\\', "/"))
-    }
-
-    fn file_hash(path: &Path) -> io::Result<u64> {
-        const FNV_OFFSET: u64 = 0xcbf29ce484222325;
-        const FNV_PRIME: u64 = 0x100000001b3;
-
-        let mut file = std::fs::File::open(path)?;
-        let mut hash = FNV_OFFSET;
-        let mut buffer = [0; 8192];
-        loop {
-            let read = file.read(&mut buffer)?;
-            if read == 0 {
-                return Ok(hash);
-            }
-
-            for byte in &buffer[..read] {
-                hash ^= u64::from(*byte);
-                hash = hash.wrapping_mul(FNV_PRIME);
-            }
-        }
-    }
-
-    fn read_snapshot(snapshot_path: &Path) -> io::Result<Snapshot> {
-        if !snapshot_path.exists() {
-            return Ok(BTreeMap::new());
-        }
-
-        let mut snapshot = BTreeMap::new();
-        for line in std::fs::read_to_string(snapshot_path)?.lines().skip(1) {
-            let fields = line.split('\t').collect::<Vec<_>>();
-            if fields.len() != 3 {
-                continue;
-            }
-
-            let Some(len) = fields[1].parse().ok() else {
-                continue;
-            };
-            let Some(hash) = fields[2].parse().ok() else {
-                continue;
-            };
-
-            snapshot.insert(fields[0].to_string(), SnapshotEntry { len, hash });
-        }
-
-        Ok(snapshot)
-    }
-
-    fn write_snapshot(snapshot_path: &Path, snapshot: &Snapshot) -> io::Result<()> {
-        if let Some(parent) = snapshot_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-
-        let mut output = String::from("path\tlen\thash\n");
-        for (path, entry) in snapshot {
-            output.push_str(path);
-            output.push('\t');
-            output.push_str(&entry.len.to_string());
-            output.push('\t');
-            output.push_str(&entry.hash.to_string());
-            output.push('\n');
-        }
-
-        std::fs::write(snapshot_path, output)
-    }
-
-    fn history_baseline(managed_dir: &Path) -> io::Result<String> {
-        let mut files = Vec::new();
-        collect_baseline_files(managed_dir, managed_dir, &mut files)?;
-        files.sort();
-
-        let mut baseline = String::from("type\tbaseline\n");
-        for (relative_path, len) in files {
-            baseline.push_str("file\t");
-            baseline.push_str(&relative_path);
-            baseline.push('\t');
-            baseline.push_str(&len.to_string());
-            baseline.push('\n');
-        }
-        Ok(baseline)
-    }
-
-    fn collect_baseline_files(
-        managed_dir: &Path,
-        current_dir: &Path,
-        files: &mut Vec<(String, u64)>,
-    ) -> io::Result<()> {
-        for entry in std::fs::read_dir(current_dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            if path == managed_dir.join(AGENT_HOME_DIR) {
-                continue;
-            }
-            if is_nested_managed_root(managed_dir, &path) {
-                continue;
-            }
-
-            let metadata = entry.metadata()?;
-            if metadata.is_dir() {
-                collect_baseline_files(managed_dir, &path, files)?;
-            } else if metadata.is_file() {
-                let relative_path = path
-                    .strip_prefix(managed_dir)
-                    .map_err(io::Error::other)?
-                    .to_string_lossy()
-                    .replace('\\', "/");
-                files.push((relative_path, metadata.len()));
-            }
-        }
-        Ok(())
     }
 
     fn is_nested_managed_root(managed_dir: &Path, path: &Path) -> bool {
@@ -2192,6 +1928,305 @@ pub mod supervisor {
         relative
             .components()
             .any(|component| component.as_os_str() == AGENT_HOME_DIR)
+    }
+
+    fn history_repo_dir(agent_home: &Path) -> PathBuf {
+        agent_home.join(HISTORY_DIR).join(HISTORY_REPO_DIR)
+    }
+
+    fn git_base_command(git_dir: &Path, work_tree: Option<&Path>) -> Command {
+        let mut cmd = Command::new("git");
+        cmd.arg("-c")
+            .arg("safe.directory=*")
+            .arg("-c")
+            .arg("user.email=afs@localhost")
+            .arg("-c")
+            .arg("user.name=AFS")
+            .arg("-c")
+            .arg("init.defaultBranch=afs")
+            .arg("-c")
+            .arg("commit.gpgsign=false")
+            .arg(format!("--git-dir={}", git_dir.display()));
+        if let Some(work_tree) = work_tree {
+            cmd.arg(format!("--work-tree={}", work_tree.display()));
+        }
+        cmd.env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .env_remove("GIT_COMMON_DIR")
+            .env_remove("GIT_AUTHOR_NAME")
+            .env_remove("GIT_AUTHOR_EMAIL")
+            .env_remove("GIT_COMMITTER_NAME")
+            .env_remove("GIT_COMMITTER_EMAIL");
+        cmd
+    }
+
+    fn git_init_if_missing(git_dir: &Path) -> io::Result<()> {
+        if git_dir.join("HEAD").exists() {
+            return Ok(());
+        }
+        if let Some(parent) = git_dir.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let output = Command::new("git")
+            .arg("-c")
+            .arg("init.defaultBranch=afs")
+            .arg("init")
+            .arg("--bare")
+            .arg("--quiet")
+            .arg(git_dir)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .output()?;
+        if !output.status.success() {
+            return Err(io::Error::other(format!(
+                "git init failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        Ok(())
+    }
+
+    fn git_has_commits(git_dir: &Path) -> io::Result<bool> {
+        let output = git_base_command(git_dir, None)
+            .arg("rev-parse")
+            .arg("--verify")
+            .arg("--quiet")
+            .arg("HEAD")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .output()?;
+        Ok(output.status.success())
+    }
+
+    struct GitCommitRequest<'a> {
+        entry_id: &'a str,
+        kind: &'a str,
+        summary: &'a str,
+        files: &'a [String],
+        undoable: bool,
+        undoes: Option<&'a str>,
+    }
+
+    fn git_stage_work_tree(
+        git_dir: &Path,
+        work_tree: &Path,
+        nested_exclusions: &[String],
+    ) -> io::Result<()> {
+        git_init_if_missing(git_dir)?;
+        let mut add = git_base_command(git_dir, Some(work_tree));
+        add.arg("add")
+            .arg("--all")
+            .arg("--")
+            .arg(".")
+            .arg(format!(":(exclude,top){AGENT_HOME_DIR}"));
+        for nested in nested_exclusions {
+            add.arg(format!(":(exclude,top){nested}"));
+        }
+        let output = add.stdout(Stdio::null()).stderr(Stdio::piped()).output()?;
+        if !output.status.success() {
+            return Err(io::Error::other(format!(
+                "git add failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        Ok(())
+    }
+
+    fn git_staged_changes_vs_head(git_dir: &Path) -> io::Result<Vec<String>> {
+        if !git_has_commits(git_dir)? {
+            return Ok(Vec::new());
+        }
+        let output = git_base_command(git_dir, None)
+            .arg("diff")
+            .arg("--cached")
+            .arg("--name-only")
+            .arg("HEAD")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()?;
+        if !output.status.success() {
+            return Err(io::Error::other(format!(
+                "git diff failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        let mut files: Vec<String> = String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter(|line| !line.is_empty())
+            .map(ToOwned::to_owned)
+            .collect();
+        files.sort();
+        Ok(files)
+    }
+
+    fn git_commit_index(
+        git_dir: &Path,
+        work_tree: &Path,
+        request: &GitCommitRequest<'_>,
+    ) -> io::Result<()> {
+        let message = git_commit_message(request);
+        let mut commit = git_base_command(git_dir, Some(work_tree));
+        commit
+            .arg("commit")
+            .arg("--allow-empty")
+            .arg("--allow-empty-message")
+            .arg("--quiet")
+            .arg("-F")
+            .arg("-")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        let mut child = commit.spawn()?;
+        {
+            let mut stdin = child
+                .stdin
+                .take()
+                .ok_or_else(|| io::Error::other("failed to capture git commit stdin"))?;
+            stdin.write_all(message.as_bytes())?;
+        }
+        let output = child.wait_with_output()?;
+        if !output.status.success() {
+            return Err(io::Error::other(format!(
+                "git commit failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        Ok(())
+    }
+
+    fn git_stage_and_commit(
+        git_dir: &Path,
+        work_tree: &Path,
+        nested_exclusions: &[String],
+        request: &GitCommitRequest<'_>,
+    ) -> io::Result<()> {
+        git_stage_work_tree(git_dir, work_tree, nested_exclusions)?;
+        git_commit_index(git_dir, work_tree, request)
+    }
+
+    fn git_commit_message(request: &GitCommitRequest<'_>) -> String {
+        let mut message = sanitize_field(request.summary);
+        message.push_str("\n\n");
+        message.push_str(&format!(
+            "Afs-Entry-Id: {}\n",
+            sanitize_field(request.entry_id)
+        ));
+        message.push_str(&format!("Afs-Kind: {}\n", sanitize_field(request.kind)));
+        message.push_str(&format!(
+            "Afs-Summary: {}\n",
+            sanitize_field(request.summary)
+        ));
+        message.push_str(&format!(
+            "Afs-Undoable: {}\n",
+            undoable_field(request.undoable)
+        ));
+        message.push_str(&format!("Afs-File-Count: {}\n", request.files.len()));
+        message.push_str(&format!(
+            "Afs-Files: {}\n",
+            sanitize_field(&request.files.join(", "))
+        ));
+        if let Some(undoes) = request.undoes {
+            message.push_str(&format!("Afs-Undoes: {}\n", sanitize_field(undoes)));
+        }
+        message
+    }
+
+    #[derive(Clone)]
+    struct GitHistoryRecord {
+        commit: String,
+        timestamp_secs: u64,
+        trailers: BTreeMap<String, String>,
+    }
+
+    fn git_log_records(git_dir: &Path) -> io::Result<Vec<GitHistoryRecord>> {
+        if !git_has_commits(git_dir)? {
+            return Ok(Vec::new());
+        }
+        let output = git_base_command(git_dir, None)
+            .arg("log")
+            .arg("--format=--AFS-COMMIT--%n%H%n%ct%n%B%n--AFS-END--")
+            .arg("HEAD")
+            .stderr(Stdio::piped())
+            .output()?;
+        if !output.status.success() {
+            return Err(io::Error::other(format!(
+                "git log failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        let text = String::from_utf8_lossy(&output.stdout).into_owned();
+        let mut records = Vec::new();
+        for block in text.split("--AFS-COMMIT--\n").skip(1) {
+            let Some((sha_line, rest)) = block.split_once('\n') else {
+                continue;
+            };
+            let Some((ts_line, body_with_end)) = rest.split_once('\n') else {
+                continue;
+            };
+            let Some((body, _)) = body_with_end.rsplit_once("--AFS-END--") else {
+                continue;
+            };
+            let commit = sha_line.trim().to_string();
+            let timestamp_secs = ts_line.trim().parse().unwrap_or(0);
+            let mut trailers = BTreeMap::new();
+            for line in body.lines() {
+                if let Some((key, value)) = line.split_once(": ")
+                    && key.starts_with("Afs-")
+                {
+                    trailers.insert(key.to_string(), value.to_string());
+                }
+            }
+            records.push(GitHistoryRecord {
+                commit,
+                timestamp_secs,
+                trailers,
+            });
+        }
+        Ok(records)
+    }
+
+    fn git_parent_commit(git_dir: &Path, commit: &str) -> io::Result<Option<String>> {
+        let output = git_base_command(git_dir, None)
+            .arg("rev-parse")
+            .arg("--verify")
+            .arg("--quiet")
+            .arg(format!("{commit}^"))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output()?;
+        if !output.status.success() {
+            return Ok(None);
+        }
+        let parent = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if parent.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(parent))
+        }
+    }
+
+    fn git_restore_tree(git_dir: &Path, work_tree: &Path, commit: &str) -> io::Result<()> {
+        remove_managed_content(work_tree)?;
+        let output = git_base_command(git_dir, Some(work_tree))
+            .arg("checkout")
+            .arg("--force")
+            .arg(commit)
+            .arg("--")
+            .arg(".")
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .output()?;
+        if !output.status.success() {
+            return Err(io::Error::other(format!(
+                "git checkout failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        Ok(())
     }
 }
 

@@ -1515,10 +1515,24 @@ fn removing_nested_managed_directory_merges_history_and_archives_agent_home() {
         child_identity,
         "archive should preserve the child identity"
     );
+    let archived_log = Command::new("git")
+        .arg("-c")
+        .arg("safe.directory=*")
+        .arg(format!(
+            "--git-dir={}",
+            archived_home.join("history/repo").display()
+        ))
+        .arg("log")
+        .arg("--format=%B")
+        .output()
+        .expect("git log on archived history should run");
     assert!(
-        std::fs::read_to_string(archived_home.join("history/entries.tsv"))
-            .expect("archived child history should be readable")
-            .contains("External change: notes.txt"),
+        archived_log.status.success(),
+        "archived history should be a readable git repo: {}",
+        String::from_utf8_lossy(&archived_log.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&archived_log.stdout).contains("External change: notes.txt"),
         "archive should preserve the child history"
     );
 
@@ -1725,7 +1739,12 @@ fn install_creates_agent_home_and_history_baseline_through_live_supervisor() {
     );
     assert!(managed_dir.join(".afs/identity").is_file());
     assert!(managed_dir.join(".afs/instructions.md").is_file());
-    assert!(managed_dir.join(".afs/history/baseline.tsv").is_file());
+    assert!(managed_dir.join(".afs/history/repo/HEAD").is_file());
+    assert!(
+        managed_dir
+            .join(".afs/history/repo/refs/heads/afs")
+            .is_file()
+    );
     assert!(
         wait_until(Duration::from_secs(2), || managed_dir
             .join(".afs/runtime-started")
@@ -1771,9 +1790,9 @@ fn install_is_idempotent_for_an_already_managed_directory() {
     assert!(first.status.success(), "first afs install should succeed");
     let identity_after_first =
         std::fs::read_to_string(managed_dir.join(".afs/identity")).expect("identity should exist");
-    let baseline_after_first =
-        std::fs::read_to_string(managed_dir.join(".afs/history/baseline.tsv"))
-            .expect("baseline should exist");
+    let baseline_commit_after_first =
+        std::fs::read_to_string(managed_dir.join(".afs/history/repo/refs/heads/afs"))
+            .expect("baseline commit ref should exist");
 
     let second = Command::new(env!("CARGO_BIN_EXE_afs"))
         .env("AFS_HOME", &afs_home)
@@ -1794,9 +1813,10 @@ fn install_is_idempotent_for_an_already_managed_directory() {
         identity_after_first
     );
     assert_eq!(
-        std::fs::read_to_string(managed_dir.join(".afs/history/baseline.tsv"))
-            .expect("baseline should still exist"),
-        baseline_after_first
+        std::fs::read_to_string(managed_dir.join(".afs/history/repo/refs/heads/afs"))
+            .expect("baseline commit ref should still exist"),
+        baseline_commit_after_first,
+        "idempotent re-install should not add new history commits"
     );
 
     stop_daemon(&mut daemon);
@@ -2157,6 +2177,130 @@ fn history_lists_newest_entries_first() {
     assert!(
         entries[1].contains("first.txt"),
         "older history entry should follow"
+    );
+
+    stop_daemon(&mut daemon);
+}
+
+#[test]
+fn history_backend_does_not_touch_surrounding_project_git_repository() {
+    let afs_home = unique_afs_home("history-isolation");
+    let project_dir = unique_afs_home("history-isolation-project");
+    let pi_runtime = fake_pi_runtime("history-isolation-runtime");
+    let socket_path = supervisor_socket(&afs_home);
+
+    std::fs::create_dir_all(&project_dir).expect("test should create project directory");
+    let init = Command::new("git")
+        .arg("-c")
+        .arg("init.defaultBranch=main")
+        .arg("init")
+        .arg("--quiet")
+        .arg(&project_dir)
+        .output()
+        .expect("git init should run");
+    assert!(init.status.success(), "surrounding git init should succeed");
+    let committer = [
+        ("GIT_AUTHOR_NAME", "Test"),
+        ("GIT_AUTHOR_EMAIL", "test@example.com"),
+        ("GIT_COMMITTER_NAME", "Test"),
+        ("GIT_COMMITTER_EMAIL", "test@example.com"),
+    ];
+    std::fs::write(project_dir.join("README.md"), "project\n")
+        .expect("test should create project file");
+    let add = Command::new("git")
+        .current_dir(&project_dir)
+        .arg("add")
+        .arg("README.md")
+        .output()
+        .expect("git add should run");
+    assert!(add.status.success(), "project git add should succeed");
+    let initial_commit = Command::new("git")
+        .current_dir(&project_dir)
+        .envs(committer)
+        .arg("commit")
+        .arg("--quiet")
+        .arg("-m")
+        .arg("initial")
+        .output()
+        .expect("git commit should run");
+    assert!(
+        initial_commit.status.success(),
+        "project git commit should succeed"
+    );
+
+    let managed_dir = project_dir.join("managed");
+    std::fs::create_dir_all(&managed_dir).expect("test should create managed directory");
+    std::fs::write(managed_dir.join("notes.txt"), "before\n")
+        .expect("test should create managed file");
+    let managed_dir = managed_dir
+        .canonicalize()
+        .expect("managed directory should canonicalize");
+
+    let project_git_head_before = std::fs::read_to_string(project_dir.join(".git/refs/heads/main"))
+        .expect("surrounding repo should have main branch");
+    let project_config_before = std::fs::read_to_string(project_dir.join(".git/config"))
+        .expect("surrounding repo should have config");
+
+    let mut daemon = start_daemon_with_pi_runtime(&afs_home, &pi_runtime);
+    assert!(
+        wait_until(Duration::from_secs(2), || socket_path
+            .metadata()
+            .map(|metadata| metadata.file_type().is_socket())
+            .unwrap_or(false)),
+        "daemon should create the Supervisor Socket before install connects"
+    );
+
+    let install = install_managed_dir(&afs_home, &managed_dir);
+    assert!(install.status.success(), "afs install should succeed");
+    std::fs::write(managed_dir.join("notes.txt"), "after\n")
+        .expect("test should trigger external change");
+    assert!(
+        wait_until(Duration::from_secs(3), || {
+            let history = afs_history(&afs_home, &managed_dir);
+            history.status.success()
+                && String::from_utf8_lossy(&history.stdout).contains("type=external")
+        }),
+        "afs history should record the external change"
+    );
+    let history = afs_history(&afs_home, &managed_dir);
+    let stdout = String::from_utf8_lossy(&history.stdout);
+    let entry = history_entry_id(stdout.lines().next().expect("history should have an entry"));
+    let undo = Command::new(env!("CARGO_BIN_EXE_afs"))
+        .env("AFS_HOME", &afs_home)
+        .arg("undo")
+        .arg(&managed_dir)
+        .arg(entry)
+        .arg("--yes")
+        .output()
+        .expect("afs undo should run");
+    assert!(undo.status.success(), "afs undo --yes should succeed");
+
+    let project_git_head_after = std::fs::read_to_string(project_dir.join(".git/refs/heads/main"))
+        .expect("surrounding repo main branch should still exist");
+    assert_eq!(
+        project_git_head_before, project_git_head_after,
+        "AFS must not create commits in the surrounding project git repository"
+    );
+    let project_config_after = std::fs::read_to_string(project_dir.join(".git/config"))
+        .expect("surrounding repo config should still exist");
+    assert_eq!(
+        project_config_before, project_config_after,
+        "AFS must not modify the surrounding project git config"
+    );
+    let status = Command::new("git")
+        .current_dir(&project_dir)
+        .arg("status")
+        .arg("--porcelain")
+        .output()
+        .expect("git status should run");
+    let status_stdout = String::from_utf8_lossy(&status.stdout);
+    assert!(
+        !status_stdout.contains(" managed/notes.txt"),
+        "surrounding project should not see undo-managed file as modified:\n{status_stdout}"
+    );
+    assert!(
+        managed_dir.join(".afs/history/repo/HEAD").is_file(),
+        "AFS should keep its own history repo inside the Agent Home"
     );
 
     stop_daemon(&mut daemon);
