@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+ignore = { version = "0.4", default-features = false }
 libc = "0.2"
 notify = { version = "8.2.0", default-features = false }
 serde = { version = "1", features = ["derive"] }
