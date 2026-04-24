@@ -170,6 +170,7 @@ fn fake_pi_runtime(test_name: &str) -> std::path::PathBuf {
   printf 'env_HOME=%s\n' "$HOME"
   printf 'env_ANTHROPIC_API_KEY=%s\n' "${ANTHROPIC_API_KEY-}"
   printf 'env_OPENAI_API_KEY=%s\n' "${OPENAI_API_KEY-}"
+  printf 'done=1\n'
 } > "$AFS_AGENT_HOME/spawn-observed"
 {
   printf 'identity=%s\n' "$AFS_AGENT_ID"
@@ -2743,7 +2744,11 @@ fn install_with_valid_config_spawns_agent_runtime_with_provider_and_model() {
         .expect("canonicalize managed dir");
     let spawn_observed = managed_dir_canonical.join(".afs").join("spawn-observed");
     assert!(
-        wait_until(Duration::from_secs(2), || spawn_observed.exists()),
+        wait_until(Duration::from_secs(2), || std::fs::read_to_string(
+            &spawn_observed
+        )
+        .map(|body| body.contains("done=1"))
+        .unwrap_or(false)),
         "fake agent runtime should record its spawn observations"
     );
     let observed =
@@ -2795,7 +2800,11 @@ fn install_with_config_without_model_omits_model_flag() {
         .expect("canonicalize managed dir");
     let spawn_observed = managed_dir_canonical.join(".afs").join("spawn-observed");
     assert!(
-        wait_until(Duration::from_secs(2), || spawn_observed.exists()),
+        wait_until(Duration::from_secs(2), || std::fs::read_to_string(
+            &spawn_observed
+        )
+        .map(|body| body.contains("done=1"))
+        .unwrap_or(false)),
         "fake agent runtime should record its spawn observations"
     );
     let observed =
@@ -2827,6 +2836,7 @@ fn install_with_api_key_config_forwards_named_env_var_to_runtime() {
   for arg in "$@"; do
     printf 'arg=%s\n' "$arg"
   done
+  printf 'done=1\n'
 } > "$AFS_AGENT_HOME/spawn-observed"
 # Keep the child alive to mimic an agent; the test only inspects spawn-observed.
 cat >/dev/null
@@ -2877,7 +2887,11 @@ cat >/dev/null
         .expect("canonicalize managed dir");
     let spawn_observed = managed_dir_canonical.join(".afs").join("spawn-observed");
     assert!(
-        wait_until(Duration::from_secs(2), || spawn_observed.exists()),
+        wait_until(Duration::from_secs(2), || std::fs::read_to_string(
+            &spawn_observed
+        )
+        .map(|body| body.contains("done=1"))
+        .unwrap_or(false)),
         "fake agent runtime should record its spawn observations"
     );
     let observed =
