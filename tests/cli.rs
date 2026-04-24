@@ -85,7 +85,38 @@ while IFS= read -r _line; do
       printf 'path=%s\n' "$asked_path"
       printf 'prompt=%s\n' "$asked_prompt"
     } >> "$AFS_AGENT_HOME/ask-received"
-    printf 'agent %s answered about %s\n' "$AFS_AGENT_ID" "$asked_path"
+    if [ -f "$AFS_AGENT_HOME/delegate-target" ]; then
+      delegate_target="$(cat "$AFS_AGENT_HOME/delegate-target")"
+      delegate_reply_target="supervisor"
+      if [ -f "$AFS_AGENT_HOME/delegate-reply-target" ]; then
+        delegate_reply_target="$(cat "$AFS_AGENT_HOME/delegate-reply-target")"
+      fi
+      delegate_prompt="$asked_prompt"
+      if [ -f "$AFS_AGENT_HOME/delegate-prompt" ]; then
+        delegate_prompt="$(cat "$AFS_AGENT_HOME/delegate-prompt")"
+      fi
+      printf 'DELEGATE\t%s\t%s\t%s\n' "$delegate_target" "$delegate_reply_target" "$delegate_prompt"
+      if [ -f "$AFS_AGENT_HOME/delegate-second-prompt" ]; then
+        delegate_second_prompt="$(cat "$AFS_AGENT_HOME/delegate-second-prompt")"
+        printf 'DELEGATE\t%s\t%s\t%s\n' "$delegate_target" "$delegate_reply_target" "$delegate_second_prompt"
+      fi
+      if [ "$delegate_reply_target" = "delegator" ]; then
+        IFS= read -r delegated_marker
+        IFS= read -r delegated_agent
+        IFS= read -r delegated_answer
+        IFS= read -r delegated_changed_files
+        IFS= read -r delegated_history_entries
+        {
+          printf 'agent=%s\n' "$delegated_agent"
+          printf 'answer=%s\n' "$delegated_answer"
+          printf 'changed_files=%s\n' "$delegated_changed_files"
+          printf 'history_entries=%s\n' "$delegated_history_entries"
+        } >> "$AFS_AGENT_HOME/delegated-reply-received"
+        printf 'delegator %s used %s\n' "$AFS_AGENT_ID" "$delegated_answer"
+      fi
+    else
+      printf 'agent %s answered about %s\n' "$AFS_AGENT_ID" "$asked_path"
+    fi
   elif [ "$_line" = "BROADCAST" ]; then
     IFS= read -r asked_prompt
     printf 'prompt=%s\n' "$asked_prompt" >> "$AFS_AGENT_HOME/broadcast-received"
@@ -95,6 +126,32 @@ while IFS= read -r _line; do
     if [ -f "$AFS_AGENT_HOME/broadcast-response" ]; then
       cat "$AFS_AGENT_HOME/broadcast-response"
     fi
+  elif [ "$_line" = "TASK" ]; then
+    IFS= read -r requester
+    IFS= read -r reply_target
+    IFS= read -r task_prompt
+    {
+      printf 'requester=%s\n' "$requester"
+      printf 'reply_target=%s\n' "$reply_target"
+      printf 'prompt=%s\n' "$task_prompt"
+    } >> "$AFS_AGENT_HOME/task-received"
+    if [ -f "$AFS_AGENT_HOME/task-delay-seconds" ]; then
+      sleep "$(cat "$AFS_AGENT_HOME/task-delay-seconds")"
+    fi
+    if [ -f "$AFS_AGENT_HOME/task-write-file" ]; then
+      task_write_file="$(cat "$AFS_AGENT_HOME/task-write-file")"
+      task_write_content="delegated task content"
+      if [ -f "$AFS_AGENT_HOME/task-write-content" ]; then
+        task_write_content="$(cat "$AFS_AGENT_HOME/task-write-content")"
+      fi
+      printf '%s\n' "$task_write_content" > "$AFS_MANAGED_DIR/$task_write_file"
+    fi
+    if [ -f "$AFS_AGENT_HOME/task-response" ]; then
+      task_answer="$(cat "$AFS_AGENT_HOME/task-response")"
+    else
+      task_answer="delegated answer for $task_prompt from $AFS_AGENT_ID"
+    fi
+    printf 'TASK_REPLY\t%s\tnone\tnone\n' "$task_answer"
   fi
 done
 "#,
@@ -783,6 +840,418 @@ fn broad_ask_broadcasts_to_registered_agents_and_reports_relevant_references() {
             .expect("recipes agent should receive broadcast")
             .contains("find my last blood tests from 2025"),
         "silent agent should still receive the Broadcast Request"
+    );
+
+    stop_daemon(&mut daemon);
+}
+
+#[test]
+fn ask_allows_agent_to_delegate_direct_task_reply_to_supervisor() {
+    let afs_home = unique_afs_home("ask-delegate-to-supervisor");
+    let source_dir = unique_afs_home("ask-delegate-source");
+    let target_dir = unique_afs_home("ask-delegate-target");
+    let pi_runtime = fake_pi_runtime("ask-delegate-runtime");
+    let socket_path = supervisor_socket(&afs_home);
+    std::fs::create_dir_all(&source_dir).expect("test should create source managed directory");
+    std::fs::create_dir_all(&target_dir).expect("test should create target managed directory");
+    let source_file = source_dir.join("request.md");
+    std::fs::write(&source_file, "needs delegated context\n")
+        .expect("test should create source file");
+    let source_dir = source_dir
+        .canonicalize()
+        .expect("source directory should canonicalize");
+    let target_dir = target_dir
+        .canonicalize()
+        .expect("target directory should canonicalize");
+    let source_file = source_file
+        .canonicalize()
+        .expect("source file should canonicalize");
+    let mut daemon = start_daemon_with_pi_runtime(&afs_home, &pi_runtime);
+
+    assert!(
+        wait_until(Duration::from_secs(2), || socket_path
+            .metadata()
+            .map(|metadata| metadata.file_type().is_socket())
+            .unwrap_or(false)),
+        "daemon should create the Supervisor Socket before install connects"
+    );
+
+    let source_install = install_managed_dir(&afs_home, &source_dir);
+    assert!(
+        source_install.status.success(),
+        "source afs install should succeed"
+    );
+    let target_install = install_managed_dir(&afs_home, &target_dir);
+    assert!(
+        target_install.status.success(),
+        "target afs install should succeed"
+    );
+    let source_identity =
+        std::fs::read_to_string(source_dir.join(".afs/identity")).expect("source identity exists");
+    let target_identity =
+        std::fs::read_to_string(target_dir.join(".afs/identity")).expect("target identity exists");
+    std::fs::write(
+        source_dir.join(".afs/delegate-target"),
+        target_dir.display().to_string(),
+    )
+    .expect("test should configure delegated target");
+    std::fs::write(source_dir.join(".afs/delegate-reply-target"), "supervisor")
+        .expect("test should configure delegated reply target");
+    std::fs::write(
+        source_dir.join(".afs/delegate-prompt"),
+        "answer from target managed directory",
+    )
+    .expect("test should configure delegated prompt");
+    std::fs::write(
+        target_dir.join(".afs/task-response"),
+        "target handled delegated work",
+    )
+    .expect("test should configure target task response");
+
+    let ask = afs_ask(&afs_home, &format!("coordinate {}", source_file.display()));
+
+    assert!(
+        ask.status.success(),
+        "afs ask should succeed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&ask.stdout),
+        String::from_utf8_lossy(&ask.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&ask.stderr), "");
+    let stdout = String::from_utf8_lossy(&ask.stdout);
+    assert!(
+        stdout.contains("target handled delegated work"),
+        "afs ask should include the delegated answer returned to the supervisor"
+    );
+    assert!(
+        stdout.contains(&format!(
+            "participating_agents: {}, {}",
+            source_identity.trim(),
+            target_identity.trim()
+        )),
+        "afs ask should report both the delegating and delegated Directory Agents"
+    );
+    assert!(
+        stdout.contains("changed_files: none"),
+        "afs ask should expose the delegated task Change Report"
+    );
+    let task_received = std::fs::read_to_string(target_dir.join(".afs/task-received"))
+        .expect("target agent should receive delegated task");
+    assert!(
+        task_received.contains(&format!("requester={}", source_identity.trim())),
+        "delegated task should identify the requesting Directory Agent"
+    );
+    assert!(
+        task_received.contains("reply_target=supervisor"),
+        "delegated task should preserve the requested Reply Target"
+    );
+
+    stop_daemon(&mut daemon);
+}
+
+#[test]
+fn ask_allows_agent_to_delegate_direct_task_reply_back_to_delegator() {
+    let afs_home = unique_afs_home("ask-delegate-to-delegator");
+    let source_dir = unique_afs_home("ask-delegator-source");
+    let target_dir = unique_afs_home("ask-delegator-target");
+    let pi_runtime = fake_pi_runtime("ask-delegator-runtime");
+    let socket_path = supervisor_socket(&afs_home);
+    std::fs::create_dir_all(&source_dir).expect("test should create source managed directory");
+    std::fs::create_dir_all(&target_dir).expect("test should create target managed directory");
+    let source_file = source_dir.join("request.md");
+    std::fs::write(&source_file, "needs delegated context\n")
+        .expect("test should create source file");
+    let source_dir = source_dir
+        .canonicalize()
+        .expect("source directory should canonicalize");
+    let target_dir = target_dir
+        .canonicalize()
+        .expect("target directory should canonicalize");
+    let source_file = source_file
+        .canonicalize()
+        .expect("source file should canonicalize");
+    let mut daemon = start_daemon_with_pi_runtime(&afs_home, &pi_runtime);
+
+    assert!(
+        wait_until(Duration::from_secs(2), || socket_path
+            .metadata()
+            .map(|metadata| metadata.file_type().is_socket())
+            .unwrap_or(false)),
+        "daemon should create the Supervisor Socket before install connects"
+    );
+
+    let source_install = install_managed_dir(&afs_home, &source_dir);
+    assert!(
+        source_install.status.success(),
+        "source afs install should succeed"
+    );
+    let target_install = install_managed_dir(&afs_home, &target_dir);
+    assert!(
+        target_install.status.success(),
+        "target afs install should succeed"
+    );
+    let source_identity =
+        std::fs::read_to_string(source_dir.join(".afs/identity")).expect("source identity exists");
+    let target_identity =
+        std::fs::read_to_string(target_dir.join(".afs/identity")).expect("target identity exists");
+    std::fs::write(
+        source_dir.join(".afs/delegate-target"),
+        target_dir.display().to_string(),
+    )
+    .expect("test should configure delegated target");
+    std::fs::write(source_dir.join(".afs/delegate-reply-target"), "delegator")
+        .expect("test should configure delegated reply target");
+    std::fs::write(
+        target_dir.join(".afs/task-response"),
+        "target context for delegator",
+    )
+    .expect("test should configure target task response");
+
+    let ask = afs_ask(&afs_home, &format!("coordinate {}", source_file.display()));
+
+    assert!(
+        ask.status.success(),
+        "afs ask should succeed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&ask.stdout),
+        String::from_utf8_lossy(&ask.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&ask.stderr), "");
+    let stdout = String::from_utf8_lossy(&ask.stdout);
+    assert!(
+        stdout.contains("delegator"),
+        "afs ask should include the delegating agent's final answer"
+    );
+    assert!(
+        stdout.contains("target context for delegator"),
+        "delegating agent should receive and use the delegated answer"
+    );
+    assert!(
+        stdout.contains(&format!(
+            "participating_agents: {}, {}",
+            source_identity.trim(),
+            target_identity.trim()
+        )),
+        "afs ask should report both the delegating and delegated Directory Agents"
+    );
+    let delegated_reply = std::fs::read_to_string(source_dir.join(".afs/delegated-reply-received"))
+        .expect("delegating agent should receive delegated reply");
+    assert!(
+        delegated_reply.contains(&format!("agent={}", target_identity.trim())),
+        "delegated reply should identify the responding Directory Agent"
+    );
+    assert!(
+        delegated_reply.contains("answer=target context for delegator"),
+        "delegated reply should include the delegated task answer"
+    );
+
+    stop_daemon(&mut daemon);
+}
+
+#[test]
+fn delegated_task_change_report_includes_agent_history_entry() {
+    let afs_home = unique_afs_home("ask-delegate-change-report");
+    let source_dir = unique_afs_home("ask-change-source");
+    let target_dir = unique_afs_home("ask-change-target");
+    let pi_runtime = fake_pi_runtime("ask-change-runtime");
+    let socket_path = supervisor_socket(&afs_home);
+    std::fs::create_dir_all(&source_dir).expect("test should create source managed directory");
+    std::fs::create_dir_all(&target_dir).expect("test should create target managed directory");
+    let source_file = source_dir.join("request.md");
+    let target_file = target_dir.join("handoff.md");
+    std::fs::write(&source_file, "needs delegated edit\n").expect("test should create source file");
+    std::fs::write(&target_file, "before\n").expect("test should create target file");
+    let source_dir = source_dir
+        .canonicalize()
+        .expect("source directory should canonicalize");
+    let target_dir = target_dir
+        .canonicalize()
+        .expect("target directory should canonicalize");
+    let source_file = source_file
+        .canonicalize()
+        .expect("source file should canonicalize");
+    let target_file = target_file
+        .canonicalize()
+        .expect("target file should canonicalize");
+    let mut daemon = start_daemon_with_pi_runtime(&afs_home, &pi_runtime);
+
+    assert!(
+        wait_until(Duration::from_secs(2), || socket_path
+            .metadata()
+            .map(|metadata| metadata.file_type().is_socket())
+            .unwrap_or(false)),
+        "daemon should create the Supervisor Socket before install connects"
+    );
+
+    let source_install = install_managed_dir(&afs_home, &source_dir);
+    assert!(
+        source_install.status.success(),
+        "source afs install should succeed"
+    );
+    let target_install = install_managed_dir(&afs_home, &target_dir);
+    assert!(
+        target_install.status.success(),
+        "target afs install should succeed"
+    );
+    std::fs::write(
+        source_dir.join(".afs/delegate-target"),
+        target_dir.display().to_string(),
+    )
+    .expect("test should configure delegated target");
+    std::fs::write(source_dir.join(".afs/delegate-reply-target"), "supervisor")
+        .expect("test should configure delegated reply target");
+    std::fs::write(
+        target_dir.join(".afs/task-response"),
+        "target updated handoff",
+    )
+    .expect("test should configure target task response");
+    std::fs::write(target_dir.join(".afs/task-write-file"), "handoff.md")
+        .expect("test should configure target write path");
+    std::fs::write(
+        target_dir.join(".afs/task-write-content"),
+        "after delegated task",
+    )
+    .expect("test should configure target write content");
+
+    let ask = afs_ask(&afs_home, &format!("coordinate {}", source_file.display()));
+
+    assert!(
+        ask.status.success(),
+        "afs ask should succeed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&ask.stdout),
+        String::from_utf8_lossy(&ask.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&ask.stderr), "");
+    assert_eq!(
+        std::fs::read_to_string(&target_file).expect("target file should be readable"),
+        "after delegated task\n",
+        "delegated task should modify the target Managed Subtree"
+    );
+    let stdout = String::from_utf8_lossy(&ask.stdout);
+    assert!(
+        stdout.contains("changed_files: handoff.md"),
+        "afs ask should report files changed by delegated work"
+    );
+    assert!(
+        stdout.contains("history_entries: history-"),
+        "afs ask should report the resulting Agent Change History Entry"
+    );
+    assert!(
+        wait_until(Duration::from_secs(3), || {
+            let history = afs_history(&afs_home, &target_dir);
+            let stdout = String::from_utf8_lossy(&history.stdout);
+            history.status.success()
+                && stdout.contains("type=agent")
+                && stdout.contains("summary=Agent change: handoff.md")
+        }),
+        "delegated file modification should be recorded as an Agent Change"
+    );
+
+    stop_daemon(&mut daemon);
+}
+
+#[test]
+fn delegated_tasks_for_busy_agent_queue_fifo_and_report_progress() {
+    let afs_home = unique_afs_home("ask-delegate-queue");
+    let source_dir = unique_afs_home("ask-queue-source");
+    let target_dir = unique_afs_home("ask-queue-target");
+    let pi_runtime = fake_pi_runtime("ask-queue-runtime");
+    let socket_path = supervisor_socket(&afs_home);
+    std::fs::create_dir_all(&source_dir).expect("test should create source managed directory");
+    std::fs::create_dir_all(&target_dir).expect("test should create target managed directory");
+    let source_file = source_dir.join("request.md");
+    std::fs::write(&source_file, "needs two delegated tasks\n")
+        .expect("test should create source file");
+    let source_dir = source_dir
+        .canonicalize()
+        .expect("source directory should canonicalize");
+    let target_dir = target_dir
+        .canonicalize()
+        .expect("target directory should canonicalize");
+    let source_file = source_file
+        .canonicalize()
+        .expect("source file should canonicalize");
+    let mut daemon = start_daemon_with_pi_runtime(&afs_home, &pi_runtime);
+
+    assert!(
+        wait_until(Duration::from_secs(2), || socket_path
+            .metadata()
+            .map(|metadata| metadata.file_type().is_socket())
+            .unwrap_or(false)),
+        "daemon should create the Supervisor Socket before install connects"
+    );
+
+    let source_install = install_managed_dir(&afs_home, &source_dir);
+    assert!(
+        source_install.status.success(),
+        "source afs install should succeed"
+    );
+    let target_install = install_managed_dir(&afs_home, &target_dir);
+    assert!(
+        target_install.status.success(),
+        "target afs install should succeed"
+    );
+    let target_identity =
+        std::fs::read_to_string(target_dir.join(".afs/identity")).expect("target identity exists");
+    std::fs::write(
+        source_dir.join(".afs/delegate-target"),
+        target_dir.display().to_string(),
+    )
+    .expect("test should configure delegated target");
+    std::fs::write(source_dir.join(".afs/delegate-reply-target"), "supervisor")
+        .expect("test should configure delegated reply target");
+    std::fs::write(
+        source_dir.join(".afs/delegate-prompt"),
+        "first delegated task",
+    )
+    .expect("test should configure first delegated prompt");
+    std::fs::write(
+        source_dir.join(".afs/delegate-second-prompt"),
+        "second delegated task",
+    )
+    .expect("test should configure second delegated prompt");
+
+    let ask = afs_ask(&afs_home, &format!("coordinate {}", source_file.display()));
+
+    assert!(
+        ask.status.success(),
+        "afs ask should succeed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&ask.stdout),
+        String::from_utf8_lossy(&ask.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&ask.stderr), "");
+    let stdout = String::from_utf8_lossy(&ask.stdout);
+    assert!(
+        stdout.contains(&format!(
+            "progress: queued task agent={} queue=1",
+            target_identity.trim()
+        )),
+        "afs ask should report when a delegated task waits in the target queue"
+    );
+    assert!(
+        stdout.contains(&format!(
+            "progress: started task agent={} queue=0",
+            target_identity.trim()
+        )),
+        "afs ask should report when the target queue drains"
+    );
+    assert!(
+        stdout.contains("delegated answer for first delegated task"),
+        "first delegated task answer should be returned"
+    );
+    assert!(
+        stdout.contains("delegated answer for second delegated task"),
+        "second delegated task answer should be returned"
+    );
+    let task_received = std::fs::read_to_string(target_dir.join(".afs/task-received"))
+        .expect("target agent should receive delegated tasks");
+    let first_position = task_received
+        .find("prompt=first delegated task")
+        .expect("target should receive first task");
+    let second_position = task_received
+        .find("prompt=second delegated task")
+        .expect("target should receive second task");
+    assert!(
+        first_position < second_position,
+        "target agent should process delegated tasks FIFO"
     );
 
     stop_daemon(&mut daemon);

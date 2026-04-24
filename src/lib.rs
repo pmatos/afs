@@ -88,6 +88,7 @@ pub mod supervisor {
         process: Child,
         stdin: ChildStdin,
         stdout: ChildStdout,
+        queued_tasks: usize,
         _monitor: thread::JoinHandle<()>,
     }
 
@@ -238,9 +239,10 @@ pub mod supervisor {
                     None => "running",
                 };
                 status.push_str(&format!(
-                    "{}\tagent={}\truntime=pi-rpc-stdio\thealth={health}\tindex=warming\treconciliation=idle\tqueue=0\n",
+                    "{}\tagent={}\truntime=pi-rpc-stdio\thealth={health}\tindex=warming\treconciliation=idle\tqueue={}\n",
                     agent.managed_dir.display(),
-                    agent.identity
+                    agent.identity,
+                    agent.queued_tasks
                 ));
             }
             Ok(status)
@@ -296,13 +298,203 @@ pub mod supervisor {
                 ));
             };
 
-            let agent = &mut self.agents[agent_index];
-            let answer = agent.ask(prompt, &requested_path)?;
+            let answer = {
+                let agent = &mut self.agents[agent_index];
+                agent.ask(prompt, &requested_path)?
+            };
+
+            if let Some(request) = parse_delegate_request(&answer)? {
+                let requests = self.collect_delegate_requests(agent_index, request)?;
+                let reply_target = requests
+                    .first()
+                    .map(|request| request.reply_target)
+                    .ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidInput, "delegation request is missing")
+                    })?;
+                if requests
+                    .iter()
+                    .any(|request| request.reply_target != reply_target)
+                {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "delegated task batch must use one reply target",
+                    ));
+                }
+
+                if reply_target == ReplyTarget::Supervisor {
+                    let outcome =
+                        self.perform_delegated_supervisor_tasks(agent_index, &requests)?;
+                    return Ok(format_delegated_supervisor_response(
+                        &outcome,
+                        &requested_path,
+                        &self.agents[agent_index].identity,
+                    ));
+                }
+
+                if requests.len() != 1 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "delegator reply target supports one delegated task per request",
+                    ));
+                }
+
+                let request = &requests[0];
+                let reply = self.perform_delegated_task(agent_index, request)?;
+                let delegator_answer = {
+                    let agent = &mut self.agents[agent_index];
+                    agent.deliver_delegated_reply(&reply)?
+                };
+                return Ok(format_delegated_delegator_response(
+                    &delegator_answer,
+                    &reply,
+                    &requested_path,
+                    &self.agents[agent_index].identity,
+                ));
+            }
+
             Ok(format_direct_ask_response(
                 &answer,
                 &requested_path,
-                &agent.identity,
+                &self.agents[agent_index].identity,
             ))
+        }
+
+        fn collect_delegate_requests(
+            &mut self,
+            agent_index: usize,
+            first_request: DelegateRequest,
+        ) -> io::Result<Vec<DelegateRequest>> {
+            let mut requests = vec![first_request];
+            let agent = &mut self.agents[agent_index];
+            set_nonblocking(&agent.stdout, true)?;
+            let mut buffer = Vec::new();
+            let mut deadline = Instant::now() + Duration::from_millis(50);
+
+            loop {
+                let line = read_nonblocking_line(&mut agent.stdout, &mut buffer)?;
+                match line {
+                    Some(line) => {
+                        let Some(request) = parse_delegate_request(&line)? else {
+                            break;
+                        };
+                        requests.push(request);
+                        deadline = Instant::now() + Duration::from_millis(50);
+                    }
+                    None if Instant::now() < deadline => {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    None => break,
+                }
+            }
+
+            set_nonblocking(&agent.stdout, false)?;
+            Ok(requests)
+        }
+
+        fn perform_delegated_task(
+            &mut self,
+            requester_index: usize,
+            request: &DelegateRequest,
+        ) -> io::Result<TaskReply> {
+            let requester_identity = self.agents[requester_index].identity.clone();
+            let Some(target_index) = self.delegated_target_agent_index(&request.target) else {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("delegated target is not managed: {}", request.target),
+                ));
+            };
+
+            self.perform_delegated_task_at(requester_identity, target_index, request)
+        }
+
+        fn perform_delegated_supervisor_tasks(
+            &mut self,
+            requester_index: usize,
+            requests: &[DelegateRequest],
+        ) -> io::Result<DelegationOutcome> {
+            let requester_identity = self.agents[requester_index].identity.clone();
+            let mut target_indexes = Vec::new();
+            let mut target_counts = BTreeMap::<usize, usize>::new();
+            for request in requests {
+                let Some(target_index) = self.delegated_target_agent_index(&request.target) else {
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!("delegated target is not managed: {}", request.target),
+                    ));
+                };
+                target_indexes.push(target_index);
+                *target_counts.entry(target_index).or_default() += 1;
+            }
+
+            let mut progress = Vec::new();
+            for (target_index, count) in &target_counts {
+                if *count > 1 {
+                    let queued = count - 1;
+                    self.agents[*target_index].queued_tasks = queued;
+                    progress.push(format!(
+                        "progress: queued task agent={} queue={queued}",
+                        self.agents[*target_index].identity
+                    ));
+                }
+            }
+
+            let mut replies = Vec::new();
+            for (request, target_index) in requests.iter().zip(target_indexes) {
+                let reply = self.perform_delegated_task_at(
+                    requester_identity.clone(),
+                    target_index,
+                    request,
+                )?;
+                replies.push(reply);
+                if self.agents[target_index].queued_tasks > 0 {
+                    self.agents[target_index].queued_tasks -= 1;
+                    progress.push(format!(
+                        "progress: started task agent={} queue={}",
+                        self.agents[target_index].identity, self.agents[target_index].queued_tasks
+                    ));
+                }
+            }
+
+            Ok(DelegationOutcome { replies, progress })
+        }
+
+        fn perform_delegated_task_at(
+            &mut self,
+            requester_identity: String,
+            target_index: usize,
+            request: &DelegateRequest,
+        ) -> io::Result<TaskReply> {
+            let target = &mut self.agents[target_index];
+            let raw_reply = target.task(
+                &requester_identity,
+                request.reply_target.as_protocol_field(),
+                &request.prompt,
+            )?;
+            let mut reply = parse_task_reply(&raw_reply, target);
+            if let Some(change) = record_agent_change(&target.managed_dir, &target.agent_home)? {
+                reply.changed_files = change.files;
+                reply.history_entries = vec![change.history_entry];
+            }
+            Ok(reply)
+        }
+
+        fn delegated_target_agent_index(&self, target: &str) -> Option<usize> {
+            if let Some(index) = self
+                .agents
+                .iter()
+                .position(|agent| agent.identity == target.trim())
+            {
+                return Some(index);
+            }
+
+            let target_path = Path::new(target);
+            let target_path = if target_path.is_absolute() {
+                target_path.to_path_buf()
+            } else {
+                return None;
+            };
+            let target_path = target_path.canonicalize().ok()?;
+            self.owning_agent_index(&target_path)
         }
 
         fn broadcast_ask(&mut self, prompt: &str) -> io::Result<String> {
@@ -425,6 +617,7 @@ pub mod supervisor {
                 process,
                 stdin,
                 stdout,
+                queued_tasks: 0,
                 _monitor: monitor,
             });
             Ok(())
@@ -446,6 +639,32 @@ pub mod supervisor {
             writeln!(self.stdin, "{prompt}")?;
             self.stdin.flush()
         }
+
+        fn task(
+            &mut self,
+            requester_identity: &str,
+            reply_target: &str,
+            prompt: &str,
+        ) -> io::Result<String> {
+            writeln!(self.stdin, "TASK")?;
+            writeln!(self.stdin, "{requester_identity}")?;
+            writeln!(self.stdin, "{reply_target}")?;
+            writeln!(self.stdin, "{prompt}")?;
+            self.stdin.flush()?;
+
+            read_blocking_line(&mut self.stdout)
+        }
+
+        fn deliver_delegated_reply(&mut self, reply: &TaskReply) -> io::Result<String> {
+            writeln!(self.stdin, "DELEGATED_REPLY")?;
+            writeln!(self.stdin, "{}", reply.agent_identity)?;
+            writeln!(self.stdin, "{}", reply.answer)?;
+            writeln!(self.stdin, "{}", report_list(&reply.changed_files))?;
+            writeln!(self.stdin, "{}", report_list(&reply.history_entries))?;
+            self.stdin.flush()?;
+
+            read_blocking_line(&mut self.stdout)
+        }
     }
 
     struct BroadcastReply {
@@ -455,6 +674,44 @@ pub mod supervisor {
         reason: String,
         answer: String,
         file_references: Vec<String>,
+    }
+
+    struct DelegateRequest {
+        target: String,
+        reply_target: ReplyTarget,
+        prompt: String,
+    }
+
+    #[derive(Clone, Copy, Eq, PartialEq)]
+    enum ReplyTarget {
+        Delegator,
+        Supervisor,
+    }
+
+    impl ReplyTarget {
+        fn as_protocol_field(self) -> &'static str {
+            match self {
+                Self::Delegator => "delegator",
+                Self::Supervisor => "supervisor",
+            }
+        }
+    }
+
+    struct TaskReply {
+        agent_identity: String,
+        answer: String,
+        changed_files: Vec<String>,
+        history_entries: Vec<String>,
+    }
+
+    struct DelegationOutcome {
+        replies: Vec<TaskReply>,
+        progress: Vec<String>,
+    }
+
+    struct RecordedChange {
+        history_entry: String,
+        files: Vec<String>,
     }
 
     fn format_direct_ask_response(
@@ -473,6 +730,105 @@ pub mod supervisor {
         response.push_str(&format!("participating_agents: {agent_identity}\n"));
         response.push_str("changed_files: none\n");
         response
+    }
+
+    fn format_delegated_supervisor_response(
+        outcome: &DelegationOutcome,
+        requested_path: &Path,
+        requester_identity: &str,
+    ) -> String {
+        let mut response = String::new();
+        if let [reply] = outcome.replies.as_slice() {
+            response.push_str(&reply.answer);
+            if !response.ends_with('\n') {
+                response.push('\n');
+            }
+        } else {
+            response.push_str("answers:\n");
+            for reply in &outcome.replies {
+                response.push_str(&format!("- agent={}\n", reply.agent_identity));
+                response.push_str(&format!("  {}\n", reply.answer));
+            }
+        }
+        for progress in &outcome.progress {
+            response.push_str(progress);
+            response.push('\n');
+        }
+        response.push_str("references:\n");
+        response.push_str(&format!("- {}\n", requested_path.display()));
+        response.push_str("caveat: local index is warming; answer may be incomplete\n");
+        let participating_agents = participating_agents(
+            requester_identity,
+            outcome
+                .replies
+                .iter()
+                .map(|reply| reply.agent_identity.as_str()),
+        );
+        response.push_str(&format!(
+            "participating_agents: {}\n",
+            participating_agents.join(", ")
+        ));
+        let changed_files = outcome
+            .replies
+            .iter()
+            .flat_map(|reply| reply.changed_files.iter().cloned())
+            .collect::<Vec<_>>();
+        let history_entries = outcome
+            .replies
+            .iter()
+            .flat_map(|reply| reply.history_entries.iter().cloned())
+            .collect::<Vec<_>>();
+        response.push_str(&format!("changed_files: {}\n", report_list(&changed_files)));
+        response.push_str(&format!(
+            "history_entries: {}\n",
+            report_list(&history_entries)
+        ));
+        response
+    }
+
+    fn format_delegated_delegator_response(
+        answer: &str,
+        reply: &TaskReply,
+        requested_path: &Path,
+        requester_identity: &str,
+    ) -> String {
+        let mut response = String::new();
+        response.push_str(answer);
+        if !response.ends_with('\n') {
+            response.push('\n');
+        }
+        response.push_str("references:\n");
+        response.push_str(&format!("- {}\n", requested_path.display()));
+        response.push_str("caveat: local index is warming; answer may be incomplete\n");
+        response.push_str(&format!(
+            "participating_agents: {}, {}\n",
+            requester_identity, reply.agent_identity
+        ));
+        response.push_str(&format!(
+            "changed_files: {}\n",
+            report_list(&reply.changed_files)
+        ));
+        response.push_str(&format!(
+            "history_entries: {}\n",
+            report_list(&reply.history_entries)
+        ));
+        response
+    }
+
+    fn participating_agents<'a>(
+        requester_identity: &'a str,
+        replies: impl Iterator<Item = &'a str>,
+    ) -> Vec<&'a str> {
+        let mut seen = BTreeSet::new();
+        let mut agents = Vec::new();
+        seen.insert(requester_identity);
+        agents.push(requester_identity);
+        for identity in replies {
+            if seen.insert(identity) {
+                agents.push(identity);
+            }
+        }
+        agents
     }
 
     fn format_broadcast_ask_response(replies: &[BroadcastReply], timeout: Duration) -> String {
@@ -548,6 +904,91 @@ pub mod supervisor {
             answer,
             file_references,
         })
+    }
+
+    fn parse_delegate_request(line: &str) -> io::Result<Option<DelegateRequest>> {
+        let line = line.trim_end_matches(['\n', '\r']);
+        let Some(payload) = line.strip_prefix("DELEGATE\t") else {
+            return Ok(None);
+        };
+
+        let mut fields = payload.splitn(3, '\t');
+        let Some(target) = fields.next().filter(|value| !value.is_empty()) else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "delegation request is missing target",
+            ));
+        };
+        let Some(reply_target) = fields.next() else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "delegation request is missing reply target",
+            ));
+        };
+        let Some(prompt) = fields.next() else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "delegation request is missing prompt",
+            ));
+        };
+
+        let reply_target = match reply_target {
+            "delegator" => ReplyTarget::Delegator,
+            "supervisor" => ReplyTarget::Supervisor,
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "delegation reply target must be delegator or supervisor",
+                ));
+            }
+        };
+
+        Ok(Some(DelegateRequest {
+            target: target.to_string(),
+            reply_target,
+            prompt: prompt.to_string(),
+        }))
+    }
+
+    fn parse_task_reply(line: &str, agent: &RegisteredAgent) -> TaskReply {
+        let line = line.trim_end_matches(['\n', '\r']);
+        let Some(payload) = line.strip_prefix("TASK_REPLY\t") else {
+            return TaskReply {
+                agent_identity: agent.identity.clone(),
+                answer: line.to_string(),
+                changed_files: Vec::new(),
+                history_entries: Vec::new(),
+            };
+        };
+
+        let mut fields = payload.splitn(3, '\t');
+        TaskReply {
+            agent_identity: agent.identity.clone(),
+            answer: fields.next().unwrap_or_default().to_string(),
+            changed_files: parse_report_list(fields.next().unwrap_or_default()),
+            history_entries: parse_report_list(fields.next().unwrap_or_default()),
+        }
+    }
+
+    fn parse_report_list(field: &str) -> Vec<String> {
+        if field == "none" || field.trim().is_empty() {
+            return Vec::new();
+        }
+
+        field
+            .split(';')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+            .collect()
+    }
+
+    fn report_list(values: &[String]) -> String {
+        if values.is_empty() {
+            "none".to_string()
+        } else {
+            values.join(", ")
+        }
     }
 
     fn normalize_broadcast_reference(reference: &str, managed_dir: &Path) -> Option<String> {
@@ -890,7 +1331,14 @@ pub mod supervisor {
     }
 
     fn record_external_change(managed_dir: &Path, agent_home: &Path) -> io::Result<()> {
-        record_snapshot_delta(managed_dir, agent_home, "external", "External change")
+        record_snapshot_delta(managed_dir, agent_home, "external", "External change").map(|_| ())
+    }
+
+    fn record_agent_change(
+        managed_dir: &Path,
+        agent_home: &Path,
+    ) -> io::Result<Option<RecordedChange>> {
+        record_snapshot_delta(managed_dir, agent_home, "agent", "Agent change")
     }
 
     fn record_startup_reconciliation(managed_dir: &Path, agent_home: &Path) -> io::Result<()> {
@@ -907,6 +1355,7 @@ pub mod supervisor {
             "reconciliation",
             "Startup reconciliation",
         )
+        .map(|_| ())
     }
 
     fn record_snapshot_delta(
@@ -914,7 +1363,7 @@ pub mod supervisor {
         agent_home: &Path,
         kind: &str,
         summary_prefix: &str,
-    ) -> io::Result<()> {
+    ) -> io::Result<Option<RecordedChange>> {
         let _guard = history_lock()
             .lock()
             .map_err(|_| io::Error::other("history lock poisoned"))?;
@@ -923,7 +1372,7 @@ pub mod supervisor {
         let current = collect_file_snapshot(managed_dir)?;
         let changed_files = changed_files(&previous, &current);
         if changed_files.is_empty() {
-            return Ok(());
+            return Ok(None);
         }
 
         let entry_id = history_entry_id();
@@ -937,7 +1386,11 @@ pub mod supervisor {
             undoable,
         )?;
         write_snapshot(&snapshot_path, &current)?;
-        refresh_content_snapshot(managed_dir, agent_home)
+        refresh_content_snapshot(managed_dir, agent_home)?;
+        Ok(Some(RecordedChange {
+            history_entry: entry_id,
+            files: changed_files,
+        }))
     }
 
     fn changed_files(previous: &Snapshot, current: &Snapshot) -> Vec<String> {
