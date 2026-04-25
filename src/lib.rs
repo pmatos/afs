@@ -790,22 +790,56 @@ pub mod supervisor {
                 return Ok(());
             }
 
-            let registry = std::fs::read_to_string(registry_path)?;
+            let registry = std::fs::read_to_string(&registry_path)?;
+            let mut rebuilt = String::from("identity\tmanaged_dir\tagent_home\n");
+            let mut registry_changed = false;
             for line in registry.lines().skip(1) {
+                if line.is_empty() {
+                    continue;
+                }
                 let fields = line.split('\t').collect::<Vec<_>>();
                 if fields.len() != 3 {
+                    // Preserve malformed rows verbatim so we don't silently
+                    // delete unrecognized state when rewriting the registry.
+                    rebuilt.push_str(line);
+                    rebuilt.push('\n');
                     continue;
                 }
 
                 let identity = fields[0].to_string();
-                let managed_dir = PathBuf::from(fields[1]);
-                let agent_home = PathBuf::from(fields[2]);
+                let mut managed_dir = PathBuf::from(fields[1]);
+                let mut agent_home = PathBuf::from(fields[2]);
+
                 if !managed_dir.is_dir() {
-                    continue;
+                    match rediscover_managed_dir(&managed_dir, identity.trim())? {
+                        Some(new_managed_dir) => {
+                            managed_dir = new_managed_dir;
+                            agent_home = managed_dir.join(AGENT_HOME_DIR);
+                            registry_changed = true;
+                        }
+                        None => {
+                            // Keep the unresolved row so it can recover later
+                            // (for example, a managed directory on a drive
+                            // that is currently unmounted).
+                            rebuilt.push_str(line);
+                            rebuilt.push('\n');
+                            continue;
+                        }
+                    }
                 }
 
                 record_startup_reconciliation(&managed_dir, &agent_home)?;
+                rebuilt.push_str(&identity);
+                rebuilt.push('\t');
+                rebuilt.push_str(&managed_dir.to_string_lossy());
+                rebuilt.push('\t');
+                rebuilt.push_str(&agent_home.to_string_lossy());
+                rebuilt.push('\n');
                 self.start_registered_agent(managed_dir, agent_home, &identity)?;
+            }
+
+            if registry_changed {
+                std::fs::write(&registry_path, rebuilt)?;
             }
 
             Ok(())
@@ -2252,6 +2286,93 @@ pub mod supervisor {
         path != managed_dir
             && path.starts_with(managed_dir)
             && path.join(AGENT_HOME_DIR).join("identity").is_file()
+    }
+
+    fn rediscover_managed_dir(original: &Path, identity: &str) -> io::Result<Option<PathBuf>> {
+        const MAX_NODES: usize = 4096;
+        const MAX_DEPTH: usize = 8;
+        const MAX_ANCESTOR_LEVELS: usize = 5;
+
+        let mut search_root = original.parent();
+        let mut scanned_levels = 0usize;
+        while let Some(candidate_root) = search_root {
+            if candidate_root.is_dir() {
+                if let Some(found) =
+                    scan_for_agent_identity(candidate_root, identity, MAX_DEPTH, MAX_NODES)?
+                {
+                    return Ok(Some(found));
+                }
+                scanned_levels += 1;
+                if scanned_levels >= MAX_ANCESTOR_LEVELS {
+                    return Ok(None);
+                }
+            }
+            search_root = candidate_root.parent();
+        }
+        Ok(None)
+    }
+
+    fn scan_for_agent_identity(
+        root: &Path,
+        identity: &str,
+        max_depth: usize,
+        max_nodes: usize,
+    ) -> io::Result<Option<PathBuf>> {
+        let mut stack = vec![(root.to_path_buf(), 0usize)];
+        let mut visited = 0usize;
+
+        while let Some((dir, depth)) = stack.pop() {
+            visited += 1;
+            if visited > max_nodes {
+                return Ok(None);
+            }
+
+            if directory_identity_matches(&dir, identity)? {
+                return Ok(Some(dir));
+            }
+
+            if depth >= max_depth {
+                continue;
+            }
+
+            let entries = match std::fs::read_dir(&dir) {
+                Ok(entries) => entries,
+                Err(_) => continue,
+            };
+            for entry in entries.flatten() {
+                // Stop enumerating this directory once the in-flight node
+                // budget is exhausted; otherwise a single high-fanout
+                // directory could allocate and stat far beyond max_nodes
+                // before the next pop observes the cap.
+                if visited + stack.len() >= max_nodes {
+                    break;
+                }
+                let file_type = match entry.file_type() {
+                    Ok(file_type) => file_type,
+                    Err(_) => continue,
+                };
+                if !file_type.is_dir() || file_type.is_symlink() {
+                    continue;
+                }
+                if entry.file_name() == AGENT_HOME_DIR {
+                    continue;
+                }
+                stack.push((entry.path(), depth + 1));
+            }
+        }
+
+        Ok(None)
+    }
+
+    fn directory_identity_matches(dir: &Path, identity: &str) -> io::Result<bool> {
+        let identity_path = dir.join(AGENT_HOME_DIR).join("identity");
+        if !identity_path.is_file() {
+            return Ok(false);
+        }
+        match std::fs::read_to_string(identity_path) {
+            Ok(content) => Ok(content.trim() == identity),
+            Err(_) => Ok(false),
+        }
     }
 
     fn is_nested_managed_path(managed_dir: &Path, path: &Path) -> bool {
