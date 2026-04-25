@@ -790,7 +790,8 @@ pub mod supervisor {
                 return Ok(());
             }
 
-            let registry = std::fs::read_to_string(registry_path)?;
+            let registry = std::fs::read_to_string(&registry_path)?;
+            let mut registry_changed = false;
             for line in registry.lines().skip(1) {
                 let fields = line.split('\t').collect::<Vec<_>>();
                 if fields.len() != 3 {
@@ -798,14 +799,25 @@ pub mod supervisor {
                 }
 
                 let identity = fields[0].to_string();
-                let managed_dir = PathBuf::from(fields[1]);
-                let agent_home = PathBuf::from(fields[2]);
+                let mut managed_dir = PathBuf::from(fields[1]);
+                let mut agent_home = PathBuf::from(fields[2]);
+
                 if !managed_dir.is_dir() {
-                    continue;
+                    let Some(rediscovered) = rediscover_managed_dir(&managed_dir, identity.trim())?
+                    else {
+                        continue;
+                    };
+                    managed_dir = rediscovered;
+                    agent_home = managed_dir.join(AGENT_HOME_DIR);
+                    registry_changed = true;
                 }
 
                 record_startup_reconciliation(&managed_dir, &agent_home)?;
                 self.start_registered_agent(managed_dir, agent_home, &identity)?;
+            }
+
+            if registry_changed {
+                self.write_registry()?;
             }
 
             Ok(())
@@ -2252,6 +2264,73 @@ pub mod supervisor {
         path != managed_dir
             && path.starts_with(managed_dir)
             && path.join(AGENT_HOME_DIR).join("identity").is_file()
+    }
+
+    fn rediscover_managed_dir(original: &Path, identity: &str) -> io::Result<Option<PathBuf>> {
+        const MAX_NODES: usize = 4096;
+        const MAX_DEPTH: usize = 8;
+
+        let mut search_root = original.parent();
+        while let Some(candidate_root) = search_root {
+            if candidate_root.is_dir() {
+                return scan_for_agent_identity(candidate_root, identity, MAX_DEPTH, MAX_NODES);
+            }
+            search_root = candidate_root.parent();
+        }
+        Ok(None)
+    }
+
+    fn scan_for_agent_identity(
+        root: &Path,
+        identity: &str,
+        max_depth: usize,
+        max_nodes: usize,
+    ) -> io::Result<Option<PathBuf>> {
+        let mut stack = vec![(root.to_path_buf(), 0usize)];
+        let mut visited = 0usize;
+
+        while let Some((dir, depth)) = stack.pop() {
+            visited += 1;
+            if visited > max_nodes {
+                return Ok(None);
+            }
+
+            if directory_identity_matches(&dir, identity)? {
+                return Ok(Some(dir));
+            }
+
+            if depth >= max_depth {
+                continue;
+            }
+
+            let entries = match std::fs::read_dir(&dir) {
+                Ok(entries) => entries,
+                Err(_) => continue,
+            };
+            for entry in entries.flatten() {
+                let file_type = match entry.file_type() {
+                    Ok(file_type) => file_type,
+                    Err(_) => continue,
+                };
+                if !file_type.is_dir() || file_type.is_symlink() {
+                    continue;
+                }
+                if entry.file_name() == AGENT_HOME_DIR {
+                    continue;
+                }
+                stack.push((entry.path(), depth + 1));
+            }
+        }
+
+        Ok(None)
+    }
+
+    fn directory_identity_matches(dir: &Path, identity: &str) -> io::Result<bool> {
+        let identity_path = dir.join(AGENT_HOME_DIR).join("identity");
+        if !identity_path.is_file() {
+            return Ok(false);
+        }
+        Ok(std::fs::read_to_string(identity_path)?.trim() == identity)
     }
 
     fn is_nested_managed_path(managed_dir: &Path, path: &Path) -> bool {

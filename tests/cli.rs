@@ -4089,3 +4089,96 @@ fn install_preserves_existing_afs_ignore_file() {
 
     stop_daemon(&mut daemon);
 }
+
+#[test]
+fn supervisor_rediscovers_moved_managed_directory_after_restart() {
+    let afs_home = unique_afs_home("move-rediscover");
+    let workspace = unique_afs_home("move-rediscover-workspace");
+    let original_dir = workspace.join("project");
+    let pi_runtime = fake_pi_runtime("move-rediscover-runtime");
+    let socket_path = supervisor_socket(&afs_home);
+    std::fs::create_dir_all(&original_dir).expect("test should create managed directory");
+    std::fs::write(original_dir.join("notes.txt"), "before move\n")
+        .expect("test should create managed file");
+    let original_dir = original_dir
+        .canonicalize()
+        .expect("original directory should canonicalize");
+
+    let mut daemon = start_daemon_with_pi_runtime(&afs_home, &pi_runtime);
+    assert!(
+        wait_until(Duration::from_secs(2), || socket_path
+            .metadata()
+            .map(|metadata| metadata.file_type().is_socket())
+            .unwrap_or(false)),
+        "daemon should create the Supervisor Socket before install connects"
+    );
+
+    let install = install_managed_dir(&afs_home, &original_dir);
+    assert!(install.status.success(), "afs install should succeed");
+    let identity = std::fs::read_to_string(original_dir.join(".afs/identity"))
+        .expect("identity should be readable")
+        .trim()
+        .to_string();
+
+    stop_daemon(&mut daemon);
+
+    let workspace = workspace
+        .canonicalize()
+        .expect("workspace should canonicalize");
+    let moved_dir = workspace.join("project-renamed");
+    std::fs::rename(&original_dir, &moved_dir).expect("test should move managed directory");
+    let moved_dir = moved_dir
+        .canonicalize()
+        .expect("moved directory should canonicalize");
+
+    let mut restarted_daemon = start_daemon_with_pi_runtime(&afs_home, &pi_runtime);
+    assert!(
+        wait_until(Duration::from_secs(2), || socket_path
+            .metadata()
+            .map(|metadata| metadata.file_type().is_socket())
+            .unwrap_or(false)),
+        "restarted daemon should re-create the Supervisor Socket"
+    );
+
+    assert!(
+        wait_until(Duration::from_secs(3), || {
+            let agents = Command::new(env!("CARGO_BIN_EXE_afs"))
+                .env("AFS_HOME", &afs_home)
+                .arg("agents")
+                .output()
+                .expect("afs agents should run");
+            let stdout = String::from_utf8_lossy(&agents.stdout);
+            agents.status.success()
+                && stdout.contains(&moved_dir.display().to_string())
+                && stdout.contains(&identity)
+        }),
+        "afs agents should report the moved managed directory under its preserved identity"
+    );
+
+    let agents = Command::new(env!("CARGO_BIN_EXE_afs"))
+        .env("AFS_HOME", &afs_home)
+        .arg("agents")
+        .output()
+        .expect("afs agents should run");
+    let stdout = String::from_utf8_lossy(&agents.stdout);
+    assert!(
+        !stdout.contains(&format!("{}\t", original_dir.display())),
+        "afs agents should not report the original path as managed after rediscovery"
+    );
+
+    let history = afs_history(&afs_home, &moved_dir);
+    assert!(
+        history.status.success(),
+        "afs history on the moved path should succeed\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&history.stdout),
+        String::from_utf8_lossy(&history.stderr)
+    );
+
+    let stale = afs_history(&afs_home, &original_dir);
+    assert!(
+        !stale.status.success(),
+        "afs history on the original path should fail after the directory moved"
+    );
+
+    stop_daemon(&mut restarted_daemon);
+}
