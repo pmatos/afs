@@ -4257,3 +4257,100 @@ fn rediscovery_skips_candidate_with_unreadable_identity_file() {
 
     stop_daemon(&mut restarted_daemon);
 }
+
+#[test]
+fn rediscovery_rewrite_preserves_unresolved_registry_rows() {
+    let afs_home = unique_afs_home("move-rediscover-preserve");
+    let movable_workspace = unique_afs_home("move-rediscover-preserve-movable");
+    let movable_dir = movable_workspace.join("project");
+    let unmounted_workspace = unique_afs_home("move-rediscover-preserve-unmounted");
+    let unmounted_dir = unmounted_workspace.join("project");
+    let pi_runtime = fake_pi_runtime("move-rediscover-preserve-runtime");
+    let socket_path = supervisor_socket(&afs_home);
+    std::fs::create_dir_all(&movable_dir).expect("test should create movable directory");
+    std::fs::create_dir_all(&unmounted_dir).expect("test should create unmounted directory");
+    let movable_dir = movable_dir
+        .canonicalize()
+        .expect("movable directory should canonicalize");
+    let unmounted_dir = unmounted_dir
+        .canonicalize()
+        .expect("unmounted directory should canonicalize");
+
+    let mut daemon = start_daemon_with_pi_runtime(&afs_home, &pi_runtime);
+    assert!(
+        wait_until(Duration::from_secs(2), || socket_path
+            .metadata()
+            .map(|metadata| metadata.file_type().is_socket())
+            .unwrap_or(false)),
+        "daemon should create the Supervisor Socket before install connects"
+    );
+    assert!(
+        install_managed_dir(&afs_home, &movable_dir)
+            .status
+            .success(),
+        "movable afs install should succeed"
+    );
+    assert!(
+        install_managed_dir(&afs_home, &unmounted_dir)
+            .status
+            .success(),
+        "unmounted afs install should succeed"
+    );
+    let unmounted_identity = std::fs::read_to_string(unmounted_dir.join(".afs/identity"))
+        .expect("unmounted identity should be readable")
+        .trim()
+        .to_string();
+    let unmounted_registry_line = format!(
+        "{}\t{}\t{}",
+        unmounted_identity,
+        unmounted_dir.display(),
+        unmounted_dir.join(".afs").display()
+    );
+    stop_daemon(&mut daemon);
+
+    let movable_workspace = movable_workspace
+        .canonicalize()
+        .expect("movable workspace should canonicalize");
+    let moved_dir = movable_workspace.join("project-renamed");
+    std::fs::rename(&movable_dir, &moved_dir).expect("test should move movable directory");
+
+    // Simulate the unmounted-drive scenario: the entire ancestor disappears,
+    // so the supervisor cannot rediscover this entry on this restart.
+    std::fs::remove_dir_all(&unmounted_workspace)
+        .expect("test should remove unmounted workspace entirely");
+
+    let mut restarted_daemon = start_daemon_with_pi_runtime(&afs_home, &pi_runtime);
+    assert!(
+        wait_until(Duration::from_secs(2), || socket_path
+            .metadata()
+            .map(|metadata| metadata.file_type().is_socket())
+            .unwrap_or(false)),
+        "restarted daemon should re-create the Supervisor Socket"
+    );
+
+    let moved_dir = moved_dir
+        .canonicalize()
+        .expect("moved directory should canonicalize");
+    assert!(
+        wait_until(Duration::from_secs(3), || {
+            let agents = Command::new(env!("CARGO_BIN_EXE_afs"))
+                .env("AFS_HOME", &afs_home)
+                .arg("agents")
+                .output()
+                .expect("afs agents should run");
+            agents.status.success()
+                && String::from_utf8_lossy(&agents.stdout)
+                    .contains(&moved_dir.display().to_string())
+        }),
+        "afs agents should report the rediscovered movable directory"
+    );
+
+    let registry = std::fs::read_to_string(afs_home.join("registry.tsv"))
+        .expect("registry should be readable after restart");
+    assert!(
+        registry.lines().any(|line| line == unmounted_registry_line),
+        "registry should preserve the unresolved row for the temporarily missing managed directory; got:\n{registry}"
+    );
+
+    stop_daemon(&mut restarted_daemon);
+}

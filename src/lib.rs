@@ -791,10 +791,18 @@ pub mod supervisor {
             }
 
             let registry = std::fs::read_to_string(&registry_path)?;
+            let mut rebuilt = String::from("identity\tmanaged_dir\tagent_home\n");
             let mut registry_changed = false;
             for line in registry.lines().skip(1) {
+                if line.is_empty() {
+                    continue;
+                }
                 let fields = line.split('\t').collect::<Vec<_>>();
                 if fields.len() != 3 {
+                    // Preserve malformed rows verbatim so we don't silently
+                    // delete unrecognized state when rewriting the registry.
+                    rebuilt.push_str(line);
+                    rebuilt.push('\n');
                     continue;
                 }
 
@@ -803,21 +811,35 @@ pub mod supervisor {
                 let mut agent_home = PathBuf::from(fields[2]);
 
                 if !managed_dir.is_dir() {
-                    let Some(rediscovered) = rediscover_managed_dir(&managed_dir, identity.trim())?
-                    else {
-                        continue;
-                    };
-                    managed_dir = rediscovered;
-                    agent_home = managed_dir.join(AGENT_HOME_DIR);
-                    registry_changed = true;
+                    match rediscover_managed_dir(&managed_dir, identity.trim())? {
+                        Some(new_managed_dir) => {
+                            managed_dir = new_managed_dir;
+                            agent_home = managed_dir.join(AGENT_HOME_DIR);
+                            registry_changed = true;
+                        }
+                        None => {
+                            // Keep the unresolved row so it can recover later
+                            // (for example, a managed directory on a drive
+                            // that is currently unmounted).
+                            rebuilt.push_str(line);
+                            rebuilt.push('\n');
+                            continue;
+                        }
+                    }
                 }
 
                 record_startup_reconciliation(&managed_dir, &agent_home)?;
+                rebuilt.push_str(&identity);
+                rebuilt.push('\t');
+                rebuilt.push_str(&managed_dir.to_string_lossy());
+                rebuilt.push('\t');
+                rebuilt.push_str(&agent_home.to_string_lossy());
+                rebuilt.push('\n');
                 self.start_registered_agent(managed_dir, agent_home, &identity)?;
             }
 
             if registry_changed {
-                self.write_registry()?;
+                std::fs::write(&registry_path, rebuilt)?;
             }
 
             Ok(())
@@ -2308,6 +2330,13 @@ pub mod supervisor {
                 Err(_) => continue,
             };
             for entry in entries.flatten() {
+                // Stop enumerating this directory once the in-flight node
+                // budget is exhausted; otherwise a single high-fanout
+                // directory could allocate and stat far beyond max_nodes
+                // before the next pop observes the cap.
+                if visited + stack.len() >= max_nodes {
+                    break;
+                }
                 let file_type = match entry.file_type() {
                     Ok(file_type) => file_type,
                     Err(_) => continue,
