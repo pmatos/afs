@@ -83,11 +83,13 @@ fn main() -> ExitCode {
         }
         Some("remove") => {
             let Some(path) = args.next() else {
-                eprintln!("usage: afs remove <path>");
+                eprintln!("usage: afs remove <path> [--discard-history]");
                 return ExitCode::FAILURE;
             };
 
-            match afs::client::remove(std::path::Path::new(&path)) {
+            let discard_history = args.any(|argument| argument == "--discard-history");
+
+            match afs::client::remove(std::path::Path::new(&path), discard_history) {
                 Ok(response) => {
                     print!("{response}");
                     ExitCode::SUCCESS

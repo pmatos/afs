@@ -48,6 +48,7 @@ Build the first version of an Agentic File System (AFS) for Linux as a Rust appl
 38. As a user, I want explicit path-based work on ignored files to still be possible and still recorded in history, so that ignore means "not by default," not "impossible."
 39. As a user, I want the system to be Linux-only in v1, so that filesystem event behavior is reliable instead of half-portable.
 40. As a user, I want a future simple GUI to remain optional and layered on top of the CLI/daemon model, so that the core system stays composable.
+41. As a user, I want `afs remove` on a top-level managed directory to archive its Agent Home under the Supervisor Home with a discoverable path, and I want a `--discard-history` flag that explicitly opts out of archiving for both top-level and nested removals, so that removal is auditable by default but can be forced to discard when history is not needed.
 
 ## Implementation Decisions
 

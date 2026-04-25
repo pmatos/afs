@@ -123,8 +123,24 @@ pub mod supervisor {
             state.ask(Path::new(cwd), prompt)
         } else if let Some(path) = request.strip_prefix("INSTALL ") {
             state.install(Path::new(path))
-        } else if let Some(path) = request.strip_prefix("REMOVE ") {
-            state.remove(Path::new(path))
+        } else if let Some(payload) = request.strip_prefix("REMOVE\t") {
+            let Some((path, flag)) = payload.split_once('\t') else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "REMOVE request is missing discard-history flag",
+                ));
+            };
+            let discard_history = match flag {
+                "discard" => true,
+                "keep" => false,
+                _ => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "REMOVE request has unknown discard-history flag",
+                    ));
+                }
+            };
+            state.remove(Path::new(path), discard_history)
         } else if request == "AGENTS" {
             state.agents()
         } else if let Some(path) = request.strip_prefix("HISTORY ") {
@@ -225,11 +241,11 @@ pub mod supervisor {
 
             if !was_already_managed && let Some(parent_agent_index) = parent_agent_index {
                 let parent = &self.agents[parent_agent_index];
+                let affected = relative_managed_path(&parent.managed_dir, &managed_dir)?;
                 record_ownership_event(
                     &parent.managed_dir,
                     &parent.agent_home,
-                    "Ownership split",
-                    &managed_dir,
+                    &format!("Ownership split: {affected}"),
                 )?;
             }
 
@@ -246,8 +262,8 @@ pub mod supervisor {
             ))
         }
 
-        fn remove(&mut self, path: &Path) -> io::Result<String> {
-            let managed_dir = path.canonicalize()?;
+        fn remove(&mut self, path: &Path, discard_history: bool) -> io::Result<String> {
+            let managed_dir = self.resolve_managed_dir_for_remove(path)?;
             let Some(agent_index) = self
                 .agents
                 .iter()
@@ -258,39 +274,81 @@ pub mod supervisor {
                     "managed directory is not installed",
                 ));
             };
-            let Some(parent_agent_index) = self.parent_agent_index(&managed_dir) else {
+
+            if self.home.starts_with(&managed_dir) {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    "removing a managed directory requires an installed parent",
+                    "cannot remove a managed directory that contains the AFS supervisor home",
                 ));
-            };
+            }
 
+            match self.parent_agent_index(&managed_dir) {
+                Some(parent_agent_index) => self.remove_nested(
+                    agent_index,
+                    parent_agent_index,
+                    managed_dir,
+                    discard_history,
+                ),
+                None => self.remove_top_level(agent_index, managed_dir, discard_history),
+            }
+        }
+
+        fn remove_nested(
+            &mut self,
+            agent_index: usize,
+            parent_agent_index: usize,
+            managed_dir: PathBuf,
+            discard_history: bool,
+        ) -> io::Result<String> {
             let parent_managed_dir = self.agents[parent_agent_index].managed_dir.clone();
             let parent_agent_home = self.agents[parent_agent_index].agent_home.clone();
             self.agents[parent_agent_index].stop_monitor()?;
-            let remove_result: io::Result<(String, PathBuf)> = (|| {
-                let removed_agent = self.agents.remove(agent_index);
-                let removed_identity = removed_agent.identity.clone();
-                let removed_agent_home = removed_agent.agent_home.clone();
-                removed_agent.stop()?;
-                let archived_agent_home =
-                    archive_agent_home(&removed_agent_home, &parent_agent_home, &removed_identity)?;
+
+            let removed_agent = self.agents.remove(agent_index);
+            let removed_identity = removed_agent.identity.clone();
+            let removed_agent_home = removed_agent.agent_home.clone();
+
+            let outcome_result: io::Result<(PathBuf, RemoveOutcome)> = (|| {
+                stop_and_persist_registry(removed_agent, self)?;
+
+                let child_origin = relative_managed_path(&parent_managed_dir, &managed_dir)?;
+
+                if !removed_agent_home.exists() {
+                    record_ownership_event(
+                        &parent_managed_dir,
+                        &parent_agent_home,
+                        &format!("Ownership merge: {child_origin} (home missing)"),
+                    )?;
+                    return Ok((removed_agent_home.clone(), RemoveOutcome::Missing));
+                }
+
+                if discard_history {
+                    std::fs::remove_dir_all(&removed_agent_home)?;
+                    record_ownership_event(
+                        &parent_managed_dir,
+                        &parent_agent_home,
+                        &format!("Ownership merge: {child_origin} (history discarded)"),
+                    )?;
+                    return Ok((removed_agent_home.clone(), RemoveOutcome::Discarded));
+                }
+
+                let archived_agent_home = archive_agent_home(
+                    &removed_agent_home,
+                    &parent_agent_home.join(ARCHIVES_DIR),
+                    &archive_safe_name(removed_identity.trim()),
+                )?;
                 record_ownership_event(
                     &parent_managed_dir,
                     &parent_agent_home,
-                    "Ownership merge",
-                    &managed_dir,
+                    &format!("Ownership merge: {child_origin}"),
                 )?;
-                let child_origin = relative_managed_path(&parent_managed_dir, &managed_dir)?;
                 merge_archived_child_history(
                     &archived_agent_home,
                     &parent_managed_dir,
                     &parent_agent_home,
                     &child_origin,
                 )?;
-                self.write_registry()?;
-
-                Ok((removed_identity, archived_agent_home))
+                Ok((archived_agent_home, RemoveOutcome::Archived))
             })();
 
             let parent_restart_result = self
@@ -298,22 +356,81 @@ pub mod supervisor {
                 .iter_mut()
                 .find(|agent| agent.managed_dir == parent_managed_dir)
                 .map(RegisteredAgent::start_monitor)
-                .transpose()?;
-            if parent_restart_result.is_none() {
+                .transpose();
+
+            let (home_path, outcome) = outcome_result?;
+            if parent_restart_result?.is_none() {
                 return Err(io::Error::new(
                     io::ErrorKind::NotFound,
                     "parent managed directory is no longer registered",
                 ));
             }
 
-            let (removed_identity, archived_agent_home) = remove_result?;
-
-            Ok(format!(
-                "removed managed directory {}\nagent {}\narchived_agent_home {}\n",
-                managed_dir.display(),
-                removed_identity.trim(),
-                archived_agent_home.display()
+            Ok(format_remove_response(
+                &managed_dir,
+                &removed_identity,
+                &home_path,
+                outcome,
             ))
+        }
+
+        fn remove_top_level(
+            &mut self,
+            agent_index: usize,
+            managed_dir: PathBuf,
+            discard_history: bool,
+        ) -> io::Result<String> {
+            let removed_agent = self.agents.remove(agent_index);
+            let removed_identity = removed_agent.identity.clone();
+            let removed_agent_home = removed_agent.agent_home.clone();
+            stop_and_persist_registry(removed_agent, self)?;
+
+            let (home_path, outcome) = if !removed_agent_home.exists() {
+                (removed_agent_home, RemoveOutcome::Missing)
+            } else if discard_history {
+                std::fs::remove_dir_all(&removed_agent_home)?;
+                (removed_agent_home, RemoveOutcome::Discarded)
+            } else {
+                let last_component = managed_dir
+                    .file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "managed".to_string());
+                let archive_name =
+                    archive_safe_name(&format!("{last_component}-{}", removed_identity.trim()));
+                let archived_path = archive_agent_home(
+                    &removed_agent_home,
+                    &supervisor_archive_root(&self.home),
+                    &archive_name,
+                )?;
+                (archived_path, RemoveOutcome::Archived)
+            };
+
+            Ok(format_remove_response(
+                &managed_dir,
+                &removed_identity,
+                &home_path,
+                outcome,
+            ))
+        }
+
+        fn resolve_managed_dir_for_remove(&self, path: &Path) -> io::Result<PathBuf> {
+            let absolute = if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                std::env::current_dir()?.join(path)
+            };
+            match absolute.canonicalize() {
+                Ok(canonical) => Ok(canonical),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    if let (Some(parent), Some(leaf)) = (absolute.parent(), absolute.file_name())
+                        && let Ok(canonical_parent) = parent.canonicalize()
+                    {
+                        return Ok(canonical_parent.join(leaf));
+                    }
+                    Err(error)
+                }
+                Err(error) => Err(error),
+            }
         }
 
         fn agents(&mut self) -> io::Result<String> {
@@ -1632,8 +1749,7 @@ pub mod supervisor {
     fn record_ownership_event(
         managed_dir: &Path,
         agent_home: &Path,
-        summary_prefix: &str,
-        affected_dir: &Path,
+        summary: &str,
     ) -> io::Result<()> {
         let _guard = history_lock()
             .lock()
@@ -1642,8 +1758,6 @@ pub mod supervisor {
         let nested = nested_managed_relative_paths(managed_dir)?;
         git_stage_work_tree(&git_dir, managed_dir, &nested)?;
         let changed_files = git_staged_changes_vs_head(&git_dir)?;
-        let affected = relative_managed_path(managed_dir, affected_dir)?;
-        let summary = format!("{summary_prefix}: {affected}");
         let entry_id = history_entry_id();
         git_commit_index(
             &git_dir,
@@ -1651,7 +1765,7 @@ pub mod supervisor {
             &GitCommitRequest {
                 entry_id: &entry_id,
                 kind: "ownership",
-                summary: &summary,
+                summary,
                 files: &changed_files,
                 undoable: false,
                 undoes: None,
@@ -1778,19 +1892,48 @@ pub mod supervisor {
 
     fn archive_agent_home(
         removed_agent_home: &Path,
-        parent_agent_home: &Path,
-        identity: &str,
+        archive_root: &Path,
+        archive_name: &str,
     ) -> io::Result<PathBuf> {
-        let archive_root = parent_agent_home.join(ARCHIVES_DIR);
-        std::fs::create_dir_all(&archive_root)?;
-        let archive_name = format!(
-            "{}-{}",
-            archive_safe_name(identity.trim()),
-            unix_timestamp_nanos()
-        );
-        let archived_agent_home = archive_root.join(archive_name);
-        std::fs::rename(removed_agent_home, &archived_agent_home)?;
+        std::fs::create_dir_all(archive_root)?;
+        let full_name = format!("{archive_name}-{}", unix_timestamp_nanos());
+        let archived_agent_home = archive_root.join(full_name);
+        move_dir_across_filesystems(removed_agent_home, &archived_agent_home)?;
         Ok(archived_agent_home)
+    }
+
+    fn move_dir_across_filesystems(src: &Path, dst: &Path) -> io::Result<()> {
+        match std::fs::rename(src, dst) {
+            Ok(()) => Ok(()),
+            Err(error) if is_cross_device_error(&error) => {
+                copy_dir_recursively(src, dst)?;
+                std::fs::remove_dir_all(src)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn is_cross_device_error(error: &io::Error) -> bool {
+        error.raw_os_error() == Some(libc::EXDEV)
+    }
+
+    fn copy_dir_recursively(src: &Path, dst: &Path) -> io::Result<()> {
+        std::fs::create_dir_all(dst)?;
+        for entry in std::fs::read_dir(src)? {
+            let entry = entry?;
+            let file_type = entry.file_type()?;
+            let src_path = entry.path();
+            let dst_path = dst.join(entry.file_name());
+            if file_type.is_dir() {
+                copy_dir_recursively(&src_path, &dst_path)?;
+            } else if file_type.is_symlink() {
+                let target = std::fs::read_link(&src_path)?;
+                std::os::unix::fs::symlink(target, &dst_path)?;
+            } else {
+                std::fs::copy(&src_path, &dst_path)?;
+            }
+        }
+        Ok(())
     }
 
     fn archive_safe_name(value: &str) -> String {
@@ -2145,6 +2288,47 @@ pub mod supervisor {
         agent_home.join(HISTORY_DIR).join(HISTORY_REPO_DIR)
     }
 
+    fn supervisor_archive_root(supervisor_home: &Path) -> PathBuf {
+        supervisor_home.join(ARCHIVES_DIR)
+    }
+
+    enum RemoveOutcome {
+        Archived,
+        Discarded,
+        Missing,
+    }
+
+    fn stop_and_persist_registry(
+        agent: RegisteredAgent,
+        state: &SupervisorState,
+    ) -> io::Result<()> {
+        let stop_err = agent.stop().err();
+        let registry_err = state.write_registry().err();
+        if let Some(err) = registry_err.or(stop_err) {
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    fn format_remove_response(
+        managed_dir: &Path,
+        identity: &str,
+        home_path: &Path,
+        outcome: RemoveOutcome,
+    ) -> String {
+        let home_label = match outcome {
+            RemoveOutcome::Archived => "archived_agent_home",
+            RemoveOutcome::Discarded => "discarded_agent_home",
+            RemoveOutcome::Missing => "missing_agent_home",
+        };
+        format!(
+            "removed managed directory {}\nagent {}\n{home_label} {}\n",
+            managed_dir.display(),
+            identity.trim(),
+            home_path.display()
+        )
+    }
+
     fn git_base_command(git_dir: &Path, work_tree: Option<&Path>) -> Command {
         let mut cmd = Command::new("git");
         cmd.arg("-c")
@@ -2474,13 +2658,14 @@ pub mod client {
         send_request(&format!("INSTALL {}", path.display()))
     }
 
-    pub fn remove(path: &Path) -> Result<String, Error> {
+    pub fn remove(path: &Path, discard_history: bool) -> Result<String, Error> {
         let path = if path.is_absolute() {
             path.to_path_buf()
         } else {
             std::env::current_dir().map_err(Error::Io)?.join(path)
         };
-        send_request(&format!("REMOVE {}", path.display()))
+        let flag = if discard_history { "discard" } else { "keep" };
+        send_request(&format!("REMOVE\t{}\t{flag}", path.display()))
     }
 
     pub fn agents() -> Result<String, Error> {
