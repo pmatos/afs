@@ -4182,3 +4182,78 @@ fn supervisor_rediscovers_moved_managed_directory_after_restart() {
 
     stop_daemon(&mut restarted_daemon);
 }
+
+#[test]
+fn rediscovery_skips_candidate_with_unreadable_identity_file() {
+    let afs_home = unique_afs_home("move-rediscover-bad-identity");
+    let workspace = unique_afs_home("move-rediscover-bad-identity-workspace");
+    let original_dir = workspace.join("project");
+    let pi_runtime = fake_pi_runtime("move-rediscover-bad-identity-runtime");
+    let socket_path = supervisor_socket(&afs_home);
+    std::fs::create_dir_all(&original_dir).expect("test should create managed directory");
+    std::fs::write(original_dir.join("notes.txt"), "before move\n")
+        .expect("test should create managed file");
+    let original_dir = original_dir
+        .canonicalize()
+        .expect("original directory should canonicalize");
+
+    let mut daemon = start_daemon_with_pi_runtime(&afs_home, &pi_runtime);
+    assert!(
+        wait_until(Duration::from_secs(2), || socket_path
+            .metadata()
+            .map(|metadata| metadata.file_type().is_socket())
+            .unwrap_or(false)),
+        "daemon should create the Supervisor Socket before install connects"
+    );
+    let install = install_managed_dir(&afs_home, &original_dir);
+    assert!(install.status.success(), "afs install should succeed");
+    let identity = std::fs::read_to_string(original_dir.join(".afs/identity"))
+        .expect("identity should be readable")
+        .trim()
+        .to_string();
+    stop_daemon(&mut daemon);
+
+    let workspace = workspace
+        .canonicalize()
+        .expect("workspace should canonicalize");
+    let moved_dir = workspace.join("project-renamed");
+    std::fs::rename(&original_dir, &moved_dir).expect("test should move managed directory");
+    let moved_dir = moved_dir
+        .canonicalize()
+        .expect("moved directory should canonicalize");
+
+    // Place an unrelated `.afs/identity` at the search root with invalid UTF-8
+    // so reading it would fail. The supervisor should treat this candidate as a
+    // non-match and continue scanning rather than abort startup.
+    let unrelated_agent_home = workspace.join(".afs");
+    std::fs::create_dir_all(&unrelated_agent_home)
+        .expect("test should create unrelated agent home");
+    std::fs::write(unrelated_agent_home.join("identity"), b"\xff\xfe\xfd")
+        .expect("test should write invalid-utf8 identity bytes");
+
+    let mut restarted_daemon = start_daemon_with_pi_runtime(&afs_home, &pi_runtime);
+    assert!(
+        wait_until(Duration::from_secs(2), || socket_path
+            .metadata()
+            .map(|metadata| metadata.file_type().is_socket())
+            .unwrap_or(false)),
+        "restarted daemon should re-create the Supervisor Socket"
+    );
+
+    assert!(
+        wait_until(Duration::from_secs(3), || {
+            let agents = Command::new(env!("CARGO_BIN_EXE_afs"))
+                .env("AFS_HOME", &afs_home)
+                .arg("agents")
+                .output()
+                .expect("afs agents should run");
+            let stdout = String::from_utf8_lossy(&agents.stdout);
+            agents.status.success()
+                && stdout.contains(&moved_dir.display().to_string())
+                && stdout.contains(&identity)
+        }),
+        "afs agents should report the moved managed directory even when an unrelated identity file in the scan tree is unreadable"
+    );
+
+    stop_daemon(&mut restarted_daemon);
+}

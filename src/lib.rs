@@ -2330,7 +2330,10 @@ pub mod supervisor {
         if !identity_path.is_file() {
             return Ok(false);
         }
-        Ok(std::fs::read_to_string(identity_path)?.trim() == identity)
+        match std::fs::read_to_string(identity_path) {
+            Ok(content) => Ok(content.trim() == identity),
+            Err(_) => Ok(false),
+        }
     }
 
     fn is_nested_managed_path(managed_dir: &Path, path: &Path) -> bool {
