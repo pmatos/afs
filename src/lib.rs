@@ -2291,11 +2291,21 @@ pub mod supervisor {
     fn rediscover_managed_dir(original: &Path, identity: &str) -> io::Result<Option<PathBuf>> {
         const MAX_NODES: usize = 4096;
         const MAX_DEPTH: usize = 8;
+        const MAX_ANCESTOR_LEVELS: usize = 5;
 
         let mut search_root = original.parent();
+        let mut scanned_levels = 0usize;
         while let Some(candidate_root) = search_root {
             if candidate_root.is_dir() {
-                return scan_for_agent_identity(candidate_root, identity, MAX_DEPTH, MAX_NODES);
+                if let Some(found) =
+                    scan_for_agent_identity(candidate_root, identity, MAX_DEPTH, MAX_NODES)?
+                {
+                    return Ok(Some(found));
+                }
+                scanned_levels += 1;
+                if scanned_levels >= MAX_ANCESTOR_LEVELS {
+                    return Ok(None);
+                }
             }
             search_root = candidate_root.parent();
         }
