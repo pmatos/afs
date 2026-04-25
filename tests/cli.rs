@@ -3436,3 +3436,229 @@ fn broadcast_reply_filters_out_reference_symlink_escaping_managed_dir() {
 
     stop_daemon(&mut daemon);
 }
+
+#[test]
+fn install_creates_afs_ignore_file_in_agent_home() {
+    let afs_home = unique_afs_home("ignore-file-created");
+    let managed_dir = unique_afs_home("managed-ignore-file-created");
+    let pi_runtime = fake_pi_runtime("ignore-file-created-runtime");
+    let socket_path = supervisor_socket(&afs_home);
+    std::fs::create_dir_all(&managed_dir).expect("test should create managed directory");
+    let managed_dir = managed_dir
+        .canonicalize()
+        .expect("managed directory should canonicalize");
+    let mut daemon = start_daemon_with_pi_runtime(&afs_home, &pi_runtime);
+
+    assert!(
+        wait_until(Duration::from_secs(2), || socket_path
+            .metadata()
+            .map(|metadata| metadata.file_type().is_socket())
+            .unwrap_or(false)),
+        "daemon should create the Supervisor Socket before install connects"
+    );
+
+    let install = install_managed_dir(&afs_home, &managed_dir);
+    assert!(install.status.success(), "afs install should succeed");
+
+    let ignore_path = managed_dir.join(".afs/ignore");
+    assert!(
+        ignore_path.is_file(),
+        "afs install should create an ignore policy file inside the Agent Home"
+    );
+
+    stop_daemon(&mut daemon);
+}
+
+#[test]
+fn install_seeds_afs_ignore_from_gitignore_when_present() {
+    let afs_home = unique_afs_home("ignore-seed-from-gitignore");
+    let managed_dir = unique_afs_home("managed-ignore-seed-from-gitignore");
+    let pi_runtime = fake_pi_runtime("ignore-seed-from-gitignore-runtime");
+    let socket_path = supervisor_socket(&afs_home);
+    std::fs::create_dir_all(&managed_dir).expect("test should create managed directory");
+    std::fs::write(managed_dir.join(".gitignore"), "build/\n*.log\n")
+        .expect("test should create .gitignore");
+    let managed_dir = managed_dir
+        .canonicalize()
+        .expect("managed directory should canonicalize");
+    let mut daemon = start_daemon_with_pi_runtime(&afs_home, &pi_runtime);
+
+    assert!(
+        wait_until(Duration::from_secs(2), || socket_path
+            .metadata()
+            .map(|metadata| metadata.file_type().is_socket())
+            .unwrap_or(false)),
+        "daemon should create the Supervisor Socket before install connects"
+    );
+
+    let install = install_managed_dir(&afs_home, &managed_dir);
+    assert!(install.status.success(), "afs install should succeed");
+
+    let seeded = std::fs::read_to_string(managed_dir.join(".afs/ignore"))
+        .expect("afs install should seed an ignore policy file");
+    assert!(
+        seeded.contains("build/"),
+        "seeded ignore policy should include the .gitignore directory pattern, got:\n{seeded}"
+    );
+    assert!(
+        seeded.contains("*.log"),
+        "seeded ignore policy should include the .gitignore glob pattern, got:\n{seeded}"
+    );
+
+    stop_daemon(&mut daemon);
+}
+
+#[test]
+fn explicit_ask_on_ignored_path_routes_to_owner_without_falling_through_to_broadcast() {
+    let afs_home = unique_afs_home("ignore-explicit-ask");
+    let managed_dir = unique_afs_home("managed-ignore-explicit-ask");
+    let pi_runtime = fake_pi_runtime("ignore-explicit-ask-runtime");
+    let socket_path = supervisor_socket(&afs_home);
+    std::fs::create_dir_all(&managed_dir).expect("test should create managed directory");
+    std::fs::write(managed_dir.join(".gitignore"), "ignored.log\n")
+        .expect("test should create .gitignore");
+    let ignored_path = managed_dir.join("ignored.log");
+    std::fs::write(&ignored_path, "before\n").expect("test should create ignored file");
+    let managed_dir = managed_dir
+        .canonicalize()
+        .expect("managed directory should canonicalize");
+    let ignored_path = ignored_path
+        .canonicalize()
+        .expect("ignored file should canonicalize");
+    let mut daemon = start_daemon_with_pi_runtime(&afs_home, &pi_runtime);
+
+    assert!(
+        wait_until(Duration::from_secs(2), || socket_path
+            .metadata()
+            .map(|metadata| metadata.file_type().is_socket())
+            .unwrap_or(false)),
+        "daemon should create the Supervisor Socket before install connects"
+    );
+
+    let install = install_managed_dir(&afs_home, &managed_dir);
+    assert!(install.status.success(), "afs install should succeed");
+
+    let ask = afs_ask(&afs_home, &ignored_path.display().to_string());
+    assert!(
+        ask.status.success(),
+        "afs ask on an ignored path should still succeed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&ask.stdout),
+        String::from_utf8_lossy(&ask.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&ask.stdout);
+    assert!(
+        stdout.contains("answered about "),
+        "afs ask on an ignored path should route to the owning agent, got:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("no relevant agents replied"),
+        "afs ask on an ignored path must not fall through to broadcast, got:\n{stdout}"
+    );
+
+    stop_daemon(&mut daemon);
+}
+
+#[test]
+fn broadcast_discovery_filters_file_references_matching_ignore_policy() {
+    let afs_home = unique_afs_home("ignore-broadcast-filter");
+    let managed_dir = unique_afs_home("managed-ignore-broadcast-filter");
+    let pi_runtime = fake_pi_runtime("ignore-broadcast-filter-runtime");
+    let socket_path = supervisor_socket(&afs_home);
+    std::fs::create_dir_all(managed_dir.join("secrets"))
+        .expect("test should create secrets subdirectory");
+    std::fs::write(managed_dir.join(".gitignore"), "secrets/\n")
+        .expect("test should create .gitignore");
+    let readme_path = managed_dir.join("README.md");
+    let vault_path = managed_dir.join("secrets/vault.txt");
+    std::fs::write(&readme_path, "project readme\n").expect("test should create README");
+    std::fs::write(&vault_path, "sensitive\n").expect("test should create secrets file");
+    let managed_dir = managed_dir
+        .canonicalize()
+        .expect("managed directory should canonicalize");
+    let readme_path = readme_path
+        .canonicalize()
+        .expect("readme should canonicalize");
+    let vault_path = vault_path
+        .canonicalize()
+        .expect("vault should canonicalize");
+    let mut daemon = start_daemon_with_pi_runtime(&afs_home, &pi_runtime);
+
+    assert!(
+        wait_until(Duration::from_secs(2), || socket_path
+            .metadata()
+            .map(|metadata| metadata.file_type().is_socket())
+            .unwrap_or(false)),
+        "daemon should create the Supervisor Socket before install connects"
+    );
+
+    let install = install_managed_dir(&afs_home, &managed_dir);
+    assert!(install.status.success(), "afs install should succeed");
+
+    std::fs::write(
+        managed_dir.join(".afs/broadcast-response"),
+        format!(
+            "possible\tcontains useful references\tHere are the project files\t{};{}\n",
+            readme_path.display(),
+            vault_path.display()
+        ),
+    )
+    .expect("test should configure broadcast response");
+
+    let ask = afs_ask(&afs_home, "what does the project contain");
+    assert!(
+        ask.status.success(),
+        "afs ask should succeed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&ask.stdout),
+        String::from_utf8_lossy(&ask.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&ask.stdout);
+    assert!(
+        stdout.contains(&format!("- {}", readme_path.display())),
+        "broadcast references should include non-ignored files, got:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains(&vault_path.display().to_string()),
+        "broadcast references should filter out files matched by the ignore policy, got:\n{stdout}"
+    );
+
+    stop_daemon(&mut daemon);
+}
+
+#[test]
+fn install_preserves_existing_afs_ignore_file() {
+    let afs_home = unique_afs_home("ignore-idempotent");
+    let managed_dir = unique_afs_home("managed-ignore-idempotent");
+    let pi_runtime = fake_pi_runtime("ignore-idempotent-runtime");
+    let socket_path = supervisor_socket(&afs_home);
+    std::fs::create_dir_all(managed_dir.join(".afs"))
+        .expect("test should create Agent Home directory");
+    std::fs::write(managed_dir.join(".gitignore"), "seeded.log\n")
+        .expect("test should create .gitignore");
+    let preserved = "# custom AFS ignore policy\ncustom-pattern\n";
+    std::fs::write(managed_dir.join(".afs/ignore"), preserved)
+        .expect("test should create a custom ignore policy");
+    let managed_dir = managed_dir
+        .canonicalize()
+        .expect("managed directory should canonicalize");
+    let mut daemon = start_daemon_with_pi_runtime(&afs_home, &pi_runtime);
+
+    assert!(
+        wait_until(Duration::from_secs(2), || socket_path
+            .metadata()
+            .map(|metadata| metadata.file_type().is_socket())
+            .unwrap_or(false)),
+        "daemon should create the Supervisor Socket before install connects"
+    );
+
+    let install = install_managed_dir(&afs_home, &managed_dir);
+    assert!(install.status.success(), "afs install should succeed");
+
+    let after = std::fs::read_to_string(managed_dir.join(".afs/ignore"))
+        .expect("afs install should leave the existing ignore policy in place");
+    assert_eq!(
+        after, preserved,
+        "afs install must not overwrite a pre-existing ignore policy"
+    );
+
+    stop_daemon(&mut daemon);
+}

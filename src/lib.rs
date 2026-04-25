@@ -18,6 +18,7 @@ pub mod supervisor {
     const HISTORY_REPO_DIR: &str = "repo";
     const REGISTRY_FILE: &str = "registry.tsv";
     const ARCHIVES_DIR: &str = "archives";
+    const IGNORE_FILE: &str = "ignore";
     const PI_RUNTIME_ENV: &str = "AFS_PI_RUNTIME";
     const BROADCAST_REPLY_TIMEOUT_ENV: &str = "AFS_BROADCAST_REPLY_TIMEOUT_MS";
     const DEFAULT_BROADCAST_REPLY_TIMEOUT: Duration = Duration::from_secs(2);
@@ -208,6 +209,8 @@ pub mod supervisor {
                     "# Agent Instructions\n\nManage this directory through AFS.\n",
                 )?;
             }
+
+            ensure_ignore_file_seeded(&managed_dir, &agent_home)?;
 
             ensure_history_baseline_commit(&managed_dir, &agent_home)?;
 
@@ -1021,11 +1024,13 @@ pub mod supervisor {
 
         let reason = fields.next()?.to_string();
         let answer = fields.next()?.to_string();
+        let matcher = load_ignore_matcher(&agent.agent_home, &agent.managed_dir);
         let file_references = fields
             .next()
             .unwrap_or_default()
             .split(';')
             .filter_map(|reference| normalize_broadcast_reference(reference, &agent.managed_dir))
+            .filter(|reference| !ignore_matches(&matcher, &agent.managed_dir, reference))
             .collect::<Vec<_>>();
 
         Some(BroadcastReply {
@@ -1121,6 +1126,38 @@ pub mod supervisor {
         } else {
             values.join(", ")
         }
+    }
+
+    fn load_ignore_matcher(
+        agent_home: &Path,
+        managed_dir: &Path,
+    ) -> Option<ignore::gitignore::Gitignore> {
+        let ignore_path = agent_home.join(IGNORE_FILE);
+        if !ignore_path.is_file() {
+            return None;
+        }
+        let mut builder = ignore::gitignore::GitignoreBuilder::new(managed_dir);
+        if builder.add(&ignore_path).is_some() {
+            return None;
+        }
+        builder.build().ok()
+    }
+
+    fn ignore_matches(
+        matcher: &Option<ignore::gitignore::Gitignore>,
+        managed_dir: &Path,
+        normalized_reference: &str,
+    ) -> bool {
+        let Some(matcher) = matcher else {
+            return false;
+        };
+        let reference_path = Path::new(normalized_reference);
+        let Ok(relative) = reference_path.strip_prefix(managed_dir) else {
+            return false;
+        };
+        matcher
+            .matched_path_or_any_parents(relative, false)
+            .is_ignore()
     }
 
     fn normalize_broadcast_reference(reference: &str, managed_dir: &Path) -> Option<String> {
@@ -1357,6 +1394,21 @@ pub mod supervisor {
     fn history_lock() -> &'static Mutex<()> {
         static HISTORY_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
         HISTORY_LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn ensure_ignore_file_seeded(managed_dir: &Path, agent_home: &Path) -> io::Result<()> {
+        let ignore_path = agent_home.join(IGNORE_FILE);
+        if ignore_path.exists() {
+            return Ok(());
+        }
+        let mut contents =
+            String::from("# AFS ignore policy - seeded from .gitignore at install.\n");
+        match std::fs::read_to_string(managed_dir.join(".gitignore")) {
+            Ok(gitignore) => contents.push_str(&gitignore),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        std::fs::write(ignore_path, contents)
     }
 
     fn ensure_history_baseline_commit(managed_dir: &Path, agent_home: &Path) -> io::Result<()> {
