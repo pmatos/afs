@@ -293,44 +293,51 @@ pub mod supervisor {
             let parent_agent_home = self.agents[parent_agent_index].agent_home.clone();
             self.agents[parent_agent_index].stop_monitor()?;
 
-            let remove_result: io::Result<(String, PathBuf, bool)> = (|| {
-                let removed_agent = self.agents.remove(agent_index);
-                let removed_identity = removed_agent.identity.clone();
-                let removed_agent_home = removed_agent.agent_home.clone();
+            let removed_agent = self.agents.remove(agent_index);
+            let removed_identity = removed_agent.identity.clone();
+            let removed_agent_home = removed_agent.agent_home.clone();
+            self.write_registry()?;
+
+            let outcome_result: io::Result<(PathBuf, RemoveOutcome)> = (|| {
                 removed_agent.stop()?;
                 let child_origin = relative_managed_path(&parent_managed_dir, &managed_dir)?;
 
+                if !removed_agent_home.exists() {
+                    record_ownership_event(
+                        &parent_managed_dir,
+                        &parent_agent_home,
+                        &format!("Ownership merge: {child_origin} (home missing)"),
+                    )?;
+                    return Ok((removed_agent_home.clone(), RemoveOutcome::Missing));
+                }
+
                 if discard_history {
-                    if removed_agent_home.exists() {
-                        std::fs::remove_dir_all(&removed_agent_home)?;
-                    }
+                    std::fs::remove_dir_all(&removed_agent_home)?;
                     record_ownership_event(
                         &parent_managed_dir,
                         &parent_agent_home,
                         &format!("Ownership merge: {child_origin} (history discarded)"),
                     )?;
-                    self.write_registry()?;
-                    Ok((removed_identity, removed_agent_home, false))
-                } else {
-                    let archived_agent_home = archive_agent_home(
-                        &removed_agent_home,
-                        &parent_agent_home.join(ARCHIVES_DIR),
-                        &archive_safe_name(removed_identity.trim()),
-                    )?;
-                    record_ownership_event(
-                        &parent_managed_dir,
-                        &parent_agent_home,
-                        &format!("Ownership merge: {child_origin}"),
-                    )?;
-                    merge_archived_child_history(
-                        &archived_agent_home,
-                        &parent_managed_dir,
-                        &parent_agent_home,
-                        &child_origin,
-                    )?;
-                    self.write_registry()?;
-                    Ok((removed_identity, archived_agent_home, true))
+                    return Ok((removed_agent_home.clone(), RemoveOutcome::Discarded));
                 }
+
+                let archived_agent_home = archive_agent_home(
+                    &removed_agent_home,
+                    &parent_agent_home.join(ARCHIVES_DIR),
+                    &archive_safe_name(removed_identity.trim()),
+                )?;
+                record_ownership_event(
+                    &parent_managed_dir,
+                    &parent_agent_home,
+                    &format!("Ownership merge: {child_origin}"),
+                )?;
+                merge_archived_child_history(
+                    &archived_agent_home,
+                    &parent_managed_dir,
+                    &parent_agent_home,
+                    &child_origin,
+                )?;
+                Ok((archived_agent_home, RemoveOutcome::Archived))
             })();
 
             let parent_restart_result = self
@@ -346,12 +353,12 @@ pub mod supervisor {
                 ));
             }
 
-            let (removed_identity, home_path, archived) = remove_result?;
+            let (home_path, outcome) = outcome_result?;
             Ok(format_remove_response(
                 &managed_dir,
                 &removed_identity,
                 &home_path,
-                archived,
+                outcome,
             ))
         }
 
@@ -367,11 +374,11 @@ pub mod supervisor {
             self.write_registry()?;
             removed_agent.stop()?;
 
-            let (home_path, archived) = if discard_history {
-                if removed_agent_home.exists() {
-                    std::fs::remove_dir_all(&removed_agent_home)?;
-                }
-                (removed_agent_home, false)
+            let (home_path, outcome) = if !removed_agent_home.exists() {
+                (removed_agent_home, RemoveOutcome::Missing)
+            } else if discard_history {
+                std::fs::remove_dir_all(&removed_agent_home)?;
+                (removed_agent_home, RemoveOutcome::Discarded)
             } else {
                 let last_component = managed_dir
                     .file_name()
@@ -384,14 +391,14 @@ pub mod supervisor {
                     &supervisor_archive_root(&self.home),
                     &archive_name,
                 )?;
-                (archived_path, true)
+                (archived_path, RemoveOutcome::Archived)
             };
 
             Ok(format_remove_response(
                 &managed_dir,
                 &removed_identity,
                 &home_path,
-                archived,
+                outcome,
             ))
         }
 
@@ -2213,16 +2220,22 @@ pub mod supervisor {
         supervisor_home.join(ARCHIVES_DIR)
     }
 
+    enum RemoveOutcome {
+        Archived,
+        Discarded,
+        Missing,
+    }
+
     fn format_remove_response(
         managed_dir: &Path,
         identity: &str,
         home_path: &Path,
-        archived: bool,
+        outcome: RemoveOutcome,
     ) -> String {
-        let home_label = if archived {
-            "archived_agent_home"
-        } else {
-            "discarded_agent_home"
+        let home_label = match outcome {
+            RemoveOutcome::Archived => "archived_agent_home",
+            RemoveOutcome::Discarded => "discarded_agent_home",
+            RemoveOutcome::Missing => "missing_agent_home",
         };
         format!(
             "removed managed directory {}\nagent {}\n{home_label} {}\n",

@@ -2105,12 +2105,21 @@ fn removing_top_level_managed_directory_that_no_longer_exists_unregisters_cleanl
 
     std::fs::remove_dir_all(&managed_dir).expect("test should wipe the managed directory off disk");
 
-    let remove = remove_managed_dir_with_flags(&afs_home, &managed_dir, &["--discard-history"]);
+    let remove = remove_managed_dir(&afs_home, &managed_dir);
     assert!(
         remove.status.success(),
-        "afs remove on a missing directory should succeed\nstdout:\n{}\nstderr:\n{}",
+        "afs remove on a missing directory should succeed without --discard-history\nstdout:\n{}\nstderr:\n{}",
         String::from_utf8_lossy(&remove.stdout),
         String::from_utf8_lossy(&remove.stderr)
+    );
+    let remove_stdout = String::from_utf8_lossy(&remove.stdout);
+    assert!(
+        remove_stdout.contains("missing_agent_home "),
+        "afs remove on a missing directory should report missing_agent_home; got:\n{remove_stdout}"
+    );
+    assert!(
+        !remove_stdout.contains("archived_agent_home "),
+        "afs remove on a missing directory should not claim to have archived; got:\n{remove_stdout}"
     );
 
     let agents = Command::new(env!("CARGO_BIN_EXE_afs"))
@@ -2131,6 +2140,17 @@ fn removing_top_level_managed_directory_that_no_longer_exists_unregisters_cleanl
     assert!(
         !registry_has_live_entry,
         "registry should not keep a stale entry for the removed directory"
+    );
+
+    let archive_root = afs_home.join("archives");
+    let archive_is_empty = !archive_root.exists()
+        || std::fs::read_dir(&archive_root)
+            .expect("archive root readable")
+            .next()
+            .is_none();
+    assert!(
+        archive_is_empty,
+        "supervisor archive root should remain empty when the Agent Home was already missing"
     );
 
     stop_daemon(&mut daemon);
