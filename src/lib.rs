@@ -296,10 +296,10 @@ pub mod supervisor {
             let removed_agent = self.agents.remove(agent_index);
             let removed_identity = removed_agent.identity.clone();
             let removed_agent_home = removed_agent.agent_home.clone();
-            self.write_registry()?;
 
             let outcome_result: io::Result<(PathBuf, RemoveOutcome)> = (|| {
-                removed_agent.stop()?;
+                stop_and_persist_registry(removed_agent, self)?;
+
                 let child_origin = relative_managed_path(&parent_managed_dir, &managed_dir)?;
 
                 if !removed_agent_home.exists() {
@@ -345,15 +345,16 @@ pub mod supervisor {
                 .iter_mut()
                 .find(|agent| agent.managed_dir == parent_managed_dir)
                 .map(RegisteredAgent::start_monitor)
-                .transpose()?;
-            if parent_restart_result.is_none() {
+                .transpose();
+
+            let (home_path, outcome) = outcome_result?;
+            if parent_restart_result?.is_none() {
                 return Err(io::Error::new(
                     io::ErrorKind::NotFound,
                     "parent managed directory is no longer registered",
                 ));
             }
 
-            let (home_path, outcome) = outcome_result?;
             Ok(format_remove_response(
                 &managed_dir,
                 &removed_identity,
@@ -371,8 +372,7 @@ pub mod supervisor {
             let removed_agent = self.agents.remove(agent_index);
             let removed_identity = removed_agent.identity.clone();
             let removed_agent_home = removed_agent.agent_home.clone();
-            self.write_registry()?;
-            removed_agent.stop()?;
+            stop_and_persist_registry(removed_agent, self)?;
 
             let (home_path, outcome) = if !removed_agent_home.exists() {
                 (removed_agent_home, RemoveOutcome::Missing)
@@ -2224,6 +2224,18 @@ pub mod supervisor {
         Archived,
         Discarded,
         Missing,
+    }
+
+    fn stop_and_persist_registry(
+        agent: RegisteredAgent,
+        state: &SupervisorState,
+    ) -> io::Result<()> {
+        let stop_err = agent.stop().err();
+        let registry_err = state.write_registry().err();
+        if let Some(err) = registry_err.or(stop_err) {
+            return Err(err);
+        }
+        Ok(())
     }
 
     fn format_remove_response(
