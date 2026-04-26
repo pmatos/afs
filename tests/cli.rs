@@ -155,6 +155,23 @@ fn start_daemon_with_pi_runtime_and_broadcast_timeout(
         .expect("afs daemon should start")
 }
 
+fn start_daemon_with_index_warm_delay(
+    afs_home: &std::path::Path,
+    pi_runtime: &std::path::Path,
+    delay_ms: u64,
+) -> Child {
+    write_default_config(afs_home);
+    Command::new(env!("CARGO_BIN_EXE_afs"))
+        .env("AFS_HOME", afs_home)
+        .env("AFS_PI_RUNTIME", pi_runtime)
+        .env("AFS_INDEX_WARM_DELAY_MS", delay_ms.to_string())
+        .arg("daemon")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("afs daemon should start")
+}
+
 fn fake_pi_runtime(test_name: &str) -> std::path::PathBuf {
     let runtime_dir = unique_afs_home(test_name);
     std::fs::create_dir_all(&runtime_dir).expect("test should create fake runtime directory");
@@ -2308,10 +2325,10 @@ fn removing_top_level_managed_directory_that_contains_supervisor_home_is_rejecte
 }
 
 #[test]
-fn ask_answer_for_managed_path_includes_file_reference_and_index_caveat() {
-    let afs_home = unique_afs_home("ask-reference-caveat");
-    let managed_dir = unique_afs_home("ask-reference-caveat-managed");
-    let pi_runtime = fake_pi_runtime("ask-reference-caveat-runtime");
+fn ask_answer_for_managed_path_includes_file_reference() {
+    let afs_home = unique_afs_home("ask-reference");
+    let managed_dir = unique_afs_home("ask-reference-managed");
+    let pi_runtime = fake_pi_runtime("ask-reference-runtime");
     let socket_path = supervisor_socket(&afs_home);
     std::fs::create_dir_all(&managed_dir).expect("test should create managed directory");
     let target_file = managed_dir.join("notes.txt");
@@ -2352,10 +2369,6 @@ fn ask_answer_for_managed_path_includes_file_reference_and_index_caveat() {
     assert!(
         stdout.contains(&format!("- {}", target_file.display())),
         "afs ask should reference the explicit managed path"
-    );
-    assert!(
-        stdout.contains("caveat: local index is warming; answer may be incomplete"),
-        "afs ask should disclose incomplete local index coverage"
     );
 
     stop_daemon(&mut daemon);
@@ -2571,6 +2584,19 @@ fn agents_lists_installed_directory_with_live_runtime_status() {
         .expect("afs install should run");
     assert!(install.status.success(), "afs install should succeed");
 
+    assert!(
+        wait_until(Duration::from_secs(3), || {
+            let agents = Command::new(env!("CARGO_BIN_EXE_afs"))
+                .env("AFS_HOME", &afs_home)
+                .arg("agents")
+                .output()
+                .expect("afs agents should run");
+            agents.status.success()
+                && String::from_utf8_lossy(&agents.stdout).contains("index=ready(files=0)")
+        }),
+        "afs agents should report index=ready(files=0) for an empty managed directory"
+    );
+
     let agents = Command::new(env!("CARGO_BIN_EXE_afs"))
         .env("AFS_HOME", &afs_home)
         .arg("agents")
@@ -2587,10 +2613,6 @@ fn agents_lists_installed_directory_with_live_runtime_status() {
     assert!(
         stdout.contains("health=running"),
         "afs agents should show basic live health"
-    );
-    assert!(
-        stdout.contains("index=warming"),
-        "afs agents should show Index Status"
     );
     assert!(
         stdout.contains("reconciliation=idle"),
@@ -4427,4 +4449,254 @@ fn rediscovery_finds_move_to_sibling_ancestor_directory() {
     );
 
     stop_daemon(&mut restarted_daemon);
+}
+
+fn await_socket(socket_path: &std::path::Path) {
+    assert!(
+        wait_until(Duration::from_secs(2), || socket_path
+            .metadata()
+            .map(|metadata| metadata.file_type().is_socket())
+            .unwrap_or(false)),
+        "daemon should create the Supervisor Socket before clients connect"
+    );
+}
+
+fn await_index_token(afs_home: &std::path::Path, expected: &str, timeout: Duration) -> String {
+    let mut last_stdout = String::new();
+    let satisfied = wait_until(timeout, || {
+        let agents = Command::new(env!("CARGO_BIN_EXE_afs"))
+            .env("AFS_HOME", afs_home)
+            .arg("agents")
+            .output()
+            .expect("afs agents should run");
+        if !agents.status.success() {
+            return false;
+        }
+        last_stdout = String::from_utf8_lossy(&agents.stdout).to_string();
+        last_stdout.contains(expected)
+    });
+    assert!(
+        satisfied,
+        "afs agents should report {expected}; last output:\n{last_stdout}"
+    );
+    last_stdout
+}
+
+#[test]
+fn agents_reports_ready_index_for_text_files() {
+    let afs_home = unique_afs_home("index-ready-text");
+    let managed_dir = unique_afs_home("index-ready-text-managed");
+    let pi_runtime = fake_pi_runtime("index-ready-text-runtime");
+    let socket_path = supervisor_socket(&afs_home);
+    std::fs::create_dir_all(&managed_dir).expect("test should create managed directory");
+    std::fs::write(managed_dir.join("a.txt"), "hello a\n")
+        .expect("test should create first text file");
+    std::fs::write(managed_dir.join("b.txt"), "hello b\n")
+        .expect("test should create second text file");
+    let managed_dir = managed_dir
+        .canonicalize()
+        .expect("managed directory should canonicalize");
+    let mut daemon = start_daemon_with_pi_runtime(&afs_home, &pi_runtime);
+    await_socket(&socket_path);
+
+    let install = install_managed_dir(&afs_home, &managed_dir);
+    assert!(install.status.success(), "afs install should succeed");
+
+    await_index_token(&afs_home, "index=ready(files=2)", Duration::from_secs(3));
+
+    stop_daemon(&mut daemon);
+}
+
+#[test]
+fn agents_reports_warming_index_during_initial_scan() {
+    let afs_home = unique_afs_home("index-warming");
+    let managed_dir = unique_afs_home("index-warming-managed");
+    let pi_runtime = fake_pi_runtime("index-warming-runtime");
+    let socket_path = supervisor_socket(&afs_home);
+    std::fs::create_dir_all(&managed_dir).expect("test should create managed directory");
+    for n in 0..5 {
+        std::fs::write(
+            managed_dir.join(format!("file-{n}.txt")),
+            format!("text-{n}\n"),
+        )
+        .expect("test should create warming fixture file");
+    }
+    let managed_dir = managed_dir
+        .canonicalize()
+        .expect("managed directory should canonicalize");
+    let mut daemon = start_daemon_with_index_warm_delay(&afs_home, &pi_runtime, 100);
+    await_socket(&socket_path);
+
+    let install = install_managed_dir(&afs_home, &managed_dir);
+    assert!(install.status.success(), "afs install should succeed");
+
+    let agents = Command::new(env!("CARGO_BIN_EXE_afs"))
+        .env("AFS_HOME", &afs_home)
+        .arg("agents")
+        .output()
+        .expect("afs agents should run");
+    assert!(agents.status.success(), "afs agents should succeed");
+    let stdout = String::from_utf8_lossy(&agents.stdout);
+    assert!(
+        stdout.contains("index=warming"),
+        "afs agents should report warming index during the slowed initial scan; got:\n{stdout}"
+    );
+
+    await_index_token(&afs_home, "index=ready(files=5)", Duration::from_secs(5));
+
+    stop_daemon(&mut daemon);
+}
+
+#[test]
+fn index_updates_after_external_text_change() {
+    let afs_home = unique_afs_home("index-external-update");
+    let managed_dir = unique_afs_home("index-external-update-managed");
+    let pi_runtime = fake_pi_runtime("index-external-update-runtime");
+    let socket_path = supervisor_socket(&afs_home);
+    std::fs::create_dir_all(&managed_dir).expect("test should create managed directory");
+    let managed_dir = managed_dir
+        .canonicalize()
+        .expect("managed directory should canonicalize");
+    let mut daemon = start_daemon_with_pi_runtime(&afs_home, &pi_runtime);
+    await_socket(&socket_path);
+
+    let install = install_managed_dir(&afs_home, &managed_dir);
+    assert!(install.status.success(), "afs install should succeed");
+
+    await_index_token(&afs_home, "index=ready(files=0)", Duration::from_secs(3));
+
+    std::fs::write(managed_dir.join("notes.txt"), "fresh notes\n")
+        .expect("test should create external text file");
+
+    await_index_token(&afs_home, "index=ready(files=1)", Duration::from_secs(5));
+
+    stop_daemon(&mut daemon);
+}
+
+#[test]
+fn index_excludes_files_per_ignore_policy() {
+    let afs_home = unique_afs_home("index-ignore");
+    let managed_dir = unique_afs_home("index-ignore-managed");
+    let pi_runtime = fake_pi_runtime("index-ignore-runtime");
+    let socket_path = supervisor_socket(&afs_home);
+    std::fs::create_dir_all(&managed_dir).expect("test should create managed directory");
+    std::fs::write(managed_dir.join(".gitignore"), ".gitignore\nsecret.txt\n")
+        .expect("test should seed .gitignore");
+    std::fs::write(managed_dir.join("secret.txt"), "do not index\n")
+        .expect("test should write ignored file");
+    std::fs::write(managed_dir.join("notes.txt"), "indexed\n")
+        .expect("test should write indexed file");
+    let managed_dir = managed_dir
+        .canonicalize()
+        .expect("managed directory should canonicalize");
+    let mut daemon = start_daemon_with_pi_runtime(&afs_home, &pi_runtime);
+    await_socket(&socket_path);
+
+    let install = install_managed_dir(&afs_home, &managed_dir);
+    assert!(install.status.success(), "afs install should succeed");
+
+    await_index_token(&afs_home, "index=ready(files=1)", Duration::from_secs(3));
+
+    stop_daemon(&mut daemon);
+}
+
+#[test]
+fn index_skips_binary_files() {
+    let afs_home = unique_afs_home("index-binary-skip");
+    let managed_dir = unique_afs_home("index-binary-skip-managed");
+    let pi_runtime = fake_pi_runtime("index-binary-skip-runtime");
+    let socket_path = supervisor_socket(&afs_home);
+    std::fs::create_dir_all(&managed_dir).expect("test should create managed directory");
+    std::fs::write(managed_dir.join("notes.txt"), "human readable\n")
+        .expect("test should write text file");
+    std::fs::write(managed_dir.join("blob.bin"), [0u8, 1, 2, 3, 0, 4, 5])
+        .expect("test should write binary file");
+    let managed_dir = managed_dir
+        .canonicalize()
+        .expect("managed directory should canonicalize");
+    let mut daemon = start_daemon_with_pi_runtime(&afs_home, &pi_runtime);
+    await_socket(&socket_path);
+
+    let install = install_managed_dir(&afs_home, &managed_dir);
+    assert!(install.status.success(), "afs install should succeed");
+
+    await_index_token(&afs_home, "index=ready(files=1)", Duration::from_secs(3));
+
+    stop_daemon(&mut daemon);
+}
+
+#[test]
+fn index_excludes_nested_managed_directory() {
+    let afs_home = unique_afs_home("index-nested");
+    let parent_dir = unique_afs_home("index-nested-parent");
+    let pi_runtime = fake_pi_runtime("index-nested-runtime");
+    let socket_path = supervisor_socket(&afs_home);
+    std::fs::create_dir_all(parent_dir.join("child")).expect("test should create nested layout");
+    std::fs::write(parent_dir.join("p1.txt"), "parent 1\n")
+        .expect("test should write parent file 1");
+    std::fs::write(parent_dir.join("p2.txt"), "parent 2\n")
+        .expect("test should write parent file 2");
+    std::fs::write(parent_dir.join("child").join("c1.txt"), "child 1\n")
+        .expect("test should write child file");
+    let parent_dir = parent_dir
+        .canonicalize()
+        .expect("parent directory should canonicalize");
+    let child_dir = parent_dir.join("child");
+
+    let mut daemon = start_daemon_with_pi_runtime(&afs_home, &pi_runtime);
+    await_socket(&socket_path);
+
+    let install_parent = install_managed_dir(&afs_home, &parent_dir);
+    assert!(
+        install_parent.status.success(),
+        "afs install (parent) should succeed"
+    );
+    await_index_token(&afs_home, "index=ready(files=3)", Duration::from_secs(3));
+
+    let install_child = install_managed_dir(&afs_home, &child_dir);
+    assert!(
+        install_child.status.success(),
+        "afs install (child) should succeed"
+    );
+
+    let stdout = await_index_token(&afs_home, "index=ready(files=2)", Duration::from_secs(5));
+    assert!(
+        stdout.contains("index=ready(files=1)"),
+        "child managed directory should report a single indexed file; got:\n{stdout}"
+    );
+
+    stop_daemon(&mut daemon);
+}
+
+#[test]
+fn direct_ask_omits_warming_caveat_when_index_ready() {
+    let afs_home = unique_afs_home("ask-no-warming");
+    let managed_dir = unique_afs_home("ask-no-warming-managed");
+    let pi_runtime = fake_pi_runtime("ask-no-warming-runtime");
+    let socket_path = supervisor_socket(&afs_home);
+    std::fs::create_dir_all(&managed_dir).expect("test should create managed directory");
+    let target = managed_dir.join("notes.txt");
+    std::fs::write(&target, "ready content\n").expect("test should write target file");
+    let managed_dir = managed_dir
+        .canonicalize()
+        .expect("managed directory should canonicalize");
+    let target = target.canonicalize().expect("target should canonicalize");
+
+    let mut daemon = start_daemon_with_pi_runtime(&afs_home, &pi_runtime);
+    await_socket(&socket_path);
+
+    let install = install_managed_dir(&afs_home, &managed_dir);
+    assert!(install.status.success(), "afs install should succeed");
+
+    await_index_token(&afs_home, "index=ready(files=1)", Duration::from_secs(3));
+
+    let ask = afs_ask(&afs_home, &format!("summarize {}", target.display()));
+    assert!(ask.status.success(), "afs ask should succeed");
+    let stdout = String::from_utf8_lossy(&ask.stdout);
+    assert!(
+        !stdout.contains("caveat: local index is warming"),
+        "afs ask should omit the warming caveat once the local index is ready; got:\n{stdout}"
+    );
+
+    stop_daemon(&mut daemon);
 }
