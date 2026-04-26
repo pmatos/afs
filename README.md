@@ -40,7 +40,15 @@ treating this as a complete v1.
 - Directory agents are launched through an external Pi runtime command over
   stdio RPC, configured via `afs login`.
 - `afs agents` reports registered agents, runtime health, index state,
-  reconciliation state, and queue depth.
+  reconciliation state, and queue depth. The index column shows
+  `index=warming(scanned=N)` while the local text index warms and
+  `index=ready(files=N)` once it is current.
+- Each managed directory has a Rust-owned local index of its text content.
+  The index warms on install, updates on filesystem events, and is rebuilt
+  after a saturated burst of changes. Binary files, ignored files, symlinks,
+  and nested-managed subtrees are excluded from indexing.
+- `afs ask` only emits the `caveat: local index is warming` line while the
+  owning agent's local index is still warming.
 - `afs ask <prompt>` supports explicit path routing to the deepest owning
   managed directory.
 - Broad asks are broadcast to registered agents and include relevant replies,
@@ -196,11 +204,12 @@ Top-level removal:
 Shows one line per registered agent:
 
 ```text
-<managed-dir> agent=<id> runtime=pi-rpc-stdio health=<running|stopped> index=warming reconciliation=idle queue=<n>
+<managed-dir> agent=<id> runtime=pi-rpc-stdio health=<running|stopped> index=<index-state> reconciliation=idle queue=<n>
 ```
 
-The index and reconciliation fields are currently coarse status markers, not a
-full index/reconciliation progress model.
+The index field is one of `warming`, `warming(scanned=N)`,
+`warming(scanned=N/total=M)`, or `ready(files=N)`. The reconciliation field
+is currently a coarse status marker, not a full progress model.
 
 ### `afs ask <prompt>`
 
@@ -217,7 +226,8 @@ filtered out.
 Direct and delegated answers include:
 
 - file references
-- an index-warming caveat
+- an index-warming caveat (only while the owning agent's local index is
+  still warming)
 - participating agents
 - changed files
 - history entries for delegated file changes
@@ -366,10 +376,12 @@ Implemented or usable:
 - Direct agent-to-agent delegation with supervisor/delegator reply targets.
 - Change reports in final ask output for delegated mutations.
 - FIFO handling for multiple delegated tasks sent to one target during one ask.
+- Per-agent local text index that warms on install, updates from filesystem
+  events, distinguishes warming and ready coverage in `afs agents`, and gates
+  the `afs ask` warming caveat on real index state.
 
 Missing or partial:
 
-- Real Rust-owned local directory indexing: #15.
 - PDF/text extraction and binary coverage in indexing: #16.
 - Broadcast collaboration after discovery: #17.
 - True streamed progress from `afs ask`: #18.

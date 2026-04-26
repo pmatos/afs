@@ -6,8 +6,9 @@ pub mod supervisor {
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::{Path, PathBuf};
     use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
-    use std::sync::{Mutex, OnceLock};
+    use std::sync::{Arc, Mutex, OnceLock};
     use std::thread;
     use std::time::{Duration, Instant};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -23,6 +24,10 @@ pub mod supervisor {
     const BROADCAST_REPLY_TIMEOUT_ENV: &str = "AFS_BROADCAST_REPLY_TIMEOUT_MS";
     const DEFAULT_BROADCAST_REPLY_TIMEOUT: Duration = Duration::from_secs(2);
     const SETTLE_WINDOW: Duration = Duration::from_millis(150);
+    const MAX_TEXT_BYTES: usize = 256 * 1024;
+    const INDEX_FINGERPRINT_BYTES: usize = 256;
+    const INDEX_SETTLED_PATH_CAP: usize = 1024;
+    const INDEX_WARM_DELAY_ENV: &str = "AFS_INDEX_WARM_DELAY_MS";
 
     pub fn run_foreground() -> io::Result<()> {
         let home = home()?;
@@ -87,6 +92,7 @@ pub mod supervisor {
         stdout: ChildStdout,
         queued_tasks: usize,
         monitor: Option<DirectoryMonitor>,
+        index: Arc<Mutex<DirectoryIndex>>,
     }
 
     struct DirectoryMonitor {
@@ -247,6 +253,11 @@ pub mod supervisor {
                     &parent.agent_home,
                     &format!("Ownership split: {affected}"),
                 )?;
+                spawn_warm_task(
+                    parent.managed_dir.clone(),
+                    parent.agent_home.clone(),
+                    parent.index.clone(),
+                );
             }
 
             let status = if was_already_managed {
@@ -366,6 +377,18 @@ pub mod supervisor {
                 ));
             }
 
+            if let Some(parent) = self
+                .agents
+                .iter()
+                .find(|agent| agent.managed_dir == parent_managed_dir)
+            {
+                spawn_warm_task(
+                    parent.managed_dir.clone(),
+                    parent.agent_home.clone(),
+                    parent.index.clone(),
+                );
+            }
+
             Ok(format_remove_response(
                 &managed_dir,
                 &removed_identity,
@@ -444,8 +467,9 @@ pub mod supervisor {
                     Some(_) => "stopped",
                     None => "running",
                 };
+                let index_token = format_index_token(&agent.index);
                 status.push_str(&format!(
-                    "{}\tagent={}\truntime=pi-rpc-stdio\thealth={health}\tindex=warming\treconciliation=idle\tqueue={}\n",
+                    "{}\tagent={}\truntime=pi-rpc-stdio\thealth={health}\tindex={index_token}\treconciliation=idle\tqueue={}\n",
                     agent.managed_dir.display(),
                     agent.identity,
                     agent.queued_tasks
@@ -530,10 +554,12 @@ pub mod supervisor {
                 if reply_target == ReplyTarget::Supervisor {
                     let outcome =
                         self.perform_delegated_supervisor_tasks(agent_index, &requests)?;
+                    let index_state = snapshot_index_state(&self.agents[agent_index].index);
                     return Ok(format_delegated_supervisor_response(
                         &outcome,
                         &requested_path,
                         &self.agents[agent_index].identity,
+                        &index_state,
                     ));
                 }
 
@@ -550,18 +576,22 @@ pub mod supervisor {
                     let agent = &mut self.agents[agent_index];
                     agent.deliver_delegated_reply(&reply)?
                 };
+                let index_state = snapshot_index_state(&self.agents[agent_index].index);
                 return Ok(format_delegated_delegator_response(
                     &delegator_answer,
                     &reply,
                     &requested_path,
                     &self.agents[agent_index].identity,
+                    &index_state,
                 ));
             }
 
+            let index_state = snapshot_index_state(&self.agents[agent_index].index);
             Ok(format_direct_ask_response(
                 &answer,
                 &requested_path,
                 &self.agents[agent_index].identity,
+                &index_state,
             ))
         }
 
@@ -860,7 +890,10 @@ pub mod supervisor {
                 .stdout
                 .take()
                 .ok_or_else(|| io::Error::other("AFS agent runtime stdout is unavailable"))?;
-            let monitor = start_directory_monitor(managed_dir.clone(), agent_home.clone())?;
+            let index = Arc::new(Mutex::new(DirectoryIndex::new()));
+            let monitor =
+                start_directory_monitor(managed_dir.clone(), agent_home.clone(), index.clone())?;
+            spawn_warm_task(managed_dir.clone(), agent_home.clone(), index.clone());
             self.agents.push(RegisteredAgent {
                 identity: identity.to_string(),
                 managed_dir,
@@ -870,6 +903,7 @@ pub mod supervisor {
                 stdout,
                 queued_tasks: 0,
                 monitor: Some(monitor),
+                index,
             });
             Ok(())
         }
@@ -886,6 +920,9 @@ pub mod supervisor {
         }
 
         fn stop_monitor(&mut self) -> io::Result<()> {
+            if let Ok(guard) = self.index.lock() {
+                guard.request_stop();
+            }
             if let Some(monitor) = self.monitor.take() {
                 monitor.stop()?;
             }
@@ -897,6 +934,7 @@ pub mod supervisor {
                 self.monitor = Some(start_directory_monitor(
                     self.managed_dir.clone(),
                     self.agent_home.clone(),
+                    self.index.clone(),
                 )?);
             }
             Ok(())
@@ -1000,10 +1038,326 @@ pub mod supervisor {
         files: Vec<String>,
     }
 
+    #[derive(Clone, Debug)]
+    enum IndexState {
+        Warming {
+            scanned: usize,
+            total: Option<usize>,
+        },
+        Ready {
+            files: usize,
+        },
+    }
+
+    struct IndexEntry {
+        // Length and fingerprint are persisted per file so future broadcast
+        // collaboration (issue #17) can consume the local index without
+        // re-reading content. They are intentionally unread in this PR.
+        #[allow(dead_code)]
+        length: u64,
+        #[allow(dead_code)]
+        fingerprint: Vec<u8>,
+    }
+
+    struct DirectoryIndex {
+        state: IndexState,
+        entries: BTreeMap<String, IndexEntry>,
+        stop: AtomicBool,
+    }
+
+    impl DirectoryIndex {
+        fn new() -> Self {
+            Self {
+                state: IndexState::Warming {
+                    scanned: 0,
+                    total: None,
+                },
+                entries: BTreeMap::new(),
+                stop: AtomicBool::new(false),
+            }
+        }
+
+        fn snapshot_state(&self) -> IndexState {
+            self.state.clone()
+        }
+
+        fn request_stop(&self) {
+            self.stop.store(true, Ordering::Relaxed);
+        }
+
+        fn update_paths(
+            &mut self,
+            managed_dir: &Path,
+            paths: &[PathBuf],
+            matcher: Option<&ignore::gitignore::Gitignore>,
+            nested: &[String],
+        ) {
+            for path in paths {
+                if !is_managed_content_path(managed_dir, path)
+                    || path_has_agent_home_component(managed_dir, path)
+                    || is_nested_managed_path_with_list(managed_dir, path, nested)
+                {
+                    continue;
+                }
+                let relative = match relative_managed_path(managed_dir, path) {
+                    Ok(r) => r,
+                    Err(_) => continue,
+                };
+                if matcher_matches(matcher, managed_dir, path) {
+                    self.entries.remove(&relative);
+                    continue;
+                }
+                match read_text_entry(path) {
+                    Ok(Some(entry)) => {
+                        self.entries.insert(relative, entry);
+                    }
+                    Ok(None) => {
+                        self.entries.remove(&relative);
+                    }
+                    Err(_) => {
+                        self.entries.remove(&relative);
+                    }
+                }
+            }
+            if let IndexState::Ready { files } = &mut self.state {
+                *files = self.entries.len();
+            }
+        }
+
+        fn rescan_full(shared: &Arc<Mutex<DirectoryIndex>>, managed_dir: &Path, agent_home: &Path) {
+            let nested = nested_managed_relative_paths(managed_dir).unwrap_or_default();
+            let matcher = load_ignore_matcher(agent_home, managed_dir);
+            let warm_delay = warm_delay_per_file();
+            let mut new_entries: BTreeMap<String, IndexEntry> = BTreeMap::new();
+            let mut scanned: usize = 0;
+
+            {
+                let mut guard = match shared.lock() {
+                    Ok(g) => g,
+                    Err(_) => return,
+                };
+                guard.state = IndexState::Warming {
+                    scanned: 0,
+                    total: None,
+                };
+                guard.stop.store(false, Ordering::Relaxed);
+            }
+
+            let mut stack: Vec<PathBuf> = vec![managed_dir.to_path_buf()];
+            while let Some(dir) = stack.pop() {
+                if shared
+                    .lock()
+                    .map(|g| g.stop.load(Ordering::Relaxed))
+                    .unwrap_or(true)
+                {
+                    return;
+                }
+
+                let read_dir = match std::fs::read_dir(&dir) {
+                    Ok(it) => it,
+                    Err(_) => continue,
+                };
+                for entry in read_dir {
+                    let entry = match entry {
+                        Ok(e) => e,
+                        Err(_) => continue,
+                    };
+                    let path = entry.path();
+                    let metadata = match std::fs::symlink_metadata(&path) {
+                        Ok(m) => m,
+                        Err(_) => continue,
+                    };
+                    if metadata.file_type().is_symlink() {
+                        continue;
+                    }
+
+                    if metadata.is_dir() {
+                        if !is_managed_content_path(managed_dir, &path)
+                            || is_nested_managed_path_with_list(managed_dir, &path, &nested)
+                        {
+                            continue;
+                        }
+                        stack.push(path);
+                        continue;
+                    }
+
+                    if !metadata.is_file() {
+                        continue;
+                    }
+                    if !is_managed_content_path(managed_dir, &path)
+                        || path_has_agent_home_component(managed_dir, &path)
+                        || is_nested_managed_path_with_list(managed_dir, &path, &nested)
+                    {
+                        continue;
+                    }
+                    if matcher_matches(matcher.as_ref(), managed_dir, &path) {
+                        continue;
+                    }
+
+                    let relative = match relative_managed_path(managed_dir, &path) {
+                        Ok(r) => r,
+                        Err(_) => continue,
+                    };
+                    if let Ok(Some(text)) = read_text_entry(&path) {
+                        new_entries.insert(relative, text);
+                    }
+
+                    scanned += 1;
+                    if let Ok(mut guard) = shared.lock() {
+                        if guard.stop.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        guard.state = IndexState::Warming {
+                            scanned,
+                            total: None,
+                        };
+                    }
+                    if let Some(delay) = warm_delay {
+                        thread::sleep(delay);
+                    }
+                }
+            }
+
+            if let Ok(mut guard) = shared.lock() {
+                if guard.stop.load(Ordering::Relaxed) {
+                    return;
+                }
+                let files = new_entries.len();
+                guard.entries = new_entries;
+                guard.state = IndexState::Ready { files };
+            }
+        }
+    }
+
+    fn spawn_warm_task(
+        managed_dir: PathBuf,
+        agent_home: PathBuf,
+        index: Arc<Mutex<DirectoryIndex>>,
+    ) {
+        thread::spawn(move || {
+            DirectoryIndex::rescan_full(&index, &managed_dir, &agent_home);
+        });
+    }
+
+    fn warm_delay_per_file() -> Option<Duration> {
+        std::env::var(INDEX_WARM_DELAY_ENV)
+            .ok()
+            .and_then(|raw| raw.parse::<u64>().ok())
+            .filter(|ms| *ms > 0)
+            .map(Duration::from_millis)
+    }
+
+    fn matcher_matches(
+        matcher: Option<&ignore::gitignore::Gitignore>,
+        managed_dir: &Path,
+        path: &Path,
+    ) -> bool {
+        let Some(matcher) = matcher else {
+            return false;
+        };
+        let Ok(relative) = path.strip_prefix(managed_dir) else {
+            return false;
+        };
+        matcher
+            .matched_path_or_any_parents(relative, false)
+            .is_ignore()
+    }
+
+    fn is_nested_managed_path_with_list(
+        managed_dir: &Path,
+        path: &Path,
+        nested: &[String],
+    ) -> bool {
+        for relative in nested {
+            let nested_root = managed_dir.join(relative);
+            if path == nested_root || path.starts_with(&nested_root) {
+                return true;
+            }
+        }
+        false
+    }
+
+    fn classify_as_text(bytes: &[u8]) -> bool {
+        let probe_end = bytes.len().min(INDEX_FINGERPRINT_BYTES);
+        let probe = &bytes[..probe_end];
+        if probe.contains(&0u8) {
+            return false;
+        }
+        std::str::from_utf8(probe).is_ok()
+    }
+
+    fn read_text_entry(path: &Path) -> io::Result<Option<IndexEntry>> {
+        let mut file = match std::fs::File::open(path) {
+            Ok(f) => f,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let mut buffer = Vec::with_capacity(INDEX_FINGERPRINT_BYTES);
+        let mut chunk = [0u8; INDEX_FINGERPRINT_BYTES];
+        let mut total_read: u64 = 0;
+        loop {
+            let read = file.read(&mut chunk)?;
+            if read == 0 {
+                break;
+            }
+            total_read += read as u64;
+            if buffer.len() < INDEX_FINGERPRINT_BYTES {
+                let take = (INDEX_FINGERPRINT_BYTES - buffer.len()).min(read);
+                buffer.extend_from_slice(&chunk[..take]);
+            }
+            if total_read as usize >= MAX_TEXT_BYTES {
+                break;
+            }
+        }
+        if !classify_as_text(&buffer) {
+            return Ok(None);
+        }
+        let length = std::fs::metadata(path)
+            .map(|m| m.len())
+            .unwrap_or(total_read);
+        Ok(Some(IndexEntry {
+            length,
+            fingerprint: buffer,
+        }))
+    }
+
+    fn snapshot_index_state(index: &Arc<Mutex<DirectoryIndex>>) -> IndexState {
+        match index.lock() {
+            Ok(guard) => guard.snapshot_state(),
+            Err(_) => IndexState::Warming {
+                scanned: 0,
+                total: None,
+            },
+        }
+    }
+
+    fn format_index_token(index: &Arc<Mutex<DirectoryIndex>>) -> String {
+        let snapshot = match index.lock() {
+            Ok(guard) => guard.snapshot_state(),
+            Err(_) => return "warming".to_string(),
+        };
+        match snapshot {
+            IndexState::Warming {
+                scanned: 0,
+                total: None,
+            } => "warming".to_string(),
+            IndexState::Warming {
+                scanned,
+                total: None,
+            } => format!("warming(scanned={scanned})"),
+            IndexState::Warming {
+                scanned,
+                total: Some(total),
+            } => format!("warming(scanned={scanned}/total={total})"),
+            IndexState::Ready { files } => format!("ready(files={files})"),
+        }
+    }
+
     fn format_direct_ask_response(
         answer: &str,
         requested_path: &Path,
         agent_identity: &str,
+        index_state: &IndexState,
     ) -> String {
         let mut response = String::new();
         response.push_str(answer);
@@ -1012,7 +1366,9 @@ pub mod supervisor {
         }
         response.push_str("references:\n");
         response.push_str(&format!("- {}\n", requested_path.display()));
-        response.push_str("caveat: local index is warming; answer may be incomplete\n");
+        if matches!(index_state, IndexState::Warming { .. }) {
+            response.push_str("caveat: local index is warming; answer may be incomplete\n");
+        }
         response.push_str(&format!("participating_agents: {agent_identity}\n"));
         response.push_str("changed_files: none\n");
         response
@@ -1022,6 +1378,7 @@ pub mod supervisor {
         outcome: &DelegationOutcome,
         requested_path: &Path,
         requester_identity: &str,
+        index_state: &IndexState,
     ) -> String {
         let mut response = String::new();
         if let [reply] = outcome.replies.as_slice() {
@@ -1042,7 +1399,9 @@ pub mod supervisor {
         }
         response.push_str("references:\n");
         response.push_str(&format!("- {}\n", requested_path.display()));
-        response.push_str("caveat: local index is warming; answer may be incomplete\n");
+        if matches!(index_state, IndexState::Warming { .. }) {
+            response.push_str("caveat: local index is warming; answer may be incomplete\n");
+        }
         let participating_agents = participating_agents(
             requester_identity,
             outcome
@@ -1077,6 +1436,7 @@ pub mod supervisor {
         reply: &TaskReply,
         requested_path: &Path,
         requester_identity: &str,
+        index_state: &IndexState,
     ) -> String {
         let mut response = String::new();
         response.push_str(answer);
@@ -1085,7 +1445,9 @@ pub mod supervisor {
         }
         response.push_str("references:\n");
         response.push_str(&format!("- {}\n", requested_path.display()));
-        response.push_str("caveat: local index is warming; answer may be incomplete\n");
+        if matches!(index_state, IndexState::Warming { .. }) {
+            response.push_str("caveat: local index is warming; answer may be incomplete\n");
+        }
         response.push_str(&format!(
             "participating_agents: {}, {}\n",
             requester_identity, reply.agent_identity
@@ -1618,12 +1980,13 @@ pub mod supervisor {
     fn start_directory_monitor(
         managed_dir: PathBuf,
         agent_home: PathBuf,
+        index: Arc<Mutex<DirectoryIndex>>,
     ) -> io::Result<DirectoryMonitor> {
         let (ready_sender, ready_receiver) = mpsc::channel();
         let (stop_sender, stop_receiver) = mpsc::channel();
         let handle = thread::spawn(move || {
             if let Err(error) =
-                monitor_directory(managed_dir, agent_home, ready_sender, stop_receiver)
+                monitor_directory(managed_dir, agent_home, index, ready_sender, stop_receiver)
             {
                 eprintln!("directory monitor stopped: {error}");
             }
@@ -1644,6 +2007,7 @@ pub mod supervisor {
     fn monitor_directory(
         managed_dir: PathBuf,
         agent_home: PathBuf,
+        index: Arc<Mutex<DirectoryIndex>>,
         ready_sender: mpsc::Sender<Result<(), String>>,
         stop_receiver: mpsc::Receiver<()>,
     ) -> io::Result<()> {
@@ -1669,8 +2033,11 @@ pub mod supervisor {
             match receiver.recv_timeout(Duration::from_millis(50)) {
                 Ok(Ok(event)) => {
                     if event_affects_managed_subtree(&managed_dir, &event.paths) {
-                        wait_for_settled_events(&receiver, &managed_dir);
+                        let mut settled = SettledPaths::new();
+                        settled.absorb(&managed_dir, &event.paths);
+                        wait_for_settled_events(&receiver, &managed_dir, &mut settled);
                         record_external_change(&managed_dir, &agent_home)?;
+                        update_index_after_settle(&managed_dir, &agent_home, &index, settled);
                     }
                 }
                 Ok(Err(_error)) => {}
@@ -1680,9 +2047,55 @@ pub mod supervisor {
         }
     }
 
+    struct SettledPaths {
+        paths: BTreeSet<PathBuf>,
+        saturated: bool,
+    }
+
+    impl SettledPaths {
+        fn new() -> Self {
+            Self {
+                paths: BTreeSet::new(),
+                saturated: false,
+            }
+        }
+
+        fn absorb(&mut self, managed_dir: &Path, paths: &[PathBuf]) {
+            for path in paths {
+                if !is_managed_content_path(managed_dir, path) {
+                    continue;
+                }
+                if self.paths.len() >= INDEX_SETTLED_PATH_CAP {
+                    self.saturated = true;
+                    return;
+                }
+                self.paths.insert(path.clone());
+            }
+        }
+    }
+
+    fn update_index_after_settle(
+        managed_dir: &Path,
+        agent_home: &Path,
+        index: &Arc<Mutex<DirectoryIndex>>,
+        settled: SettledPaths,
+    ) {
+        if settled.saturated {
+            DirectoryIndex::rescan_full(index, managed_dir, agent_home);
+            return;
+        }
+        let nested = nested_managed_relative_paths(managed_dir).unwrap_or_default();
+        let matcher = load_ignore_matcher(agent_home, managed_dir);
+        let paths_vec: Vec<PathBuf> = settled.paths.into_iter().collect();
+        if let Ok(mut guard) = index.lock() {
+            guard.update_paths(managed_dir, &paths_vec, matcher.as_ref(), &nested);
+        }
+    }
+
     fn wait_for_settled_events(
         receiver: &Receiver<notify::Result<notify::Event>>,
         managed_dir: &Path,
+        settled: &mut SettledPaths,
     ) {
         let mut deadline = Instant::now() + SETTLE_WINDOW;
         loop {
@@ -1694,6 +2107,7 @@ pub mod supervisor {
             match receiver.recv_timeout(deadline - now) {
                 Ok(Ok(event)) => {
                     if event_affects_managed_subtree(managed_dir, &event.paths) {
+                        settled.absorb(managed_dir, &event.paths);
                         deadline = Instant::now() + SETTLE_WINDOW;
                     }
                 }
