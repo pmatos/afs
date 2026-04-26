@@ -1063,6 +1063,11 @@ pub mod supervisor {
         state: IndexState,
         entries: BTreeMap<String, IndexEntry>,
         stop: AtomicBool,
+        // Bumped at the start of every full warm scan. A scan stamps its own
+        // generation and bails (without writing) at every checkpoint if a
+        // newer scan has appeared, so concurrent rescans cannot let an older
+        // scan overwrite a newer one's results.
+        scan_generation: u64,
     }
 
     impl DirectoryIndex {
@@ -1074,6 +1079,7 @@ pub mod supervisor {
                 },
                 entries: BTreeMap::new(),
                 stop: AtomicBool::new(false),
+                scan_generation: 0,
             }
         }
 
@@ -1128,29 +1134,40 @@ pub mod supervisor {
             let nested = nested_managed_relative_paths(managed_dir).unwrap_or_default();
             let matcher = load_ignore_matcher(agent_home, managed_dir);
             let warm_delay = warm_delay_per_file();
-            let mut new_entries: BTreeMap<String, IndexEntry> = BTreeMap::new();
-            let mut scanned: usize = 0;
 
-            {
+            // Reserve a fresh generation, snapshot existing keys, reset state
+            // to warming. We mutate guard.entries in place per file (preserving
+            // any watcher-installed deltas that land during the scan); at the
+            // end we only remove keys that existed before the scan and weren't
+            // revisited.
+            let (my_gen, pre_scan_keys) = {
                 let mut guard = match shared.lock() {
                     Ok(g) => g,
                     Err(_) => return,
                 };
+                guard.scan_generation = guard.scan_generation.wrapping_add(1);
                 guard.state = IndexState::Warming {
                     scanned: 0,
                     total: None,
                 };
                 guard.stop.store(false, Ordering::Relaxed);
-            }
+                let my_gen = guard.scan_generation;
+                let keys: BTreeSet<String> = guard.entries.keys().cloned().collect();
+                (my_gen, keys)
+            };
+
+            let mut visited: BTreeSet<String> = BTreeSet::new();
+            let mut scanned: usize = 0;
 
             let mut stack: Vec<PathBuf> = vec![managed_dir.to_path_buf()];
             while let Some(dir) = stack.pop() {
-                if shared
-                    .lock()
-                    .map(|g| g.stop.load(Ordering::Relaxed))
-                    .unwrap_or(true)
-                {
-                    return;
+                match shared.lock() {
+                    Ok(g) => {
+                        if g.scan_generation != my_gen || g.stop.load(Ordering::Relaxed) {
+                            return;
+                        }
+                    }
+                    Err(_) => return,
                 }
 
                 let read_dir = match std::fs::read_dir(&dir) {
@@ -1198,20 +1215,26 @@ pub mod supervisor {
                         Ok(r) => r,
                         Err(_) => continue,
                     };
-                    if let Ok(Some(text)) = read_text_entry(&path) {
-                        new_entries.insert(relative, text);
-                    }
+                    let entry_value = match read_text_entry(&path) {
+                        Ok(Some(text)) => text,
+                        Ok(None) | Err(_) => continue,
+                    };
 
                     scanned += 1;
                     if let Ok(mut guard) = shared.lock() {
-                        if guard.stop.load(Ordering::Relaxed) {
+                        if guard.scan_generation != my_gen || guard.stop.load(Ordering::Relaxed) {
                             return;
                         }
+                        guard.entries.insert(relative.clone(), entry_value);
                         guard.state = IndexState::Warming {
                             scanned,
                             total: None,
                         };
+                    } else {
+                        return;
                     }
+                    visited.insert(relative);
+
                     if let Some(delay) = warm_delay {
                         thread::sleep(delay);
                     }
@@ -1219,11 +1242,17 @@ pub mod supervisor {
             }
 
             if let Ok(mut guard) = shared.lock() {
-                if guard.stop.load(Ordering::Relaxed) {
+                if guard.scan_generation != my_gen || guard.stop.load(Ordering::Relaxed) {
                     return;
                 }
-                let files = new_entries.len();
-                guard.entries = new_entries;
+                // Remove only keys that existed before the scan started AND
+                // were not revisited. Keys NOT in pre_scan_keys are watcher
+                // deltas that landed during the scan and must be preserved.
+                let stale: Vec<String> = pre_scan_keys.difference(&visited).cloned().collect();
+                for key in stale {
+                    guard.entries.remove(&key);
+                }
+                let files = guard.entries.len();
                 guard.state = IndexState::Ready { files };
             }
         }
