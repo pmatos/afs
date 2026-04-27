@@ -714,6 +714,34 @@ pub mod supervisor {
             Ok(reply)
         }
 
+        fn perform_delegated_task_with_deadline(
+            &mut self,
+            requester_index: usize,
+            request: &DelegateRequest,
+            deadline: Instant,
+        ) -> io::Result<TaskReply> {
+            let requester_identity = self.agents[requester_index].identity.clone();
+            let Some(target_index) = self.delegated_target_agent_index(&request.target) else {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("delegated target is not managed: {}", request.target),
+                ));
+            };
+            let target = &mut self.agents[target_index];
+            let raw_reply = target.task_with_deadline(
+                &requester_identity,
+                request.reply_target.as_protocol_field(),
+                &request.prompt,
+                deadline,
+            )?;
+            let mut reply = parse_task_reply(&raw_reply, target);
+            if let Some(change) = record_agent_change(&target.managed_dir, &target.agent_home)? {
+                reply.changed_files = change.files;
+                reply.history_entries = vec![change.history_entry];
+            }
+            Ok(reply)
+        }
+
         fn delegated_target_agent_index(&self, target: &str) -> Option<usize> {
             if let Some(index) = self
                 .agents
@@ -830,9 +858,39 @@ pub mod supervisor {
                 if let Some(line) = line {
                     if let Some(req) = parse_delegate_request(&line)? {
                         set_nonblocking(&self.agents[agent_index].stdout, false)?;
-                        let reply = self.perform_delegated_task(agent_index, &req)?;
+                        let call_deadline = Instant::now() + broadcast_reply_timeout();
+                        let reply = match self.perform_delegated_task_with_deadline(
+                            agent_index,
+                            &req,
+                            call_deadline,
+                        ) {
+                            Ok(reply) => reply,
+                            Err(error) if error.kind() == io::ErrorKind::TimedOut => {
+                                let identity = self.agents[agent_index].identity.clone();
+                                outcome.progress.push(format!(
+                                    "progress: collaboration delegation timeout agent={identity} target={}",
+                                    req.target
+                                ));
+                                return Ok(());
+                            }
+                            Err(error) => return Err(error),
+                        };
                         let next_line = if req.reply_target == ReplyTarget::Delegator {
-                            Some(self.agents[agent_index].deliver_delegated_reply(&reply)?)
+                            let next_deadline = Instant::now() + broadcast_reply_timeout();
+                            match self.agents[agent_index]
+                                .deliver_delegated_reply_with_deadline(&reply, next_deadline)
+                            {
+                                Ok(line) => Some(line),
+                                Err(error) if error.kind() == io::ErrorKind::TimedOut => {
+                                    let identity = self.agents[agent_index].identity.clone();
+                                    outcome.answers.push(reply);
+                                    outcome.progress.push(format!(
+                                        "progress: collaboration timeout agent={identity}"
+                                    ));
+                                    return Ok(());
+                                }
+                                Err(error) => return Err(error),
+                            }
                         } else {
                             None
                         };
@@ -1082,6 +1140,22 @@ pub mod supervisor {
             read_blocking_line(&mut self.stdout)
         }
 
+        fn task_with_deadline(
+            &mut self,
+            requester_identity: &str,
+            reply_target: &str,
+            prompt: &str,
+            deadline: Instant,
+        ) -> io::Result<String> {
+            writeln!(self.stdin, "TASK")?;
+            writeln!(self.stdin, "{requester_identity}")?;
+            writeln!(self.stdin, "{reply_target}")?;
+            writeln!(self.stdin, "{prompt}")?;
+            self.stdin.flush()?;
+
+            read_line_with_deadline(&mut self.stdout, deadline)
+        }
+
         fn deliver_delegated_reply(&mut self, reply: &TaskReply) -> io::Result<String> {
             writeln!(self.stdin, "DELEGATED_REPLY")?;
             writeln!(self.stdin, "{}", reply.agent_identity)?;
@@ -1091,6 +1165,21 @@ pub mod supervisor {
             self.stdin.flush()?;
 
             read_blocking_line(&mut self.stdout)
+        }
+
+        fn deliver_delegated_reply_with_deadline(
+            &mut self,
+            reply: &TaskReply,
+            deadline: Instant,
+        ) -> io::Result<String> {
+            writeln!(self.stdin, "DELEGATED_REPLY")?;
+            writeln!(self.stdin, "{}", reply.agent_identity)?;
+            writeln!(self.stdin, "{}", reply.answer)?;
+            writeln!(self.stdin, "{}", report_list(&reply.changed_files))?;
+            writeln!(self.stdin, "{}", report_list(&reply.history_entries))?;
+            self.stdin.flush()?;
+
+            read_line_with_deadline(&mut self.stdout, deadline)
         }
     }
 
@@ -2024,6 +2113,29 @@ pub mod supervisor {
                 Err(error) => return Err(error),
             }
         }
+    }
+
+    fn read_line_with_deadline(stdout: &mut ChildStdout, deadline: Instant) -> io::Result<String> {
+        set_nonblocking(stdout, true)?;
+        let mut buffer = Vec::new();
+        let result = loop {
+            match read_nonblocking_line(stdout, &mut buffer) {
+                Ok(Some(line)) => break Ok(line),
+                Ok(None) => {
+                    if Instant::now() >= deadline {
+                        break Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "AFS agent runtime did not reply within the deadline",
+                        ));
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => break Err(error),
+            }
+        };
+        // Best-effort restore of blocking mode; surface only the original error.
+        let _ = set_nonblocking(stdout, false);
+        result
     }
 
     fn read_nonblocking_line(

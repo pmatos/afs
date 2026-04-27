@@ -1261,6 +1261,88 @@ fn broadcast_collaboration_delegations_record_change_reports_in_history() {
 }
 
 #[test]
+fn broadcast_collaboration_bounds_hung_consultee_with_per_call_timeout() {
+    let afs_home = unique_afs_home("ask-collab-hung");
+    let source_dir = unique_afs_home("ask-collab-hung-source");
+    let peer_dir = unique_afs_home("ask-collab-hung-peer");
+    let pi_runtime = fake_pi_runtime("ask-collab-hung-runtime");
+    let socket_path = supervisor_socket(&afs_home);
+    std::fs::create_dir_all(&source_dir).expect("test should create source managed directory");
+    std::fs::create_dir_all(&peer_dir).expect("test should create peer managed directory");
+    let source_dir = source_dir
+        .canonicalize()
+        .expect("source directory should canonicalize");
+    let peer_dir = peer_dir
+        .canonicalize()
+        .expect("peer directory should canonicalize");
+    let mut daemon =
+        start_daemon_with_pi_runtime_and_broadcast_timeout(&afs_home, &pi_runtime, 100);
+
+    assert!(
+        wait_until(Duration::from_secs(2), || socket_path
+            .metadata()
+            .map(|metadata| metadata.file_type().is_socket())
+            .unwrap_or(false)),
+        "daemon should create the Supervisor Socket before install connects"
+    );
+
+    let source_install = install_managed_dir(&afs_home, &source_dir);
+    assert!(
+        source_install.status.success(),
+        "source afs install should succeed"
+    );
+    let peer_install = install_managed_dir(&afs_home, &peer_dir);
+    assert!(
+        peer_install.status.success(),
+        "peer afs install should succeed"
+    );
+    let peer_identity =
+        std::fs::read_to_string(peer_dir.join(".afs/identity")).expect("peer identity exists");
+
+    std::fs::write(
+        source_dir.join(".afs/broadcast-response"),
+        "strong\tsource is relevant\tsource will delegate to peer\t\n",
+    )
+    .expect("test should configure source broadcast response");
+    std::fs::write(
+        peer_dir.join(".afs/broadcast-response"),
+        "strong\tpeer is relevant\tpeer has data\t\n",
+    )
+    .expect("test should configure peer broadcast response");
+
+    std::fs::write(
+        source_dir.join(".afs/collaborate-delegate-target"),
+        peer_identity.trim(),
+    )
+    .expect("test should configure source delegate target");
+    // Peer hangs for far longer than the per-call deadline (100ms broadcast timeout).
+    std::fs::write(peer_dir.join(".afs/task-delay-seconds"), "3")
+        .expect("test should configure peer task delay");
+
+    let started = Instant::now();
+    let ask = afs_ask(&afs_home, "broad question that triggers collaboration");
+    let elapsed = started.elapsed();
+
+    assert!(
+        ask.status.success(),
+        "afs ask should still succeed when a consultee hangs\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&ask.stdout),
+        String::from_utf8_lossy(&ask.stderr)
+    );
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "afs ask must return well before the 3s consultee delay; took {elapsed:?}"
+    );
+    let stdout = String::from_utf8_lossy(&ask.stdout);
+    assert!(
+        stdout.contains("progress: collaboration delegation timeout"),
+        "ask output should report the per-call delegation timeout\nstdout:\n{stdout}"
+    );
+
+    stop_daemon(&mut daemon);
+}
+
+#[test]
 fn broadcast_with_single_relevant_reply_skips_collaboration_phase() {
     let afs_home = unique_afs_home("ask-collab-skip");
     let lone_dir = unique_afs_home("ask-collab-skip-lone");
