@@ -1069,6 +1069,12 @@ pub mod supervisor {
         Failed,
     }
 
+    enum PathAction {
+        Clear(String),
+        Insert(String, IndexEntry),
+        MarkFailed(String),
+    }
+
     struct DirectoryIndex {
         state: IndexState,
         entries: BTreeMap<String, IndexEntry>,
@@ -1103,45 +1109,20 @@ pub mod supervisor {
             self.stop.store(true, Ordering::Relaxed);
         }
 
-        fn update_paths(
-            &mut self,
-            managed_dir: &Path,
-            paths: &[PathBuf],
-            matcher: Option<&ignore::gitignore::Gitignore>,
-            nested: &[String],
-        ) {
-            for path in paths {
-                if !is_managed_content_path(managed_dir, path)
-                    || path_has_agent_home_component(managed_dir, path)
-                    || is_nested_managed_path_with_list(managed_dir, path, nested)
-                {
-                    continue;
-                }
-                let relative = match relative_managed_path(managed_dir, path) {
-                    Ok(r) => r,
-                    Err(_) => continue,
-                };
-                if matcher_matches(matcher, managed_dir, path) {
-                    self.entries.remove(&relative);
-                    self.failed_paths.remove(&relative);
-                    continue;
-                }
-                match read_index_entry(path) {
-                    Ok(ReadOutcome::Indexed(entry)) => {
+        fn apply_path_updates(&mut self, actions: Vec<PathAction>) {
+            for action in actions {
+                match action {
+                    PathAction::Clear(relative) => {
+                        self.entries.remove(&relative);
+                        self.failed_paths.remove(&relative);
+                    }
+                    PathAction::Insert(relative, entry) => {
                         self.entries.insert(relative.clone(), entry);
                         self.failed_paths.remove(&relative);
                     }
-                    Ok(ReadOutcome::Skipped) => {
-                        self.entries.remove(&relative);
-                        self.failed_paths.remove(&relative);
-                    }
-                    Ok(ReadOutcome::Failed) => {
+                    PathAction::MarkFailed(relative) => {
                         self.entries.remove(&relative);
                         self.failed_paths.insert(relative);
-                    }
-                    Err(_) => {
-                        self.entries.remove(&relative);
-                        self.failed_paths.remove(&relative);
                     }
                 }
             }
@@ -2203,9 +2184,50 @@ pub mod supervisor {
         let nested = nested_managed_relative_paths(managed_dir).unwrap_or_default();
         let matcher = load_ignore_matcher(agent_home, managed_dir);
         let paths_vec: Vec<PathBuf> = settled.paths.into_iter().collect();
-        if let Ok(mut guard) = index.lock() {
-            guard.update_paths(managed_dir, &paths_vec, matcher.as_ref(), &nested);
+        let actions = compute_path_updates(managed_dir, &paths_vec, matcher.as_ref(), &nested);
+        if actions.is_empty() {
+            return;
         }
+        if let Ok(mut guard) = index.lock() {
+            guard.apply_path_updates(actions);
+        }
+    }
+
+    fn compute_path_updates(
+        managed_dir: &Path,
+        paths: &[PathBuf],
+        matcher: Option<&ignore::gitignore::Gitignore>,
+        nested: &[String],
+    ) -> Vec<PathAction> {
+        let mut actions = Vec::with_capacity(paths.len());
+        for path in paths {
+            if !is_managed_content_path(managed_dir, path)
+                || path_has_agent_home_component(managed_dir, path)
+                || is_nested_managed_path_with_list(managed_dir, path, nested)
+            {
+                continue;
+            }
+            let relative = match relative_managed_path(managed_dir, path) {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+            if matcher_matches(matcher, managed_dir, path) {
+                actions.push(PathAction::Clear(relative));
+                continue;
+            }
+            match read_index_entry(path) {
+                Ok(ReadOutcome::Indexed(entry)) => {
+                    actions.push(PathAction::Insert(relative, entry));
+                }
+                Ok(ReadOutcome::Skipped) | Err(_) => {
+                    actions.push(PathAction::Clear(relative));
+                }
+                Ok(ReadOutcome::Failed) => {
+                    actions.push(PathAction::MarkFailed(relative));
+                }
+            }
+        }
+        actions
     }
 
     fn wait_for_settled_events(
