@@ -735,8 +735,12 @@ pub mod supervisor {
 
         fn broadcast_ask(&mut self, prompt: &str) -> io::Result<String> {
             let timeout = broadcast_reply_timeout();
+            let empty_outcome = CollaborationOutcome {
+                answers: Vec::new(),
+                progress: Vec::new(),
+            };
             if self.agents.is_empty() {
-                return Ok(format_broadcast_ask_response(&[], timeout));
+                return Ok(format_broadcast_ask_response(&[], &empty_outcome, timeout));
             }
 
             for agent in &mut self.agents {
@@ -747,7 +751,7 @@ pub mod supervisor {
             let deadline = Instant::now() + timeout;
             let mut pending = (0..self.agents.len()).collect::<BTreeSet<_>>();
             let mut buffers = vec![Vec::new(); self.agents.len()];
-            let mut replies = Vec::new();
+            let mut indexed_replies: Vec<(usize, BroadcastReply)> = Vec::new();
 
             while !pending.is_empty() && Instant::now() < deadline {
                 let mut made_progress = false;
@@ -760,7 +764,7 @@ pub mod supervisor {
                     if let Some(line) = line {
                         pending.remove(&index);
                         if let Some(reply) = parse_broadcast_reply(&line, &self.agents[index]) {
-                            replies.push(reply);
+                            indexed_replies.push((index, reply));
                         }
                         made_progress = true;
                     }
@@ -775,7 +779,101 @@ pub mod supervisor {
                 set_nonblocking(&agent.stdout, false)?;
             }
 
-            Ok(format_broadcast_ask_response(&replies, timeout))
+            let mut outcome = CollaborationOutcome {
+                answers: Vec::new(),
+                progress: Vec::new(),
+            };
+
+            if indexed_replies.len() >= 2 {
+                let peers: Vec<(String, PathBuf)> = indexed_replies
+                    .iter()
+                    .map(|(_, reply)| (reply.agent_identity.clone(), reply.managed_dir.clone()))
+                    .collect();
+                let agent_indices: Vec<usize> =
+                    indexed_replies.iter().map(|(index, _)| *index).collect();
+                for agent_index in agent_indices {
+                    let self_identity = self.agents[agent_index].identity.clone();
+                    let peers_excluding_self: Vec<(String, PathBuf)> = peers
+                        .iter()
+                        .filter(|(identity, _)| identity != &self_identity)
+                        .cloned()
+                        .collect();
+                    self.agents[agent_index].send_collaborate(prompt, &peers_excluding_self)?;
+                    self.run_collaboration_turn(agent_index, &mut outcome)?;
+                }
+            }
+
+            let replies: Vec<BroadcastReply> = indexed_replies
+                .into_iter()
+                .map(|(_, reply)| reply)
+                .collect();
+            Ok(format_broadcast_ask_response(&replies, &outcome, timeout))
+        }
+
+        fn run_collaboration_turn(
+            &mut self,
+            agent_index: usize,
+            outcome: &mut CollaborationOutcome,
+        ) -> io::Result<()> {
+            set_nonblocking(&self.agents[agent_index].stdout, true)?;
+            let mut buffer: Vec<u8> = Vec::new();
+            let mut deadline = Instant::now() + broadcast_reply_timeout();
+            let mut pending_line: Option<String> = None;
+
+            loop {
+                let line = if let Some(line) = pending_line.take() {
+                    Some(line)
+                } else {
+                    read_nonblocking_line(&mut self.agents[agent_index].stdout, &mut buffer)?
+                };
+
+                if let Some(line) = line {
+                    if let Some(req) = parse_delegate_request(&line)? {
+                        set_nonblocking(&self.agents[agent_index].stdout, false)?;
+                        let reply = self.perform_delegated_task(agent_index, &req)?;
+                        let next_line = if req.reply_target == ReplyTarget::Delegator {
+                            Some(self.agents[agent_index].deliver_delegated_reply(&reply)?)
+                        } else {
+                            None
+                        };
+                        outcome.answers.push(reply);
+                        deadline = Instant::now() + broadcast_reply_timeout();
+                        if let Some(next) = next_line {
+                            pending_line = Some(next);
+                        } else {
+                            set_nonblocking(&self.agents[agent_index].stdout, true)?;
+                        }
+                        continue;
+                    }
+
+                    if line.starts_with("COLLABORATE_REPLY\t") {
+                        let parsed = parse_collaborate_reply(&line, &self.agents[agent_index]);
+                        outcome.answers.push(parsed);
+                        set_nonblocking(&self.agents[agent_index].stdout, false)?;
+                        return Ok(());
+                    }
+
+                    let identity = self.agents[agent_index].identity.clone();
+                    outcome.answers.push(TaskReply {
+                        agent_identity: identity,
+                        answer: line.trim_end_matches(['\n', '\r']).to_string(),
+                        changed_files: Vec::new(),
+                        history_entries: Vec::new(),
+                    });
+                    set_nonblocking(&self.agents[agent_index].stdout, false)?;
+                    return Ok(());
+                }
+
+                if Instant::now() >= deadline {
+                    let identity = self.agents[agent_index].identity.clone();
+                    outcome
+                        .progress
+                        .push(format!("progress: collaboration timeout agent={identity}"));
+                    set_nonblocking(&self.agents[agent_index].stdout, false)?;
+                    return Ok(());
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
         }
 
         fn owning_agent_index(&self, requested_path: &Path) -> Option<usize> {
@@ -955,6 +1053,20 @@ pub mod supervisor {
             self.stdin.flush()
         }
 
+        fn send_collaborate(
+            &mut self,
+            prompt: &str,
+            peers: &[(String, PathBuf)],
+        ) -> io::Result<()> {
+            writeln!(self.stdin, "COLLABORATE")?;
+            writeln!(self.stdin, "{}", peers.len())?;
+            for (identity, managed_dir) in peers {
+                writeln!(self.stdin, "{}\t{}", identity, managed_dir.display())?;
+            }
+            writeln!(self.stdin, "{prompt}")?;
+            self.stdin.flush()
+        }
+
         fn task(
             &mut self,
             requester_identity: &str,
@@ -1030,6 +1142,11 @@ pub mod supervisor {
 
     struct DelegationOutcome {
         replies: Vec<TaskReply>,
+        progress: Vec<String>,
+    }
+
+    struct CollaborationOutcome {
+        answers: Vec<TaskReply>,
         progress: Vec<String>,
     }
 
@@ -1595,7 +1712,11 @@ pub mod supervisor {
         agents
     }
 
-    fn format_broadcast_ask_response(replies: &[BroadcastReply], timeout: Duration) -> String {
+    fn format_broadcast_ask_response(
+        replies: &[BroadcastReply],
+        outcome: &CollaborationOutcome,
+        timeout: Duration,
+    ) -> String {
         let mut response = String::new();
         if replies.is_empty() {
             response.push_str("no relevant agents replied before broadcast timeout\n");
@@ -1613,6 +1734,18 @@ pub mod supervisor {
             }
         }
 
+        if !outcome.answers.is_empty() {
+            response.push_str("collaboration:\n");
+            for answer in &outcome.answers {
+                response.push_str(&format!("- agent={}\n", answer.agent_identity));
+                response.push_str(&format!("  {}\n", answer.answer));
+            }
+        }
+        for progress in &outcome.progress {
+            response.push_str(progress);
+            response.push('\n');
+        }
+
         let references = replies
             .iter()
             .flat_map(|reply| reply.file_references.iter())
@@ -1627,19 +1760,45 @@ pub mod supervisor {
             }
         }
 
-        let participating_agents = replies
-            .iter()
-            .map(|reply| reply.agent_identity.as_str())
-            .collect::<Vec<_>>();
+        let mut seen = BTreeSet::new();
+        let mut participants: Vec<&str> = Vec::new();
+        for reply in replies {
+            if seen.insert(reply.agent_identity.as_str()) {
+                participants.push(reply.agent_identity.as_str());
+            }
+        }
+        for answer in &outcome.answers {
+            if seen.insert(answer.agent_identity.as_str()) {
+                participants.push(answer.agent_identity.as_str());
+            }
+        }
         response.push_str(&format!(
             "participating_agents: {}\n",
-            if participating_agents.is_empty() {
+            if participants.is_empty() {
                 "none".to_string()
             } else {
-                participating_agents.join(", ")
+                participants.join(", ")
             }
         ));
-        response.push_str("changed_files: none\n");
+
+        let aggregated_changed: Vec<String> = outcome
+            .answers
+            .iter()
+            .flat_map(|answer| answer.changed_files.iter().cloned())
+            .collect();
+        let aggregated_history: Vec<String> = outcome
+            .answers
+            .iter()
+            .flat_map(|answer| answer.history_entries.iter().cloned())
+            .collect();
+        response.push_str(&format!(
+            "changed_files: {}\n",
+            report_list(&aggregated_changed)
+        ));
+        response.push_str(&format!(
+            "history_entries: {}\n",
+            report_list(&aggregated_history)
+        ));
         response.push_str(&format!("broadcast_timeout_ms: {}\n", timeout.as_millis()));
         response
     }
@@ -1719,6 +1878,26 @@ pub mod supervisor {
     fn parse_task_reply(line: &str, agent: &RegisteredAgent) -> TaskReply {
         let line = line.trim_end_matches(['\n', '\r']);
         let Some(payload) = line.strip_prefix("TASK_REPLY\t") else {
+            return TaskReply {
+                agent_identity: agent.identity.clone(),
+                answer: line.to_string(),
+                changed_files: Vec::new(),
+                history_entries: Vec::new(),
+            };
+        };
+
+        let mut fields = payload.splitn(3, '\t');
+        TaskReply {
+            agent_identity: agent.identity.clone(),
+            answer: fields.next().unwrap_or_default().to_string(),
+            changed_files: parse_report_list(fields.next().unwrap_or_default()),
+            history_entries: parse_report_list(fields.next().unwrap_or_default()),
+        }
+    }
+
+    fn parse_collaborate_reply(line: &str, agent: &RegisteredAgent) -> TaskReply {
+        let line = line.trim_end_matches(['\n', '\r']);
+        let Some(payload) = line.strip_prefix("COLLABORATE_REPLY\t") else {
             return TaskReply {
                 agent_identity: agent.identity.clone(),
                 answer: line.to_string(),

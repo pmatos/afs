@@ -60,6 +60,11 @@ treating this as a complete v1.
 - Broad asks are broadcast to registered agents and include relevant replies,
   file references, participating agents, changed files, and the broadcast
   timeout.
+- After broadcast discovery, relevant agents enter a sequential collaboration
+  round. Each may delegate to another relevant agent (delegator reply target)
+  and use the reply in its refined answer. The final `afs ask` output
+  aggregates all participating agents (broadcast + consulted), file
+  references, changed files, and history entries from both phases.
 - Directory agents can delegate direct tasks to another agent and request the
   reply either to the supervisor or back to the delegator.
 - Delegated file changes are recorded as agent history entries and reported in
@@ -328,6 +333,25 @@ A direct ask may request delegation by returning:
 DELEGATE<TAB><target-agent-id-or-absolute-path><TAB><delegator|supervisor><TAB><prompt>
 ```
 
+Collaboration round (sent after a broadcast when 2+ agents replied
+`possible`/`strong`):
+
+```text
+COLLABORATE
+<peer-count>
+<peer-agent-id><TAB><peer-managed-dir>   (one line per peer, repeated peer-count times)
+<prompt>
+```
+
+During its turn the agent may emit zero or more `DELEGATE` lines and must
+terminate the turn with:
+
+```text
+COLLABORATE_REPLY<TAB><answer><TAB><changed-files-or-none><TAB><history-entries-or-none>
+```
+
+The per-turn timeout reuses `AFS_BROADCAST_REPLY_TIMEOUT_MS`.
+
 ## PRD #1 Status
 
 PRD #1 is not complete. The current implementation covers a substantial CLI
@@ -383,6 +407,11 @@ Implemented or usable:
   removal with optional `--discard-history`.
 - Broadcast discovery with relevance replies, ignore-policy filtering, and
   timeout.
+- Broadcast collaboration: when two or more agents reply with relevance, the
+  supervisor runs a sequential collaboration round in which each relevant
+  agent may delegate to another relevant agent and use the reply in its
+  refined answer. The final `afs ask` output reports every participant and
+  aggregates change reports from both phases.
 - Direct agent-to-agent delegation with supervisor/delegator reply targets.
 - Change reports in final ask output for delegated mutations.
 - FIFO handling for multiple delegated tasks sent to one target during one ask.
@@ -396,7 +425,6 @@ Implemented or usable:
 
 Missing or partial:
 
-- Broadcast collaboration after discovery: #17.
 - True streamed progress from `afs ask`: #18.
 - Concurrent per-agent FIFO task queue: #19.
 - Detailed agent lifecycle status for indexing, reconciliation, and queued work:
