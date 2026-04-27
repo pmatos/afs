@@ -395,6 +395,61 @@ fn afs_ask_streamed(afs_home: &std::path::Path, prompt: &str) -> Vec<(Duration, 
     reader.join().expect("stdout reader thread should join")
 }
 
+struct SpawnedAsk {
+    child: Child,
+    reader: std::thread::JoinHandle<Vec<(Duration, String)>>,
+}
+
+impl SpawnedAsk {
+    fn finish(mut self) -> Vec<(Duration, String)> {
+        let status = self.child.wait().expect("afs ask should exit");
+        let lines = self
+            .reader
+            .join()
+            .expect("stdout reader thread should join");
+        assert!(
+            status.success(),
+            "afs ask should succeed; stdout:\n{lines:#?}"
+        );
+        lines
+    }
+}
+
+fn spawn_afs_ask_streamed(afs_home: &std::path::Path, prompt: &str) -> SpawnedAsk {
+    use std::io::{BufRead, BufReader};
+
+    let start = Instant::now();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_afs"))
+        .env("AFS_HOME", afs_home)
+        .arg("ask")
+        .arg(prompt)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("afs ask should spawn");
+
+    let stdout = child.stdout.take().expect("afs ask should expose stdout");
+    let reader = std::thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        let mut lines = Vec::new();
+        let mut buffer = String::new();
+        loop {
+            buffer.clear();
+            let n = reader
+                .read_line(&mut buffer)
+                .expect("stdout read should succeed");
+            if n == 0 {
+                break;
+            }
+            let trimmed = buffer.trim_end_matches(['\n', '\r']).to_string();
+            lines.push((start.elapsed(), trimmed));
+        }
+        lines
+    });
+
+    SpawnedAsk { child, reader }
+}
+
 fn install_managed_dir(
     afs_home: &std::path::Path,
     managed_dir: &std::path::Path,
@@ -5221,6 +5276,114 @@ fn direct_ask_streams_route_direct_progress() {
     );
 
     stop_daemon(&mut daemon);
+}
+
+#[test]
+fn concurrent_direct_asks_to_same_agent_queue_fifo_and_report_status() {
+    let afs_home = unique_afs_home("ask-concurrent-direct");
+    let managed_dir = unique_afs_home("ask-concurrent-direct-managed");
+    let pi_runtime = fake_pi_runtime("ask-concurrent-direct-runtime");
+    let socket_path = supervisor_socket(&afs_home);
+    std::fs::create_dir_all(&managed_dir).expect("test should create managed dir");
+    let managed_file = managed_dir.join("notes.md");
+    std::fs::write(&managed_file, "direct context\n").expect("test should create managed file");
+    let managed_dir = managed_dir
+        .canonicalize()
+        .expect("managed dir should canonicalize");
+    let managed_file = managed_file
+        .canonicalize()
+        .expect("managed file should canonicalize");
+
+    let mut daemon = start_daemon_with_pi_runtime(&afs_home, &pi_runtime);
+    await_socket(&socket_path);
+
+    assert!(
+        install_managed_dir(&afs_home, &managed_dir)
+            .status
+            .success(),
+        "install should succeed"
+    );
+    let identity =
+        std::fs::read_to_string(managed_dir.join(".afs/identity")).expect("identity exists");
+    let delay_path = managed_dir.join(".afs/ask-delay-seconds");
+    std::fs::write(&delay_path, "2").expect("test should configure initial ask delay");
+
+    let first_prompt = format!("first direct {}", managed_file.display());
+    let second_prompt = format!("second direct {}", managed_file.display());
+    let first = spawn_afs_ask_streamed(&afs_home, &first_prompt);
+    assert!(
+        wait_until(Duration::from_secs(1), || {
+            std::fs::read_to_string(managed_dir.join(".afs/ask-received"))
+                .map(|log| log.contains(&format!("prompt={first_prompt}")))
+                .unwrap_or(false)
+        }),
+        "first ask should reach the agent runtime before the second ask is spawned"
+    );
+    std::fs::remove_file(&delay_path).expect("second ask should not inherit the startup delay");
+
+    let second = spawn_afs_ask_streamed(&afs_home, &second_prompt);
+    let mut last_agents = String::new();
+    let saw_queue = wait_until(Duration::from_secs(3), || {
+        let agents = Command::new(env!("CARGO_BIN_EXE_afs"))
+            .env("AFS_HOME", &afs_home)
+            .arg("agents")
+            .output()
+            .expect("afs agents should run");
+        if !agents.status.success() {
+            return false;
+        }
+        last_agents = String::from_utf8_lossy(&agents.stdout).to_string();
+        last_agents.contains("queue=1")
+    });
+
+    let first_lines = first.finish();
+    let second_lines = second.finish();
+    let task_log = std::fs::read_to_string(managed_dir.join(".afs/ask-received"))
+        .expect("agent runtime should record both asks");
+    stop_daemon(&mut daemon);
+
+    assert!(
+        saw_queue,
+        "afs agents should expose the queued second ask while the first ask is active; last output:\n{last_agents}"
+    );
+    let queued_index = second_lines
+        .iter()
+        .position(|(_, line)| {
+            line == &format!("progress: queued task agent={} queue=1", identity.trim())
+        })
+        .expect("second ask should stream queued progress");
+    let started_index = second_lines
+        .iter()
+        .position(|(_, line)| {
+            line == &format!("progress: started task agent={} queue=0", identity.trim())
+        })
+        .expect("second ask should stream started progress when the first ask releases the agent");
+    let answer_index = second_lines
+        .iter()
+        .position(|(_, line)| {
+            line.starts_with(&format!("agent {} answered about", identity.trim()))
+        })
+        .expect("second ask should return the direct answer");
+    assert!(
+        queued_index < started_index && started_index < answer_index,
+        "second ask progress should show queued, then started, then answer; lines:\n{second_lines:#?}"
+    );
+    let first_position = task_log
+        .find(&format!("prompt={first_prompt}"))
+        .expect("runtime should record first ask");
+    let second_position = task_log
+        .find(&format!("prompt={second_prompt}"))
+        .expect("runtime should record second ask");
+    assert!(
+        first_position < second_position,
+        "agent runtime should receive concurrent direct asks FIFO; log:\n{task_log}"
+    );
+    assert!(
+        first_lines
+            .iter()
+            .any(|(_, line)| line.starts_with(&format!("agent {} answered about", identity.trim()))),
+        "first ask should also complete normally; lines:\n{first_lines:#?}"
+    );
 }
 
 fn remove_dir_all_retry(path: &std::path::Path) {
