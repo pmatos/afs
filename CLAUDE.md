@@ -24,7 +24,6 @@ the PRD is complete just because the linked child issues are closed.
 Before judging PRD #1 completion, compare the live issue body and README status
 against the actual source and tests. Known gaps as of the current code include:
 
-- PDF/text extraction (#16).
 - Broadcast collaboration after discovery (#17).
 - True streamed progress from `afs ask` (#18).
 - Concurrent per-agent FIFO task queue (#19).

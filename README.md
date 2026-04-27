@@ -41,14 +41,20 @@ treating this as a complete v1.
   stdio RPC, configured via `afs login`.
 - `afs agents` reports registered agents, runtime health, index state,
   reconciliation state, and queue depth. The index column shows
-  `index=warming(scanned=N)` while the local text index warms and
-  `index=ready(files=N)` once it is current.
-- Each managed directory has a Rust-owned local index of its text content.
+  `index=warming(scanned=N)` while the local text index warms,
+  `index=ready(files=N)` once it is current, and
+  `index=ready(files=N, failed=M)` if some files could not be extracted.
+- Each managed directory has a Rust-owned local index of its content.
   The index warms on install, updates on filesystem events, and is rebuilt
-  after a saturated burst of changes. Binary files, ignored files, symlinks,
-  and nested-managed subtrees are excluded from indexing.
-- `afs ask` only emits the `caveat: local index is warming` line while the
-  owning agent's local index is still warming.
+  after a saturated burst of changes. PDF files contribute their extracted
+  text to the index. Other binary files, ignored files, symlinks, and
+  nested-managed subtrees are excluded from indexing, but binary files
+  remain tracked in AFS history and are restored byte-for-byte through
+  `afs undo` without UTF-8 assumptions.
+- `afs ask` emits `caveat: local index is warming` while the owning
+  agent's local index is still warming, and
+  `caveat: local index could not extract N file(s)` once the index is
+  ready but some files (for example, malformed PDFs) failed extraction.
 - `afs ask <prompt>` supports explicit path routing to the deepest owning
   managed directory.
 - Broad asks are broadcast to registered agents and include relevant replies,
@@ -208,8 +214,10 @@ Shows one line per registered agent:
 ```
 
 The index field is one of `warming`, `warming(scanned=N)`,
-`warming(scanned=N/total=M)`, or `ready(files=N)`. The reconciliation field
-is currently a coarse status marker, not a full progress model.
+`warming(scanned=N/total=M)`, `ready(files=N)`, or
+`ready(files=N, failed=M)` when M file(s) (for example, malformed PDFs)
+could not be extracted. The reconciliation field is currently a coarse
+status marker, not a full progress model.
 
 ### `afs ask <prompt>`
 
@@ -228,6 +236,8 @@ Direct and delegated answers include:
 - file references
 - an index-warming caveat (only while the owning agent's local index is
   still warming)
+- an extraction-failure caveat (only once the index is ready and at
+  least one file failed to extract; the caveat reports how many)
 - participating agents
 - changed files
 - history entries for delegated file changes
@@ -376,13 +386,16 @@ Implemented or usable:
 - Direct agent-to-agent delegation with supervisor/delegator reply targets.
 - Change reports in final ask output for delegated mutations.
 - FIFO handling for multiple delegated tasks sent to one target during one ask.
-- Per-agent local text index that warms on install, updates from filesystem
+- Per-agent local content index that warms on install, updates from filesystem
   events, distinguishes warming and ready coverage in `afs agents`, and gates
-  the `afs ask` warming caveat on real index state.
+  the `afs ask` warming caveat on real index state. PDF files contribute
+  extracted text to the index; extraction failures are surfaced as
+  `failed=N` in `afs agents` and as an honest caveat in `afs ask`. Binary
+  files are tracked in AFS history and restored byte-for-byte through
+  `afs undo`.
 
 Missing or partial:
 
-- PDF/text extraction and binary coverage in indexing: #16.
 - Broadcast collaboration after discovery: #17.
 - True streamed progress from `afs ask`: #18.
 - Concurrent per-agent FIFO task queue: #19.

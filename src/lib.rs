@@ -1046,22 +1046,33 @@ pub mod supervisor {
         },
         Ready {
             files: usize,
+            failed: usize,
         },
     }
 
     struct IndexEntry {
-        // Length and fingerprint are persisted per file so future broadcast
-        // collaboration (issue #17) can consume the local index without
-        // re-reading content. They are intentionally unread in this PR.
+        // Length, fingerprint and extracted_text are persisted per file so
+        // future broadcast collaboration (issue #17) can consume the local
+        // index without re-reading content. They are intentionally unread in
+        // this PR.
         #[allow(dead_code)]
         length: u64,
         #[allow(dead_code)]
         fingerprint: Vec<u8>,
+        #[allow(dead_code)]
+        extracted_text: Option<String>,
+    }
+
+    enum ReadOutcome {
+        Indexed(IndexEntry),
+        Skipped,
+        Failed,
     }
 
     struct DirectoryIndex {
         state: IndexState,
         entries: BTreeMap<String, IndexEntry>,
+        failed_paths: BTreeSet<String>,
         stop: AtomicBool,
         // Bumped at the start of every full warm scan. A scan stamps its own
         // generation and bails (without writing) at every checkpoint if a
@@ -1078,6 +1089,7 @@ pub mod supervisor {
                     total: None,
                 },
                 entries: BTreeMap::new(),
+                failed_paths: BTreeSet::new(),
                 stop: AtomicBool::new(false),
                 scan_generation: 0,
             }
@@ -1111,22 +1123,31 @@ pub mod supervisor {
                 };
                 if matcher_matches(matcher, managed_dir, path) {
                     self.entries.remove(&relative);
+                    self.failed_paths.remove(&relative);
                     continue;
                 }
-                match read_text_entry(path) {
-                    Ok(Some(entry)) => {
-                        self.entries.insert(relative, entry);
+                match read_index_entry(path) {
+                    Ok(ReadOutcome::Indexed(entry)) => {
+                        self.entries.insert(relative.clone(), entry);
+                        self.failed_paths.remove(&relative);
                     }
-                    Ok(None) => {
+                    Ok(ReadOutcome::Skipped) => {
                         self.entries.remove(&relative);
+                        self.failed_paths.remove(&relative);
+                    }
+                    Ok(ReadOutcome::Failed) => {
+                        self.entries.remove(&relative);
+                        self.failed_paths.insert(relative);
                     }
                     Err(_) => {
                         self.entries.remove(&relative);
+                        self.failed_paths.remove(&relative);
                     }
                 }
             }
-            if let IndexState::Ready { files } = &mut self.state {
+            if let IndexState::Ready { files, failed } = &mut self.state {
                 *files = self.entries.len();
+                *failed = self.failed_paths.len();
             }
         }
 
@@ -1140,7 +1161,7 @@ pub mod supervisor {
             // any watcher-installed deltas that land during the scan); at the
             // end we only remove keys that existed before the scan and weren't
             // revisited.
-            let (my_gen, pre_scan_keys) = {
+            let (my_gen, pre_scan_keys, pre_scan_failed) = {
                 let mut guard = match shared.lock() {
                     Ok(g) => g,
                     Err(_) => return,
@@ -1153,7 +1174,8 @@ pub mod supervisor {
                 guard.stop.store(false, Ordering::Relaxed);
                 let my_gen = guard.scan_generation;
                 let keys: BTreeSet<String> = guard.entries.keys().cloned().collect();
-                (my_gen, keys)
+                let failed: BTreeSet<String> = guard.failed_paths.iter().cloned().collect();
+                (my_gen, keys, failed)
             };
 
             let mut visited: BTreeSet<String> = BTreeSet::new();
@@ -1215,9 +1237,14 @@ pub mod supervisor {
                         Ok(r) => r,
                         Err(_) => continue,
                     };
-                    let entry_value = match read_text_entry(&path) {
-                        Ok(Some(text)) => text,
-                        Ok(None) | Err(_) => continue,
+                    let outcome = match read_index_entry(&path) {
+                        Ok(o) => o,
+                        Err(_) => continue,
+                    };
+                    let entry_value = match outcome {
+                        ReadOutcome::Indexed(entry) => Some(entry),
+                        ReadOutcome::Failed => None,
+                        ReadOutcome::Skipped => continue,
                     };
 
                     scanned += 1;
@@ -1225,7 +1252,16 @@ pub mod supervisor {
                         if guard.scan_generation != my_gen || guard.stop.load(Ordering::Relaxed) {
                             return;
                         }
-                        guard.entries.insert(relative.clone(), entry_value);
+                        match entry_value {
+                            Some(entry) => {
+                                guard.entries.insert(relative.clone(), entry);
+                                guard.failed_paths.remove(&relative);
+                            }
+                            None => {
+                                guard.entries.remove(&relative);
+                                guard.failed_paths.insert(relative.clone());
+                            }
+                        }
                         guard.state = IndexState::Warming {
                             scanned,
                             total: None,
@@ -1252,8 +1288,14 @@ pub mod supervisor {
                 for key in stale {
                     guard.entries.remove(&key);
                 }
+                let stale_failed: Vec<String> =
+                    pre_scan_failed.difference(&visited).cloned().collect();
+                for key in stale_failed {
+                    guard.failed_paths.remove(&key);
+                }
                 let files = guard.entries.len();
-                guard.state = IndexState::Ready { files };
+                let failed = guard.failed_paths.len();
+                guard.state = IndexState::Ready { files, failed };
             }
         }
     }
@@ -1315,10 +1357,14 @@ pub mod supervisor {
         std::str::from_utf8(probe).is_ok()
     }
 
-    fn read_text_entry(path: &Path) -> io::Result<Option<IndexEntry>> {
+    const PDF_EXTRACT_BYTE_CAP: u64 = 50 * 1024 * 1024;
+
+    fn read_index_entry(path: &Path) -> io::Result<ReadOutcome> {
         let mut file = match std::fs::File::open(path) {
             Ok(f) => f,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(ReadOutcome::Skipped);
+            }
             Err(error) => return Err(error),
         };
         let mut buffer = Vec::with_capacity(INDEX_FINGERPRINT_BYTES);
@@ -1338,16 +1384,46 @@ pub mod supervisor {
                 break;
             }
         }
+        if buffer.starts_with(b"%PDF-") {
+            return Ok(read_pdf_entry(path, &buffer));
+        }
         if !classify_as_text(&buffer) {
-            return Ok(None);
+            return Ok(ReadOutcome::Skipped);
         }
         let length = std::fs::metadata(path)
             .map(|m| m.len())
             .unwrap_or(total_read);
-        Ok(Some(IndexEntry {
+        Ok(ReadOutcome::Indexed(IndexEntry {
             length,
             fingerprint: buffer,
+            extracted_text: None,
         }))
+    }
+
+    fn read_pdf_entry(path: &Path, head: &[u8]) -> ReadOutcome {
+        let length = match std::fs::metadata(path) {
+            Ok(m) => m.len(),
+            Err(_) => return ReadOutcome::Failed,
+        };
+        if length > PDF_EXTRACT_BYTE_CAP {
+            return ReadOutcome::Failed;
+        }
+        let path_buf = path.to_path_buf();
+        let extracted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            pdf_extract::extract_text(&path_buf)
+        }));
+        match extracted {
+            Ok(Ok(text)) => {
+                let fingerprint_end = head.len().min(INDEX_FINGERPRINT_BYTES);
+                let fingerprint = head[..fingerprint_end].to_vec();
+                ReadOutcome::Indexed(IndexEntry {
+                    length,
+                    fingerprint,
+                    extracted_text: Some(text),
+                })
+            }
+            Ok(Err(_)) | Err(_) => ReadOutcome::Failed,
+        }
     }
 
     fn snapshot_index_state(index: &Arc<Mutex<DirectoryIndex>>) -> IndexState {
@@ -1378,7 +1454,10 @@ pub mod supervisor {
                 scanned,
                 total: Some(total),
             } => format!("warming(scanned={scanned}/total={total})"),
-            IndexState::Ready { files } => format!("ready(files={files})"),
+            IndexState::Ready { files, failed: 0 } => format!("ready(files={files})"),
+            IndexState::Ready { files, failed } => {
+                format!("ready(files={files}, failed={failed})")
+            }
         }
     }
 
@@ -1395,12 +1474,24 @@ pub mod supervisor {
         }
         response.push_str("references:\n");
         response.push_str(&format!("- {}\n", requested_path.display()));
-        if matches!(index_state, IndexState::Warming { .. }) {
-            response.push_str("caveat: local index is warming; answer may be incomplete\n");
-        }
+        push_index_caveat(&mut response, index_state);
         response.push_str(&format!("participating_agents: {agent_identity}\n"));
         response.push_str("changed_files: none\n");
         response
+    }
+
+    fn push_index_caveat(response: &mut String, index_state: &IndexState) {
+        match index_state {
+            IndexState::Warming { .. } => {
+                response.push_str("caveat: local index is warming; answer may be incomplete\n");
+            }
+            IndexState::Ready { failed, .. } if *failed > 0 => {
+                response.push_str(&format!(
+                    "caveat: local index could not extract {failed} file(s); answer may be incomplete\n"
+                ));
+            }
+            IndexState::Ready { .. } => {}
+        }
     }
 
     fn format_delegated_supervisor_response(
@@ -1428,9 +1519,7 @@ pub mod supervisor {
         }
         response.push_str("references:\n");
         response.push_str(&format!("- {}\n", requested_path.display()));
-        if matches!(index_state, IndexState::Warming { .. }) {
-            response.push_str("caveat: local index is warming; answer may be incomplete\n");
-        }
+        push_index_caveat(&mut response, index_state);
         let participating_agents = participating_agents(
             requester_identity,
             outcome
@@ -1474,9 +1563,7 @@ pub mod supervisor {
         }
         response.push_str("references:\n");
         response.push_str(&format!("- {}\n", requested_path.display()));
-        if matches!(index_state, IndexState::Warming { .. }) {
-            response.push_str("caveat: local index is warming; answer may be incomplete\n");
-        }
+        push_index_caveat(&mut response, index_state);
         response.push_str(&format!(
             "participating_agents: {}, {}\n",
             requester_identity, reply.agent_identity

@@ -4700,3 +4700,137 @@ fn direct_ask_omits_warming_caveat_when_index_ready() {
 
     stop_daemon(&mut daemon);
 }
+
+const BLOOD_PANEL_PDF: &[u8] = include_bytes!("fixtures/blood-panel.pdf");
+
+#[test]
+fn pdf_file_is_indexed_and_counted_among_ready_files() {
+    let afs_home = unique_afs_home("index-pdf");
+    let managed_dir = unique_afs_home("index-pdf-managed");
+    let pi_runtime = fake_pi_runtime("index-pdf-runtime");
+    let socket_path = supervisor_socket(&afs_home);
+    std::fs::create_dir_all(&managed_dir).expect("test should create managed directory");
+    std::fs::write(managed_dir.join("notes.txt"), "human readable\n")
+        .expect("test should write text file");
+    std::fs::write(managed_dir.join("blood-panel.pdf"), BLOOD_PANEL_PDF)
+        .expect("test should write pdf file");
+    let managed_dir = managed_dir
+        .canonicalize()
+        .expect("managed directory should canonicalize");
+
+    let mut daemon = start_daemon_with_pi_runtime(&afs_home, &pi_runtime);
+    await_socket(&socket_path);
+
+    let install = install_managed_dir(&afs_home, &managed_dir);
+    assert!(install.status.success(), "afs install should succeed");
+
+    let stdout = await_index_token(&afs_home, "index=ready(files=2)", Duration::from_secs(10));
+    assert!(
+        !stdout.contains("failed="),
+        "ready index should not surface a failed= count for a well-formed pdf; got:\n{stdout}"
+    );
+
+    stop_daemon(&mut daemon);
+}
+
+#[test]
+fn binary_file_is_tracked_in_history_and_restored_through_undo() {
+    let afs_home = unique_afs_home("undo-binary");
+    let managed_dir = unique_afs_home("undo-binary-managed");
+    let pi_runtime = fake_pi_runtime("undo-binary-runtime");
+    let socket_path = supervisor_socket(&afs_home);
+    std::fs::create_dir_all(&managed_dir).expect("test should create managed directory");
+    let target_file = managed_dir.join("payload.bin");
+    let original: [u8; 8] = [0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01, 0x02, 0xFF];
+    std::fs::write(&target_file, original).expect("test should create binary managed file");
+    let managed_dir = managed_dir
+        .canonicalize()
+        .expect("managed directory should canonicalize");
+    let target_file = target_file
+        .canonicalize()
+        .expect("target file should canonicalize");
+
+    let mut daemon = start_daemon_with_pi_runtime(&afs_home, &pi_runtime);
+    await_socket(&socket_path);
+
+    let install = install_managed_dir(&afs_home, &managed_dir);
+    assert!(install.status.success(), "afs install should succeed");
+
+    let mutated: [u8; 6] = [0xCA, 0xFE, 0xBA, 0xBE, 0x00, 0x42];
+    std::fs::write(&target_file, mutated).expect("test should mutate binary file");
+    assert!(
+        wait_until(Duration::from_secs(3), || {
+            let history = afs_history(&afs_home, &managed_dir);
+            history.status.success()
+                && String::from_utf8_lossy(&history.stdout).contains("type=external")
+        }),
+        "afs history should record the binary External Change"
+    );
+
+    let history = afs_history(&afs_home, &managed_dir);
+    let stdout = String::from_utf8_lossy(&history.stdout);
+    let entry = history_entry_id(stdout.lines().next().expect("history should have an entry"));
+    let undo = Command::new(env!("CARGO_BIN_EXE_afs"))
+        .env("AFS_HOME", &afs_home)
+        .arg("undo")
+        .arg(&managed_dir)
+        .arg(entry)
+        .arg("--yes")
+        .output()
+        .expect("afs undo should run");
+
+    assert!(undo.status.success(), "afs undo --yes should succeed");
+    assert_eq!(
+        std::fs::read(&target_file).expect("target file should be readable"),
+        original.to_vec(),
+        "undo should restore the exact binary bytes without UTF-8 assumptions"
+    );
+
+    stop_daemon(&mut daemon);
+}
+
+#[test]
+fn corrupted_pdf_degrades_gracefully_with_failure_caveat() {
+    let afs_home = unique_afs_home("index-pdf-corrupt");
+    let managed_dir = unique_afs_home("index-pdf-corrupt-managed");
+    let pi_runtime = fake_pi_runtime("index-pdf-corrupt-runtime");
+    let socket_path = supervisor_socket(&afs_home);
+    std::fs::create_dir_all(&managed_dir).expect("test should create managed directory");
+    let target = managed_dir.join("broken.pdf");
+    let mut bytes = b"%PDF-1.4\n".to_vec();
+    bytes.extend_from_slice(
+        b"this is not a real pdf body, just garbage that pdf-extract cannot parse\n",
+    );
+    bytes.extend_from_slice(&[0xFF, 0xFE, 0x00, 0x01, 0x02]);
+    std::fs::write(&target, &bytes).expect("test should write corrupted pdf");
+    let managed_dir = managed_dir
+        .canonicalize()
+        .expect("managed directory should canonicalize");
+    let target = target.canonicalize().expect("target should canonicalize");
+
+    let mut daemon = start_daemon_with_pi_runtime(&afs_home, &pi_runtime);
+    await_socket(&socket_path);
+
+    let install = install_managed_dir(&afs_home, &managed_dir);
+    assert!(install.status.success(), "afs install should succeed");
+
+    let stdout = await_index_token(
+        &afs_home,
+        "index=ready(files=0, failed=1)",
+        Duration::from_secs(10),
+    );
+    assert!(
+        stdout.contains("failed=1"),
+        "agents should surface failed=1 for the corrupted pdf; got:\n{stdout}"
+    );
+
+    let ask = afs_ask(&afs_home, &format!("summarize {}", target.display()));
+    assert!(ask.status.success(), "afs ask should still succeed");
+    let answer = String::from_utf8_lossy(&ask.stdout);
+    assert!(
+        answer.contains("caveat: local index could not extract 1 file(s)"),
+        "afs ask should surface an honest extraction-failure caveat; got:\n{answer}"
+    );
+
+    stop_daemon(&mut daemon);
+}
