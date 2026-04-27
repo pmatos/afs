@@ -4834,3 +4834,36 @@ fn corrupted_pdf_degrades_gracefully_with_failure_caveat() {
 
     stop_daemon(&mut daemon);
 }
+
+#[test]
+fn text_file_with_pdf_magic_prefix_falls_back_to_text_index() {
+    let afs_home = unique_afs_home("index-pdf-magic-text");
+    let managed_dir = unique_afs_home("index-pdf-magic-text-managed");
+    let pi_runtime = fake_pi_runtime("index-pdf-magic-text-runtime");
+    let socket_path = supervisor_socket(&afs_home);
+    std::fs::create_dir_all(&managed_dir).expect("test should create managed directory");
+    std::fs::write(
+        managed_dir.join("pdf-spec-notes.md"),
+        "%PDF-1.4 is the PDF major version. This file is plain markdown text \
+         describing the magic bytes; it is not itself a real PDF and pdf-extract \
+         should not be able to parse it.\n",
+    )
+    .expect("test should write text file with pdf magic prefix");
+    let managed_dir = managed_dir
+        .canonicalize()
+        .expect("managed directory should canonicalize");
+
+    let mut daemon = start_daemon_with_pi_runtime(&afs_home, &pi_runtime);
+    await_socket(&socket_path);
+
+    let install = install_managed_dir(&afs_home, &managed_dir);
+    assert!(install.status.success(), "afs install should succeed");
+
+    let stdout = await_index_token(&afs_home, "index=ready(files=1)", Duration::from_secs(10));
+    assert!(
+        !stdout.contains("failed="),
+        "text file that incidentally starts with %PDF- should not be counted as a failed extraction; got:\n{stdout}"
+    );
+
+    stop_daemon(&mut daemon);
+}

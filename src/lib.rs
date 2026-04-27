@@ -1403,7 +1403,24 @@ pub mod supervisor {
                     extracted_text: Some(text),
                 })
             }
-            Ok(Err(_)) | Err(_) => ReadOutcome::Failed,
+            Ok(Err(_)) | Err(_) => {
+                // The %PDF- magic was present but extraction failed. If the
+                // head buffer still classifies as text (no NUL bytes, valid
+                // UTF-8), this is a plain-text file that incidentally starts
+                // with the magic — index it as text rather than counting it
+                // as a broken PDF.
+                if classify_as_text(head) {
+                    let fingerprint_end = head.len().min(INDEX_FINGERPRINT_BYTES);
+                    let fingerprint = head[..fingerprint_end].to_vec();
+                    ReadOutcome::Indexed(IndexEntry {
+                        length,
+                        fingerprint,
+                        extracted_text: None,
+                    })
+                } else {
+                    ReadOutcome::Failed
+                }
+            }
         }
     }
 
