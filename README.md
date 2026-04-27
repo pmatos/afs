@@ -5,8 +5,8 @@ Rust. It runs a foreground supervisor daemon, installs directory-scoped agents
 into selected directories, records local AFS history, routes questions to the
 right agent, and supports latest-entry undo.
 
-Status: usable core, not the full PRD #1 yet. See "PRD #1 Status" below before
-treating this as a complete v1.
+Status: PRD #1 (AFS v1) is complete. See "PRD #1 Status" below for the
+source-grounded coverage map.
 
 ## What Works Today
 
@@ -383,15 +383,11 @@ The per-turn timeout reuses `AFS_BROADCAST_REPLY_TIMEOUT_MS`.
 
 ## PRD #1 Status
 
-PRD #1 is not complete. The current implementation covers a substantial CLI
-and history core, but several PRD-level requirements are still missing or only
-partially represented.
-
-A large group of child issues is closed and the current code is intended to
-satisfy their stated acceptance criteria. Those issues were tracer bullets for
-major AFS capabilities, but they do not enumerate every requirement in PRD #1.
-Do not treat "all listed child issues are closed" as equivalent to "PRD #1 is
-complete."
+PRD #1 is complete. Every v1 user story, implementation decision, and testing
+decision in `docs/prd/agentic-file-system-v1.md` is implemented in the source
+and exercised by the behavior tests in `tests/cli.rs`. The repository
+verification gate (`cargo fmt --check`, `cargo clippy -D warnings`,
+`cargo test`) is green.
 
 Closed child-issue coverage:
 
@@ -421,6 +417,10 @@ Closed child-issue coverage:
   queue depth visible through `afs agents`.
 - #20: top-level managed-directory remove lifecycle with optional history
   archive or discard.
+- #21: detailed per-agent lifecycle status (reconciliation running/complete,
+  active turn, queue depth) surfaced through `afs agents` and ask caveats.
+- #22: final PRD coverage audit comparing PRD #1 against the live source and
+  tests; closed with the audit summary on issue #1.
 
 Implemented or usable:
 
@@ -466,12 +466,13 @@ Implemented or usable:
   `running` while missed changes replay, `complete(changed_files=N)` after
   replay, and direct/delegated asks include a caveat while replay is running.
 
-Missing or partial:
-
-- Final PRD coverage audit before closing #1: #22.
-
-Because of these gaps, issue #1 should remain open until the missing PRD
-requirements are either implemented or deliberately scoped out of v1.
+Out of scope for v1 (deliberate, see PRD): a full GUI, cross-platform watcher
+support, a global supervisor content index, selective undo of non-latest
+entries, cross-directory transactional writes, a formal permissions/ACL
+system, OS-level sandboxing for agent shell commands, a user-facing
+conversation-receipt browser, cancel/interrupt for queued tasks, mandatory
+OCR/vision/audio in the indexing path, background auto-start of the
+supervisor, and vendoring Pi into this repository.
 
 ## Development
 
