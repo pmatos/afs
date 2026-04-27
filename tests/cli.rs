@@ -243,6 +243,44 @@ while IFS= read -r _line; do
     if [ -f "$AFS_AGENT_HOME/broadcast-response" ]; then
       cat "$AFS_AGENT_HOME/broadcast-response"
     fi
+  elif [ "$_line" = "COLLABORATE" ]; then
+    IFS= read -r peer_count
+    : > "$AFS_AGENT_HOME/collaborate-peers"
+    i=0
+    while [ "$i" -lt "$peer_count" ]; do
+      IFS= read -r peer_line
+      printf '%s\n' "$peer_line" >> "$AFS_AGENT_HOME/collaborate-peers"
+      i=$((i + 1))
+    done
+    IFS= read -r collab_prompt
+    printf 'prompt=%s\n' "$collab_prompt" >> "$AFS_AGENT_HOME/collaborate-received"
+    delegated_answer=""
+    if [ -f "$AFS_AGENT_HOME/collaborate-delegate-target" ]; then
+      collab_target="$(cat "$AFS_AGENT_HOME/collaborate-delegate-target")"
+      collab_dprompt="$collab_prompt"
+      if [ -f "$AFS_AGENT_HOME/collaborate-delegate-prompt" ]; then
+        collab_dprompt="$(cat "$AFS_AGENT_HOME/collaborate-delegate-prompt")"
+      fi
+      printf 'DELEGATE\t%s\tdelegator\t%s\n' "$collab_target" "$collab_dprompt"
+      IFS= read -r _marker
+      IFS= read -r _agent
+      IFS= read -r delegated_answer
+      IFS= read -r _changed
+      IFS= read -r _history
+      {
+        printf 'agent=%s\n' "$_agent"
+        printf 'answer=%s\n' "$delegated_answer"
+      } >> "$AFS_AGENT_HOME/collaborate-delegated-reply"
+    fi
+    if [ -f "$AFS_AGENT_HOME/collaborate-response-template" ]; then
+      template="$(cat "$AFS_AGENT_HOME/collaborate-response-template")"
+      escaped_answer="$(printf '%s' "$delegated_answer" | sed 's/[\\/&]/\\&/g')"
+      printf '%s\n' "$template" | sed "s/__PEER_ANSWER__/$escaped_answer/g"
+    elif [ -f "$AFS_AGENT_HOME/collaborate-response" ]; then
+      cat "$AFS_AGENT_HOME/collaborate-response"
+    else
+      printf 'COLLABORATE_REPLY\t%s collaborated\tnone\tnone\n' "$AFS_AGENT_ID"
+    fi
   elif [ "$_line" = "TASK" ]; then
     IFS= read -r requester
     IFS= read -r reply_target
@@ -978,6 +1016,423 @@ fn broad_ask_broadcasts_to_registered_agents_and_reports_relevant_references() {
             .expect("recipes agent should receive broadcast")
             .contains("find my last blood tests from 2025"),
         "silent agent should still receive the Broadcast Request"
+    );
+
+    stop_daemon(&mut daemon);
+}
+
+#[test]
+fn broadcast_relevant_agents_collaborate_and_use_consulted_reply_in_final_synthesis() {
+    let afs_home = unique_afs_home("ask-collab-criterion2");
+    let recipes_dir = unique_afs_home("ask-collab-recipes");
+    let workouts_dir = unique_afs_home("ask-collab-workouts");
+    let pi_runtime = fake_pi_runtime("ask-collab-runtime");
+    let socket_path = supervisor_socket(&afs_home);
+    std::fs::create_dir_all(&recipes_dir).expect("test should create recipes managed directory");
+    std::fs::create_dir_all(&workouts_dir).expect("test should create workouts managed directory");
+    let recipes_dir = recipes_dir
+        .canonicalize()
+        .expect("recipes directory should canonicalize");
+    let workouts_dir = workouts_dir
+        .canonicalize()
+        .expect("workouts directory should canonicalize");
+    let mut daemon =
+        start_daemon_with_pi_runtime_and_broadcast_timeout(&afs_home, &pi_runtime, 200);
+
+    assert!(
+        wait_until(Duration::from_secs(2), || socket_path
+            .metadata()
+            .map(|metadata| metadata.file_type().is_socket())
+            .unwrap_or(false)),
+        "daemon should create the Supervisor Socket before install connects"
+    );
+
+    let recipes_install = install_managed_dir(&afs_home, &recipes_dir);
+    assert!(
+        recipes_install.status.success(),
+        "recipes afs install should succeed"
+    );
+    let workouts_install = install_managed_dir(&afs_home, &workouts_dir);
+    assert!(
+        workouts_install.status.success(),
+        "workouts afs install should succeed"
+    );
+
+    let recipes_identity = std::fs::read_to_string(recipes_dir.join(".afs/identity"))
+        .expect("recipes identity exists");
+    let workouts_identity = std::fs::read_to_string(workouts_dir.join(".afs/identity"))
+        .expect("workouts identity exists");
+
+    std::fs::write(
+        recipes_dir.join(".afs/broadcast-response"),
+        "strong\trecipes touch food and fitness\trecipes thinks the answer involves workouts\t\n",
+    )
+    .expect("test should configure recipes broadcast response");
+    std::fs::write(
+        workouts_dir.join(".afs/broadcast-response"),
+        "strong\tworkouts indexes training plans\tworkouts has the daily routine\t\n",
+    )
+    .expect("test should configure workouts broadcast response");
+
+    std::fs::write(
+        recipes_dir.join(".afs/collaborate-delegate-target"),
+        workouts_identity.trim(),
+    )
+    .expect("test should configure recipes delegate target");
+    std::fs::write(
+        recipes_dir.join(".afs/collaborate-response-template"),
+        "COLLABORATE_REPLY\trecipes incorporated peer note: __PEER_ANSWER__\tnone\tnone\n",
+    )
+    .expect("test should configure recipes collaborate template");
+
+    std::fs::write(
+        workouts_dir.join(".afs/task-response"),
+        "workouts says check workouts/run.md",
+    )
+    .expect("test should configure workouts task reply");
+
+    let ask = afs_ask(&afs_home, "where are my recent fitness records?");
+
+    assert!(
+        ask.status.success(),
+        "afs ask should succeed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&ask.stdout),
+        String::from_utf8_lossy(&ask.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&ask.stdout);
+    assert!(
+        stdout.contains("recipes thinks the answer involves workouts"),
+        "broadcast answers block should include recipes reply\nstdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("workouts has the daily routine"),
+        "broadcast answers block should include workouts reply\nstdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("collaboration:"),
+        "ask output should include the collaboration block\nstdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("recipes incorporated peer note: workouts says check workouts/run.md"),
+        "consulter's refined answer must contain the consultee's reply text\nstdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains(recipes_identity.trim()),
+        "participating_agents should list recipes\nstdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains(workouts_identity.trim()),
+        "participating_agents should list workouts\nstdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("changed_files: none"),
+        "no files were modified in this scenario\nstdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("history_entries: none"),
+        "no history entries were created in this scenario\nstdout:\n{stdout}"
+    );
+    assert!(
+        recipes_dir.join(".afs/collaborate-received").is_file(),
+        "recipes agent should have received a COLLABORATE message"
+    );
+    let delegated_log =
+        std::fs::read_to_string(recipes_dir.join(".afs/collaborate-delegated-reply"))
+            .expect("recipes agent should have received the delegated reply envelope");
+    assert!(
+        delegated_log.contains("answer=workouts says check workouts/run.md"),
+        "supervisor must deliver the consultee's reply back to the consulter\nlog:\n{delegated_log}"
+    );
+
+    stop_daemon(&mut daemon);
+}
+
+#[test]
+fn broadcast_collaboration_delegations_record_change_reports_in_history() {
+    let afs_home = unique_afs_home("ask-collab-changes");
+    let source_dir = unique_afs_home("ask-collab-changes-source");
+    let peer_dir = unique_afs_home("ask-collab-changes-peer");
+    let pi_runtime = fake_pi_runtime("ask-collab-changes-runtime");
+    let socket_path = supervisor_socket(&afs_home);
+    std::fs::create_dir_all(&source_dir).expect("test should create source managed directory");
+    std::fs::create_dir_all(&peer_dir).expect("test should create peer managed directory");
+    let peer_file = peer_dir.join("handoff.md");
+    std::fs::write(&peer_file, "before\n").expect("test should create peer file");
+    let source_dir = source_dir
+        .canonicalize()
+        .expect("source directory should canonicalize");
+    let peer_dir = peer_dir
+        .canonicalize()
+        .expect("peer directory should canonicalize");
+    let peer_file = peer_file
+        .canonicalize()
+        .expect("peer file should canonicalize");
+    let mut daemon =
+        start_daemon_with_pi_runtime_and_broadcast_timeout(&afs_home, &pi_runtime, 200);
+
+    assert!(
+        wait_until(Duration::from_secs(2), || socket_path
+            .metadata()
+            .map(|metadata| metadata.file_type().is_socket())
+            .unwrap_or(false)),
+        "daemon should create the Supervisor Socket before install connects"
+    );
+
+    let source_install = install_managed_dir(&afs_home, &source_dir);
+    assert!(
+        source_install.status.success(),
+        "source afs install should succeed"
+    );
+    let peer_install = install_managed_dir(&afs_home, &peer_dir);
+    assert!(
+        peer_install.status.success(),
+        "peer afs install should succeed"
+    );
+    let peer_identity =
+        std::fs::read_to_string(peer_dir.join(".afs/identity")).expect("peer identity exists");
+
+    std::fs::write(
+        source_dir.join(".afs/broadcast-response"),
+        "strong\tsource owns coordination\tsource thinks peer should update handoff\t\n",
+    )
+    .expect("test should configure source broadcast response");
+    std::fs::write(
+        peer_dir.join(".afs/broadcast-response"),
+        "possible\tpeer holds the handoff file\tpeer can update its handoff\t\n",
+    )
+    .expect("test should configure peer broadcast response");
+
+    std::fs::write(
+        source_dir.join(".afs/collaborate-delegate-target"),
+        peer_identity.trim(),
+    )
+    .expect("test should configure source delegate target");
+    std::fs::write(
+        source_dir.join(".afs/collaborate-response-template"),
+        "COLLABORATE_REPLY\tsource asked peer to update handoff\tnone\tnone\n",
+    )
+    .expect("test should configure source collaborate template");
+
+    std::fs::write(peer_dir.join(".afs/task-write-file"), "handoff.md")
+        .expect("test should configure peer write path");
+    std::fs::write(
+        peer_dir.join(".afs/task-write-content"),
+        "after collaboration",
+    )
+    .expect("test should configure peer write content");
+    std::fs::write(peer_dir.join(".afs/task-response"), "peer wrote handoff.md")
+        .expect("test should configure peer task response");
+
+    let ask = afs_ask(&afs_home, "coordinate the next handoff");
+
+    assert!(
+        ask.status.success(),
+        "afs ask should succeed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&ask.stdout),
+        String::from_utf8_lossy(&ask.stderr)
+    );
+    assert_eq!(String::from_utf8_lossy(&ask.stderr), "");
+    assert_eq!(
+        std::fs::read_to_string(&peer_file).expect("peer file should be readable"),
+        "after collaboration\n",
+        "consulted task should modify the peer Managed Subtree"
+    );
+    let stdout = String::from_utf8_lossy(&ask.stdout);
+    assert!(
+        stdout.contains("changed_files: handoff.md"),
+        "afs ask should aggregate files changed by collaboration delegations\nstdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("history_entries: history-"),
+        "afs ask should report the resulting Agent Change History Entry\nstdout:\n{stdout}"
+    );
+    assert!(
+        wait_until(Duration::from_secs(3), || {
+            let history = afs_history(&afs_home, &peer_dir);
+            let history_stdout = String::from_utf8_lossy(&history.stdout);
+            history.status.success()
+                && history_stdout.contains("type=agent")
+                && history_stdout.contains("summary=Agent change: handoff.md")
+        }),
+        "consulted file modification should be recorded as an Agent Change"
+    );
+
+    stop_daemon(&mut daemon);
+}
+
+#[test]
+fn broadcast_collaboration_bounds_hung_consultee_with_per_call_timeout() {
+    let afs_home = unique_afs_home("ask-collab-hung");
+    let source_dir = unique_afs_home("ask-collab-hung-source");
+    let peer_dir = unique_afs_home("ask-collab-hung-peer");
+    let pi_runtime = fake_pi_runtime("ask-collab-hung-runtime");
+    let socket_path = supervisor_socket(&afs_home);
+    std::fs::create_dir_all(&source_dir).expect("test should create source managed directory");
+    std::fs::create_dir_all(&peer_dir).expect("test should create peer managed directory");
+    let source_dir = source_dir
+        .canonicalize()
+        .expect("source directory should canonicalize");
+    let peer_dir = peer_dir
+        .canonicalize()
+        .expect("peer directory should canonicalize");
+    let mut daemon =
+        start_daemon_with_pi_runtime_and_broadcast_timeout(&afs_home, &pi_runtime, 100);
+
+    assert!(
+        wait_until(Duration::from_secs(2), || socket_path
+            .metadata()
+            .map(|metadata| metadata.file_type().is_socket())
+            .unwrap_or(false)),
+        "daemon should create the Supervisor Socket before install connects"
+    );
+
+    let source_install = install_managed_dir(&afs_home, &source_dir);
+    assert!(
+        source_install.status.success(),
+        "source afs install should succeed"
+    );
+    let peer_install = install_managed_dir(&afs_home, &peer_dir);
+    assert!(
+        peer_install.status.success(),
+        "peer afs install should succeed"
+    );
+    let peer_identity =
+        std::fs::read_to_string(peer_dir.join(".afs/identity")).expect("peer identity exists");
+
+    std::fs::write(
+        source_dir.join(".afs/broadcast-response"),
+        "strong\tsource is relevant\tsource will delegate to peer\t\n",
+    )
+    .expect("test should configure source broadcast response");
+    std::fs::write(
+        peer_dir.join(".afs/broadcast-response"),
+        "strong\tpeer is relevant\tpeer has data\t\n",
+    )
+    .expect("test should configure peer broadcast response");
+
+    std::fs::write(
+        source_dir.join(".afs/collaborate-delegate-target"),
+        peer_identity.trim(),
+    )
+    .expect("test should configure source delegate target");
+    // Peer hangs for far longer than the per-call deadline (100ms broadcast timeout).
+    std::fs::write(peer_dir.join(".afs/task-delay-seconds"), "3")
+        .expect("test should configure peer task delay");
+
+    let started = Instant::now();
+    let ask = afs_ask(&afs_home, "broad question that triggers collaboration");
+    let elapsed = started.elapsed();
+
+    assert!(
+        ask.status.success(),
+        "afs ask should still succeed when a consultee hangs\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&ask.stdout),
+        String::from_utf8_lossy(&ask.stderr)
+    );
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "afs ask must return well before the 3s consultee delay; took {elapsed:?}"
+    );
+    let stdout = String::from_utf8_lossy(&ask.stdout);
+    assert!(
+        stdout.contains("progress: collaboration delegation timeout"),
+        "ask output should report the per-call delegation timeout\nstdout:\n{stdout}"
+    );
+
+    stop_daemon(&mut daemon);
+}
+
+#[test]
+fn broadcast_with_single_relevant_reply_skips_collaboration_phase() {
+    let afs_home = unique_afs_home("ask-collab-skip");
+    let lone_dir = unique_afs_home("ask-collab-skip-lone");
+    let silent_dir = unique_afs_home("ask-collab-skip-silent");
+    let pi_runtime = fake_pi_runtime("ask-collab-skip-runtime");
+    let socket_path = supervisor_socket(&afs_home);
+    std::fs::create_dir_all(&lone_dir).expect("test should create lone managed directory");
+    std::fs::create_dir_all(&silent_dir).expect("test should create silent managed directory");
+    let lone_dir = lone_dir
+        .canonicalize()
+        .expect("lone directory should canonicalize");
+    let silent_dir = silent_dir
+        .canonicalize()
+        .expect("silent directory should canonicalize");
+    let mut daemon =
+        start_daemon_with_pi_runtime_and_broadcast_timeout(&afs_home, &pi_runtime, 200);
+
+    assert!(
+        wait_until(Duration::from_secs(2), || socket_path
+            .metadata()
+            .map(|metadata| metadata.file_type().is_socket())
+            .unwrap_or(false)),
+        "daemon should create the Supervisor Socket before install connects"
+    );
+
+    let lone_install = install_managed_dir(&afs_home, &lone_dir);
+    assert!(
+        lone_install.status.success(),
+        "lone afs install should succeed"
+    );
+    let silent_install = install_managed_dir(&afs_home, &silent_dir);
+    assert!(
+        silent_install.status.success(),
+        "silent afs install should succeed"
+    );
+    let silent_identity =
+        std::fs::read_to_string(silent_dir.join(".afs/identity")).expect("silent identity exists");
+
+    std::fs::write(
+        lone_dir.join(".afs/broadcast-response"),
+        "strong\tlone is the only relevant agent\tlone has the answer\t\n",
+    )
+    .expect("test should configure lone broadcast response");
+    // silent_dir gets a non-possible/strong reply so parse_broadcast_reply discards it,
+    // leaving exactly one relevant reply for the supervisor to consider.
+    std::fs::write(
+        silent_dir.join(".afs/broadcast-response"),
+        "none\tnot relevant\t\t\n",
+    )
+    .expect("test should configure silent non-relevant response");
+
+    // If collaboration ran on lone, this delegate target would be exercised.
+    std::fs::write(
+        lone_dir.join(".afs/collaborate-delegate-target"),
+        silent_identity.trim(),
+    )
+    .expect("test should configure lone delegate target");
+
+    let ask = afs_ask(&afs_home, "find the relevant context");
+
+    assert!(
+        ask.status.success(),
+        "afs ask should succeed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&ask.stdout),
+        String::from_utf8_lossy(&ask.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&ask.stdout);
+    assert!(
+        stdout.contains("lone has the answer"),
+        "broadcast answer from the lone relevant agent should appear\nstdout:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("collaboration:"),
+        "single-relevant broadcast must not emit a collaboration block\nstdout:\n{stdout}"
+    );
+    assert!(
+        !lone_dir.join(".afs/collaborate-received").exists(),
+        "lone agent must not receive COLLABORATE when no peer is relevant"
+    );
+    assert!(
+        !silent_dir.join(".afs/collaborate-received").exists(),
+        "silent agent must not receive COLLABORATE"
+    );
+    assert!(
+        stdout.contains("changed_files: none"),
+        "no files should be reported changed when collaboration is skipped\nstdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("history_entries: none"),
+        "no history entries when collaboration is skipped\nstdout:\n{stdout}"
     );
 
     stop_daemon(&mut daemon);
