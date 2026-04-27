@@ -3695,6 +3695,100 @@ fn direct_ask_warns_when_startup_reconciliation_is_running() {
 }
 
 #[test]
+fn live_edit_during_startup_reconciliation_is_recorded_as_external_change() {
+    let afs_home = unique_afs_home("reconciliation-live-edit");
+    let managed_dir = unique_afs_home("reconciliation-live-edit-managed");
+    let pi_runtime = fake_pi_runtime("reconciliation-live-edit-runtime");
+    let socket_path = supervisor_socket(&afs_home);
+    std::fs::create_dir_all(&managed_dir).expect("test should create managed directory");
+    std::fs::write(managed_dir.join("baseline.txt"), "before\n")
+        .expect("test should create baseline file");
+    let managed_dir = managed_dir
+        .canonicalize()
+        .expect("managed directory should canonicalize");
+    let mut daemon = start_daemon_with_pi_runtime(&afs_home, &pi_runtime);
+    await_socket(&socket_path);
+
+    let install = install_managed_dir(&afs_home, &managed_dir);
+    assert!(install.status.success(), "afs install should succeed");
+
+    stop_daemon(&mut daemon);
+
+    std::fs::write(managed_dir.join("offline.txt"), "changed while stopped\n")
+        .expect("test should create offline change");
+
+    let mut restarted_daemon = start_daemon_with_reconciliation_delay(&afs_home, &pi_runtime, 1000);
+    await_socket(&socket_path);
+    await_index_token(&afs_home, "reconciliation=running", Duration::from_secs(2));
+
+    std::fs::write(managed_dir.join("live.txt"), "changed after restart\n")
+        .expect("test should create live edit during reconciliation");
+
+    assert!(
+        wait_until(Duration::from_secs(5), || {
+            let history = afs_history(&afs_home, &managed_dir);
+            if !history.status.success() {
+                return false;
+            }
+            let stdout = String::from_utf8_lossy(&history.stdout);
+            stdout.contains("type=external")
+                && stdout.contains("summary=External change: live.txt")
+                && stdout.contains("type=reconciliation")
+                && stdout.contains("summary=Startup reconciliation: offline.txt")
+        }),
+        "live edit during startup reconciliation should remain an External Change"
+    );
+
+    stop_daemon(&mut restarted_daemon);
+}
+
+#[test]
+fn remove_cancels_pending_startup_reconciliation_without_recreating_agent_home() {
+    let afs_home = unique_afs_home("reconciliation-remove");
+    let managed_dir = unique_afs_home("reconciliation-remove-managed");
+    let pi_runtime = fake_pi_runtime("reconciliation-remove-runtime");
+    let socket_path = supervisor_socket(&afs_home);
+    std::fs::create_dir_all(&managed_dir).expect("test should create managed directory");
+    std::fs::write(managed_dir.join("baseline.txt"), "before\n")
+        .expect("test should create baseline file");
+    let managed_dir = managed_dir
+        .canonicalize()
+        .expect("managed directory should canonicalize");
+    let agent_home = managed_dir.join(".afs");
+    let mut daemon = start_daemon_with_pi_runtime(&afs_home, &pi_runtime);
+    await_socket(&socket_path);
+
+    let install = install_managed_dir(&afs_home, &managed_dir);
+    assert!(install.status.success(), "afs install should succeed");
+
+    stop_daemon(&mut daemon);
+
+    std::fs::write(managed_dir.join("offline.txt"), "changed while stopped\n")
+        .expect("test should create offline change");
+
+    let mut restarted_daemon = start_daemon_with_reconciliation_delay(&afs_home, &pi_runtime, 1000);
+    await_socket(&socket_path);
+    await_index_token(&afs_home, "reconciliation=running", Duration::from_secs(2));
+
+    let remove = remove_managed_dir_with_flags(&afs_home, &managed_dir, &["--discard-history"]);
+    assert!(
+        remove.status.success(),
+        "afs remove --discard-history should succeed while reconciliation is running\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&remove.stdout),
+        String::from_utf8_lossy(&remove.stderr)
+    );
+
+    std::thread::sleep(Duration::from_millis(1200));
+
+    assert!(
+        !agent_home.exists(),
+        "cancelled reconciliation must not recreate the removed Agent Home"
+    );
+
+    stop_daemon(&mut restarted_daemon);
+}
+
+#[test]
 fn history_lists_newest_entries_first() {
     let afs_home = unique_afs_home("history-newest-first");
     let managed_dir = unique_afs_home("managed-newest-first");
