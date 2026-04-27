@@ -88,6 +88,31 @@ source-grounded coverage map.
 
 ## Quick Start
 
+### Prerequisite: the Pi runtime
+
+AFS is a control plane around an external "Pi" agent runtime that talks to
+the underlying provider (Claude or OpenAI). Pi is **not vendored in this
+repository** (intentionally — see PRD #1). Every command that talks to a
+provider, including `afs login`, shells out to it.
+
+Before running any of the steps below, make a `pi` executable available.
+Either put one on `$PATH`, or point AFS at it explicitly:
+
+```sh
+export AFS_PI_RUNTIME=/path/to/pi
+```
+
+If neither is set, `afs login` and `afs daemon` will fail with:
+
+```text
+AFS agent runtime not found: pi (set AFS_PI_RUNTIME)
+```
+
+See [Agent Runtime Protocol](#agent-runtime-protocol) for the stdio RPC
+contract Pi must implement.
+
+### Build, log in, and run
+
 Build AFS:
 
 ```sh
@@ -107,14 +132,6 @@ writes `$AFS_HOME/config.json` on success.
 Start the supervisor in one terminal:
 
 ```sh
-cargo run -- daemon
-```
-
-By default AFS starts a `pi` executable as the external agent runtime. To use a
-specific runtime command:
-
-```sh
-export AFS_PI_RUNTIME=/path/to/pi
 cargo run -- daemon
 ```
 
