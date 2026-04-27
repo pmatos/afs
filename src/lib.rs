@@ -2878,11 +2878,15 @@ pub mod supervisor {
         })?;
         let runtime = pi_runtime_command();
         let mut command = Command::new(&runtime);
+        let runtime_provider = config
+            .runtime_provider_id
+            .as_deref()
+            .unwrap_or(config.provider.as_cli_str());
         command
             .arg("--mode")
             .arg("rpc")
             .arg("--provider")
-            .arg(config.provider.as_cli_str());
+            .arg(runtime_provider);
         if let Some(model) = config.model.as_deref() {
             command.arg("--model").arg(model);
         }
@@ -4556,7 +4560,7 @@ pub mod login {
             })?
             .wait()?;
 
-        verify_auth(&home_dir, provider, status.success())?;
+        let runtime_provider_id = verify_auth(&home_dir, provider, status.success())?;
 
         let afs_home = supervisor::home()?;
         let config = Config {
@@ -4564,6 +4568,7 @@ pub mod login {
             model: None,
             auth_method: AuthMethod::Oauth,
             api_key_env: None,
+            runtime_provider_id: Some(runtime_provider_id),
         };
         config.save(&afs_home)?;
 
@@ -4590,7 +4595,12 @@ pub mod login {
         home_dir: &std::path::Path,
         provider: Provider,
         exit_ok: bool,
-    ) -> Result<(), Error> {
+    ) -> Result<String, Error> {
+        if !exit_ok {
+            return Err(Error::VerificationFailed(
+                "authentication did not complete; please try again".to_string(),
+            ));
+        }
         let auth_path = home_dir.join(".pi").join("agent").join("auth.json");
         let body = std::fs::read_to_string(&auth_path).map_err(|error| match error.kind() {
             io::ErrorKind::NotFound => Error::VerificationFailed(
@@ -4601,22 +4611,16 @@ pub mod login {
         let value: serde_json::Value = serde_json::from_str(&body).map_err(|_| {
             Error::VerificationFailed("authentication store is corrupted".to_string())
         })?;
-        let entry = value.get(provider.auth_json_key()).ok_or_else(|| {
+        let matched = provider.auth_json_keys().iter().find_map(|key| {
+            value
+                .get(*key)
+                .and_then(|entry| entry.get("type").map(|_| *key))
+        });
+        matched.map(str::to_string).ok_or_else(|| {
             Error::VerificationFailed(
                 "authentication did not complete; please try again".to_string(),
             )
-        })?;
-        if entry.get("type").is_none() {
-            return Err(Error::VerificationFailed(
-                "authentication did not complete; please try again".to_string(),
-            ));
-        }
-        if !exit_ok {
-            return Err(Error::VerificationFailed(
-                "authentication did not complete; please try again".to_string(),
-            ));
-        }
-        Ok(())
+        })
     }
 }
 
@@ -4650,10 +4654,10 @@ pub mod config {
             }
         }
 
-        pub fn auth_json_key(&self) -> &'static str {
+        pub fn auth_json_keys(&self) -> &'static [&'static str] {
             match self {
-                Provider::Claude => "anthropic",
-                Provider::Openai => "openai",
+                Provider::Claude => &["anthropic"],
+                Provider::Openai => &["openai", "openai-codex"],
             }
         }
 
@@ -4674,6 +4678,8 @@ pub mod config {
         pub auth_method: AuthMethod,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub api_key_env: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub runtime_provider_id: Option<String>,
     }
 
     impl Config {

@@ -60,6 +60,7 @@ fn fake_pi_login_runtime(test_name: &str, succeed: bool, provider: &str) -> std:
     let auth_key = match provider {
         "claude" => "anthropic",
         "openai" => "openai",
+        "openai-codex" => "openai-codex",
         other => panic!("fake login runtime does not support provider {other}"),
     };
     let script = if succeed {
@@ -4205,6 +4206,61 @@ fn install_with_config_without_model_omits_model_flag() {
 }
 
 #[test]
+fn install_forwards_runtime_provider_id_to_pi() {
+    let afs_home = unique_afs_home("install-runtime-provider-id");
+    let pi_runtime = fake_pi_runtime("install-runtime-provider-id-runtime");
+
+    write_config(
+        &afs_home,
+        r#"{"provider":"openai","auth_method":"oauth","runtime_provider_id":"openai-codex"}"#,
+    );
+
+    let mut daemon = start_daemon_with_pi_runtime(&afs_home, &pi_runtime);
+    assert!(
+        wait_until(Duration::from_secs(2), || supervisor_socket(&afs_home)
+            .metadata()
+            .map(|metadata| metadata.file_type().is_socket())
+            .unwrap_or(false)),
+        "afs daemon should create a Unix supervisor socket"
+    );
+
+    let managed_dir = unique_afs_home("install-runtime-provider-id-target");
+    std::fs::create_dir_all(&managed_dir).expect("test should create target directory");
+
+    let output = install_managed_dir(&afs_home, &managed_dir);
+    assert!(
+        output.status.success(),
+        "afs install should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let managed_dir_canonical = managed_dir
+        .canonicalize()
+        .expect("canonicalize managed dir");
+    let spawn_observed = managed_dir_canonical.join(".afs").join("spawn-observed");
+    assert!(
+        wait_until(Duration::from_secs(2), || std::fs::read_to_string(
+            &spawn_observed
+        )
+        .map(|body| body.contains("done=1"))
+        .unwrap_or(false)),
+        "fake agent runtime should record its spawn observations"
+    );
+    let observed =
+        std::fs::read_to_string(&spawn_observed).expect("test should read spawn observations");
+    assert!(
+        observed.contains("arg=--provider") && observed.contains("arg=openai-codex"),
+        "runtime should receive --provider openai-codex when runtime_provider_id is set. got:\n{observed}"
+    );
+    assert!(
+        !observed.contains("arg=openai\n"),
+        "runtime should not receive bare --provider openai when runtime_provider_id overrides it. got:\n{observed}"
+    );
+
+    stop_daemon(&mut daemon);
+}
+
+#[test]
 fn install_with_api_key_config_forwards_named_env_var_to_runtime() {
     let afs_home = unique_afs_home("install-api-key");
     let runtime_dir = unique_afs_home("install-api-key-runtime");
@@ -4318,8 +4374,44 @@ fn login_writes_config_after_runtime_populates_auth_json() {
         "config should record oauth auth_method. got: {config_body}"
     );
     assert!(
+        config_body.contains("\"runtime_provider_id\": \"anthropic\""),
+        "config should record matched Pi auth.json key. got: {config_body}"
+    );
+    assert!(
         !config_body.contains("\"model\""),
         "login should not pin a model. got: {config_body}"
+    );
+}
+
+#[test]
+fn login_openai_accepts_codex_oauth_auth_key() {
+    let afs_home = unique_afs_home("login-openai-codex");
+    let home_dir = unique_afs_home("login-openai-codex-home");
+    std::fs::create_dir_all(&home_dir).expect("test should create home dir");
+    let pi_runtime = fake_pi_login_runtime("login-openai-codex-runtime", true, "openai-codex");
+
+    let output = run_afs_login(
+        &home_dir,
+        &afs_home,
+        &pi_runtime,
+        &["--provider", "openai"],
+        true,
+    );
+    assert!(
+        output.status.success(),
+        "afs login --provider openai should accept openai-codex auth.json key. stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let config_body = std::fs::read_to_string(afs_home.join("config.json"))
+        .expect("config.json should exist after login");
+    assert!(
+        config_body.contains("\"provider\": \"openai\""),
+        "config should record user-facing provider as openai. got: {config_body}"
+    );
+    assert!(
+        config_body.contains("\"runtime_provider_id\": \"openai-codex\""),
+        "config should record matched Pi auth.json key. got: {config_body}"
     );
 }
 
