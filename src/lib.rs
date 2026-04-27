@@ -28,6 +28,7 @@ pub mod supervisor {
     const INDEX_FINGERPRINT_BYTES: usize = 256;
     const INDEX_SETTLED_PATH_CAP: usize = 1024;
     const INDEX_WARM_DELAY_ENV: &str = "AFS_INDEX_WARM_DELAY_MS";
+    const RECONCILIATION_DELAY_ENV: &str = "AFS_RECONCILIATION_DELAY_MS";
 
     pub fn run_foreground() -> io::Result<()> {
         let home = home()?;
@@ -100,6 +101,8 @@ pub mod supervisor {
         task_queue: Arc<AgentTaskQueue>,
         monitor: Option<DirectoryMonitor>,
         index: Arc<Mutex<DirectoryIndex>>,
+        reconciliation: Arc<Mutex<ReconciliationState>>,
+        reconciliation_task: Option<ReconciliationTask>,
     }
 
     struct AgentRuntimeIo {
@@ -115,6 +118,7 @@ pub mod supervisor {
         runtime: Arc<Mutex<AgentRuntimeIo>>,
         task_queue: Arc<AgentTaskQueue>,
         index: Arc<Mutex<DirectoryIndex>>,
+        reconciliation: Arc<Mutex<ReconciliationState>>,
     }
 
     struct AgentTaskQueue {
@@ -126,6 +130,12 @@ pub mod supervisor {
         next_ticket: usize,
         serving_ticket: usize,
         cancelled_tickets: BTreeSet<usize>,
+        active: bool,
+    }
+
+    struct AgentQueueStatus {
+        active: bool,
+        queued: usize,
     }
 
     struct QueuedAgentTask {
@@ -145,6 +155,11 @@ pub mod supervisor {
 
     struct DirectoryMonitor {
         stop: mpsc::Sender<()>,
+        handle: thread::JoinHandle<()>,
+    }
+
+    struct ReconciliationTask {
+        cancel: Arc<AtomicBool>,
         handle: thread::JoinHandle<()>,
     }
 
@@ -224,6 +239,7 @@ pub mod supervisor {
                     next_ticket: 0,
                     serving_ticket: 0,
                     cancelled_tickets: BTreeSet::new(),
+                    active: false,
                 }),
                 ready: Condvar::new(),
             }
@@ -259,11 +275,17 @@ pub mod supervisor {
             })
         }
 
-        fn queue_depth(&self) -> usize {
+        fn status(&self) -> AgentQueueStatus {
             let Ok(state) = self.state.lock() else {
-                return 0;
+                return AgentQueueStatus {
+                    active: false,
+                    queued: 0,
+                };
             };
-            Self::queue_depth_locked(&state)
+            AgentQueueStatus {
+                active: state.active,
+                queued: Self::queue_depth_locked(&state),
+            }
         }
 
         fn queue_depth_locked(state: &AgentTaskQueueState) -> usize {
@@ -300,6 +322,7 @@ pub mod supervisor {
                     .wait(state)
                     .map_err(|_| io::Error::other("agent task queue lock poisoned"))?;
             }
+            state.active = true;
             let queue_depth = AgentTaskQueue::queue_depth_locked(&state);
             drop(state);
 
@@ -336,6 +359,7 @@ pub mod supervisor {
     impl Drop for AgentTaskPermit {
         fn drop(&mut self) {
             if let Ok(mut state) = self.queue.state.lock() {
+                state.active = false;
                 state.serving_ticket += 1;
                 AgentTaskQueue::advance_cancelled_locked(&mut state);
                 self.queue.ready.notify_all();
@@ -352,6 +376,7 @@ pub mod supervisor {
                 runtime: self.runtime.clone(),
                 task_queue: self.task_queue.clone(),
                 index: self.index.clone(),
+                reconciliation: self.reconciliation.clone(),
             }
         }
     }
@@ -593,11 +618,13 @@ pub mod supervisor {
                         }
                     };
                     let index_state = snapshot_index_state(&agent.index);
+                    let reconciliation_state = snapshot_reconciliation_state(&agent.reconciliation);
                     let body = format_delegated_supervisor_response(
                         &outcome,
                         &requested_path,
                         &agent.identity,
                         &index_state,
+                        &reconciliation_state,
                     );
                     return response.write_body(&body);
                 }
@@ -653,20 +680,28 @@ pub mod supervisor {
                     }
                 };
                 let index_state = snapshot_index_state(&agent.index);
+                let reconciliation_state = snapshot_reconciliation_state(&agent.reconciliation);
                 let body = format_delegated_delegator_response(
                     &delegator_answer,
                     &reply,
                     &requested_path,
                     &agent.identity,
                     &index_state,
+                    &reconciliation_state,
                 );
                 return response.write_body(&body);
             }
 
             drop(turn);
             let index_state = snapshot_index_state(&agent.index);
-            let body =
-                format_direct_ask_response(&answer, &requested_path, &agent.identity, &index_state);
+            let reconciliation_state = snapshot_reconciliation_state(&agent.reconciliation);
+            let body = format_direct_ask_response(
+                &answer,
+                &requested_path,
+                &agent.identity,
+                &index_state,
+                &reconciliation_state,
+            );
             response.write_body(&body)
         }
 
@@ -808,7 +843,12 @@ pub mod supervisor {
                 .iter()
                 .any(|agent| agent.managed_dir == managed_dir)
             {
-                self.start_registered_agent(managed_dir.clone(), agent_home, identity.trim())?;
+                self.start_registered_agent(
+                    managed_dir.clone(),
+                    agent_home,
+                    identity.trim(),
+                    ReconciliationState::Idle,
+                )?;
                 self.write_registry()?;
             }
 
@@ -1035,11 +1075,14 @@ pub mod supervisor {
                     None => "running",
                 };
                 let index_token = format_index_token(&agent.index);
+                let reconciliation_token = format_reconciliation_token(&agent.reconciliation);
+                let queue_status = agent.task_queue.status();
                 status.push_str(&format!(
-                    "{}\tagent={}\truntime=pi-rpc-stdio\thealth={health}\tindex={index_token}\treconciliation=idle\tqueue={}\n",
+                    "{}\tagent={}\truntime=pi-rpc-stdio\thealth={health}\tindex={index_token}\treconciliation={reconciliation_token}\tactive={}\tqueue={}\n",
                     agent.managed_dir.display(),
                     agent.identity,
-                    agent.task_queue.queue_depth()
+                    queue_status.active,
+                    queue_status.queued
                 ));
             }
             Ok(status)
@@ -1409,14 +1452,28 @@ pub mod supervisor {
                     }
                 }
 
-                record_startup_reconciliation(&managed_dir, &agent_home)?;
                 rebuilt.push_str(&identity);
                 rebuilt.push('\t');
                 rebuilt.push_str(&managed_dir.to_string_lossy());
                 rebuilt.push('\t');
                 rebuilt.push_str(&agent_home.to_string_lossy());
                 rebuilt.push('\n');
-                self.start_registered_agent(managed_dir, agent_home, &identity)?;
+                let reconciliation_files =
+                    startup_reconciliation_files(&managed_dir, &agent_home, SystemTime::now())?;
+                let agent_index = self.start_registered_agent(
+                    managed_dir.clone(),
+                    agent_home.clone(),
+                    &identity,
+                    ReconciliationState::Running,
+                )?;
+                let reconciliation = self.agents[agent_index].reconciliation.clone();
+                self.agents[agent_index].reconciliation_task =
+                    Some(spawn_startup_reconciliation_task(
+                        managed_dir,
+                        agent_home,
+                        reconciliation,
+                        reconciliation_files,
+                    ));
             }
 
             if registry_changed {
@@ -1431,7 +1488,8 @@ pub mod supervisor {
             managed_dir: PathBuf,
             agent_home: PathBuf,
             identity: &str,
-        ) -> io::Result<()> {
+            reconciliation_state: ReconciliationState,
+        ) -> io::Result<usize> {
             let mut process = start_directory_agent_process(&managed_dir, &agent_home, identity)?;
             let stdin = process
                 .stdin
@@ -1442,6 +1500,7 @@ pub mod supervisor {
                 .take()
                 .ok_or_else(|| io::Error::other("AFS agent runtime stdout is unavailable"))?;
             let index = Arc::new(Mutex::new(DirectoryIndex::new()));
+            let reconciliation = Arc::new(Mutex::new(reconciliation_state));
             let monitor =
                 start_directory_monitor(managed_dir.clone(), agent_home.clone(), index.clone())?;
             spawn_warm_task(managed_dir.clone(), agent_home.clone(), index.clone());
@@ -1454,18 +1513,28 @@ pub mod supervisor {
                 task_queue: Arc::new(AgentTaskQueue::new()),
                 monitor: Some(monitor),
                 index,
+                reconciliation: reconciliation.clone(),
+                reconciliation_task: None,
             });
-            Ok(())
+            Ok(self.agents.len() - 1)
         }
     }
 
     impl RegisteredAgent {
         fn stop(mut self) -> io::Result<()> {
             self.stop_monitor()?;
+            self.stop_reconciliation()?;
             if self.process.try_wait()?.is_none() {
                 self.process.kill()?;
             }
             let _ = self.process.wait()?;
+            Ok(())
+        }
+
+        fn stop_reconciliation(&mut self) -> io::Result<()> {
+            if let Some(task) = self.reconciliation_task.take() {
+                task.cancel_and_join()?;
+            }
             Ok(())
         }
 
@@ -1567,6 +1636,15 @@ pub mod supervisor {
         }
     }
 
+    impl ReconciliationTask {
+        fn cancel_and_join(self) -> io::Result<()> {
+            self.cancel.store(true, Ordering::Relaxed);
+            self.handle
+                .join()
+                .map_err(|_| io::Error::other("startup reconciliation thread panicked"))
+        }
+    }
+
     struct BroadcastReply {
         agent_identity: String,
         managed_dir: PathBuf,
@@ -1615,6 +1693,14 @@ pub mod supervisor {
     struct RecordedChange {
         history_entry: String,
         files: Vec<String>,
+    }
+
+    #[derive(Clone, Debug)]
+    enum ReconciliationState {
+        Idle,
+        Running,
+        Complete { changed_files: usize },
+        Error,
     }
 
     #[derive(Clone, Debug)]
@@ -1870,8 +1956,66 @@ pub mod supervisor {
         });
     }
 
+    fn spawn_startup_reconciliation_task(
+        managed_dir: PathBuf,
+        agent_home: PathBuf,
+        reconciliation: Arc<Mutex<ReconciliationState>>,
+        reconciliation_files: Vec<String>,
+    ) -> ReconciliationTask {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let thread_cancel = cancel.clone();
+        let handle = thread::spawn(move || {
+            if thread_cancel.load(Ordering::Relaxed) {
+                return;
+            }
+            let state = match record_startup_reconciliation(
+                &managed_dir,
+                &agent_home,
+                &reconciliation_files,
+            ) {
+                Ok(Some(change)) => ReconciliationState::Complete {
+                    changed_files: change.files.len(),
+                },
+                Ok(None) => ReconciliationState::Complete { changed_files: 0 },
+                Err(_) => ReconciliationState::Error,
+            };
+            if let Some(delay) = reconciliation_delay()
+                && !sleep_unless_cancelled(delay, &thread_cancel)
+            {
+                return;
+            }
+            if thread_cancel.load(Ordering::Relaxed) {
+                return;
+            }
+            if let Ok(mut guard) = reconciliation.lock() {
+                *guard = state;
+            }
+        });
+        ReconciliationTask { cancel, handle }
+    }
+
+    fn sleep_unless_cancelled(delay: Duration, cancel: &AtomicBool) -> bool {
+        let deadline = Instant::now() + delay;
+        while Instant::now() < deadline {
+            if cancel.load(Ordering::Relaxed) {
+                return false;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            thread::sleep(remaining.min(Duration::from_millis(20)));
+        }
+        !cancel.load(Ordering::Relaxed)
+    }
+
     fn warm_delay_per_file() -> Option<Duration> {
         std::env::var(INDEX_WARM_DELAY_ENV)
+            .ok()
+            .and_then(|raw| raw.parse::<u64>().ok())
+            .filter(|ms| *ms > 0)
+            .map(Duration::from_millis)
+    }
+
+    fn reconciliation_delay() -> Option<Duration> {
+        std::env::var(RECONCILIATION_DELAY_ENV)
             .ok()
             .and_then(|raw| raw.parse::<u64>().ok())
             .filter(|ms| *ms > 0)
@@ -2015,6 +2159,15 @@ pub mod supervisor {
         }
     }
 
+    fn snapshot_reconciliation_state(
+        reconciliation: &Arc<Mutex<ReconciliationState>>,
+    ) -> ReconciliationState {
+        match reconciliation.lock() {
+            Ok(guard) => guard.clone(),
+            Err(_) => ReconciliationState::Error,
+        }
+    }
+
     fn format_index_token(index: &Arc<Mutex<DirectoryIndex>>) -> String {
         let snapshot = match index.lock() {
             Ok(guard) => guard.snapshot_state(),
@@ -2035,8 +2188,23 @@ pub mod supervisor {
             } => format!("warming(scanned={scanned}/total={total})"),
             IndexState::Ready { files, failed: 0 } => format!("ready(files={files})"),
             IndexState::Ready { files, failed } => {
-                format!("ready(files={files}, failed={failed})")
+                format!("incomplete(files={files}, failed={failed})")
             }
+        }
+    }
+
+    fn format_reconciliation_token(reconciliation: &Arc<Mutex<ReconciliationState>>) -> String {
+        let snapshot = match reconciliation.lock() {
+            Ok(guard) => guard.clone(),
+            Err(_) => return "error".to_string(),
+        };
+        match snapshot {
+            ReconciliationState::Idle => "idle".to_string(),
+            ReconciliationState::Running => "running".to_string(),
+            ReconciliationState::Complete { changed_files } => {
+                format!("complete(changed_files={changed_files})")
+            }
+            ReconciliationState::Error => "error".to_string(),
         }
     }
 
@@ -2045,6 +2213,7 @@ pub mod supervisor {
         requested_path: &Path,
         agent_identity: &str,
         index_state: &IndexState,
+        reconciliation_state: &ReconciliationState,
     ) -> String {
         let mut response = String::new();
         response.push_str(answer);
@@ -2054,6 +2223,7 @@ pub mod supervisor {
         response.push_str("references:\n");
         response.push_str(&format!("- {}\n", requested_path.display()));
         push_index_caveat(&mut response, index_state);
+        push_reconciliation_caveat(&mut response, reconciliation_state);
         response.push_str(&format!("participating_agents: {agent_identity}\n"));
         response.push_str("changed_files: none\n");
         response
@@ -2073,11 +2243,30 @@ pub mod supervisor {
         }
     }
 
+    fn push_reconciliation_caveat(
+        response: &mut String,
+        reconciliation_state: &ReconciliationState,
+    ) {
+        match reconciliation_state {
+            ReconciliationState::Running => {
+                response.push_str(
+                    "caveat: startup reconciliation is running; answer may be incomplete\n",
+                );
+            }
+            ReconciliationState::Error => {
+                response
+                    .push_str("caveat: startup reconciliation failed; answer may be incomplete\n");
+            }
+            ReconciliationState::Idle | ReconciliationState::Complete { .. } => {}
+        }
+    }
+
     fn format_delegated_supervisor_response(
         outcome: &DelegationOutcome,
         requested_path: &Path,
         requester_identity: &str,
         index_state: &IndexState,
+        reconciliation_state: &ReconciliationState,
     ) -> String {
         let mut response = String::new();
         if let [reply] = outcome.replies.as_slice() {
@@ -2095,6 +2284,7 @@ pub mod supervisor {
         response.push_str("references:\n");
         response.push_str(&format!("- {}\n", requested_path.display()));
         push_index_caveat(&mut response, index_state);
+        push_reconciliation_caveat(&mut response, reconciliation_state);
         let participating_agents = participating_agents(
             requester_identity,
             outcome
@@ -2130,6 +2320,7 @@ pub mod supervisor {
         requested_path: &Path,
         requester_identity: &str,
         index_state: &IndexState,
+        reconciliation_state: &ReconciliationState,
     ) -> String {
         let mut response = String::new();
         response.push_str(answer);
@@ -2139,6 +2330,7 @@ pub mod supervisor {
         response.push_str("references:\n");
         response.push_str(&format!("- {}\n", requested_path.display()));
         push_index_caveat(&mut response, index_state);
+        push_reconciliation_caveat(&mut response, reconciliation_state);
         response.push_str(&format!(
             "participating_agents: {}, {}\n",
             requester_identity, reply.agent_identity
@@ -3014,16 +3206,80 @@ pub mod supervisor {
         record_snapshot_delta(managed_dir, agent_home, "agent", "Agent change")
     }
 
-    fn record_startup_reconciliation(managed_dir: &Path, agent_home: &Path) -> io::Result<()> {
+    fn record_startup_reconciliation(
+        managed_dir: &Path,
+        agent_home: &Path,
+        reconciliation_files: &[String],
+    ) -> io::Result<Option<RecordedChange>> {
         std::fs::create_dir_all(agent_home.join(HISTORY_DIR))?;
         ensure_history_baseline_commit(managed_dir, agent_home)?;
-        record_snapshot_delta(
+        let _guard = history_lock()
+            .lock()
+            .map_err(|_| io::Error::other("history lock poisoned"))?;
+        let git_dir = history_repo_dir(agent_home);
+        if reconciliation_files.is_empty() {
+            return Ok(None);
+        }
+        git_stage_paths(&git_dir, managed_dir, reconciliation_files)?;
+        let changed_files = git_staged_changes_vs_head(&git_dir)?;
+        if changed_files.is_empty() {
+            return Ok(None);
+        }
+
+        let entry_id = history_entry_id();
+        let summary = history_summary("Startup reconciliation", &changed_files);
+        git_commit_index(
+            &git_dir,
             managed_dir,
-            agent_home,
-            "reconciliation",
-            "Startup reconciliation",
-        )
-        .map(|_| ())
+            &GitCommitRequest {
+                entry_id: &entry_id,
+                kind: "reconciliation",
+                summary: &summary,
+                files: &changed_files,
+                undoable: true,
+                undoes: None,
+                origin: None,
+            },
+        )?;
+        Ok(Some(RecordedChange {
+            history_entry: entry_id,
+            files: changed_files,
+        }))
+    }
+
+    fn startup_reconciliation_files(
+        managed_dir: &Path,
+        agent_home: &Path,
+        cutoff: SystemTime,
+    ) -> io::Result<Vec<String>> {
+        std::fs::create_dir_all(agent_home.join(HISTORY_DIR))?;
+        ensure_history_baseline_commit(managed_dir, agent_home)?;
+        let _guard = history_lock()
+            .lock()
+            .map_err(|_| io::Error::other("history lock poisoned"))?;
+        let git_dir = history_repo_dir(agent_home);
+        let nested = nested_managed_relative_paths(managed_dir)?;
+        git_stage_work_tree(&git_dir, managed_dir, &nested)?;
+        let changed_files = git_staged_changes_vs_head(&git_dir)?;
+        let reconciliation_files = changed_files
+            .into_iter()
+            .filter(|file| changed_file_existed_before(managed_dir, file, cutoff))
+            .collect::<Vec<_>>();
+        git_reset_index(&git_dir, managed_dir)?;
+        Ok(reconciliation_files)
+    }
+
+    fn changed_file_existed_before(managed_dir: &Path, relative: &str, cutoff: SystemTime) -> bool {
+        let path = managed_dir.join(relative);
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return true,
+            Err(_) => return false,
+        };
+        metadata
+            .modified()
+            .map(|mtime| mtime <= cutoff)
+            .unwrap_or(false)
     }
 
     fn record_snapshot_delta(
@@ -3832,6 +4088,44 @@ pub mod supervisor {
         if !output.status.success() {
             return Err(io::Error::other(format!(
                 "git add failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        Ok(())
+    }
+
+    fn git_stage_paths(git_dir: &Path, work_tree: &Path, paths: &[String]) -> io::Result<()> {
+        if paths.is_empty() {
+            return Ok(());
+        }
+        let mut add = git_base_command(git_dir, Some(work_tree));
+        add.arg("add").arg("--all").arg("--force").arg("--");
+        for path in paths {
+            add.arg(path);
+        }
+        let output = add.stdout(Stdio::null()).stderr(Stdio::piped()).output()?;
+        if !output.status.success() {
+            return Err(io::Error::other(format!(
+                "git add failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+        Ok(())
+    }
+
+    fn git_reset_index(git_dir: &Path, work_tree: &Path) -> io::Result<()> {
+        let output = git_base_command(git_dir, Some(work_tree))
+            .arg("reset")
+            .arg("--quiet")
+            .arg("HEAD")
+            .arg("--")
+            .arg(".")
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .output()?;
+        if !output.status.success() {
+            return Err(io::Error::other(format!(
+                "git reset failed: {}",
                 String::from_utf8_lossy(&output.stderr).trim()
             )));
         }
