@@ -125,10 +125,11 @@ pub mod supervisor {
     struct AgentTaskQueueState {
         next_ticket: usize,
         serving_ticket: usize,
+        cancelled_tickets: BTreeSet<usize>,
     }
 
     struct QueuedAgentTask {
-        queue: Arc<AgentTaskQueue>,
+        queue: Option<Arc<AgentTaskQueue>>,
         ticket: usize,
         was_queued: bool,
     }
@@ -222,6 +223,7 @@ pub mod supervisor {
                 state: Mutex::new(AgentTaskQueueState {
                     next_ticket: 0,
                     serving_ticket: 0,
+                    cancelled_tickets: BTreeSet::new(),
                 }),
                 ready: Condvar::new(),
             }
@@ -251,7 +253,7 @@ pub mod supervisor {
             }
 
             Ok(QueuedAgentTask {
-                queue: self.clone(),
+                queue: Some(self.clone()),
                 ticket,
                 was_queued,
             })
@@ -268,23 +270,32 @@ pub mod supervisor {
             state
                 .next_ticket
                 .saturating_sub(state.serving_ticket.saturating_add(1))
+                .saturating_sub(state.cancelled_tickets.len())
+        }
+
+        fn advance_cancelled_locked(state: &mut AgentTaskQueueState) {
+            while state.cancelled_tickets.remove(&state.serving_ticket) {
+                state.serving_ticket += 1;
+            }
         }
     }
 
     impl QueuedAgentTask {
         fn start(
-            self,
+            mut self,
             agent_identity: &str,
             response: &mut ResponseStream<'_>,
         ) -> io::Result<AgentTaskPermit> {
-            let mut state = self
+            let queue = self
                 .queue
+                .take()
+                .ok_or_else(|| io::Error::other("queued task already consumed"))?;
+            let mut state = queue
                 .state
                 .lock()
                 .map_err(|_| io::Error::other("agent task queue lock poisoned"))?;
             while state.serving_ticket != self.ticket {
-                state = self
-                    .queue
+                state = queue
                     .ready
                     .wait(state)
                     .map_err(|_| io::Error::other("agent task queue lock poisoned"))?;
@@ -293,7 +304,7 @@ pub mod supervisor {
             drop(state);
 
             let permit = AgentTaskPermit {
-                queue: self.queue.clone(),
+                queue: queue.clone(),
             };
             if self.was_queued {
                 let _ = response.emit_progress(format_args!(
@@ -303,12 +314,30 @@ pub mod supervisor {
 
             Ok(permit)
         }
+
+        fn was_queued(&self) -> bool {
+            self.was_queued
+        }
+    }
+
+    impl Drop for QueuedAgentTask {
+        fn drop(&mut self) {
+            let Some(queue) = &self.queue else {
+                return;
+            };
+            if let Ok(mut state) = queue.state.lock() {
+                state.cancelled_tickets.insert(self.ticket);
+                AgentTaskQueue::advance_cancelled_locked(&mut state);
+                queue.ready.notify_all();
+            }
+        }
     }
 
     impl Drop for AgentTaskPermit {
         fn drop(&mut self) {
             if let Ok(mut state) = self.queue.state.lock() {
                 state.serving_ticket += 1;
+                AgentTaskQueue::advance_cancelled_locked(&mut state);
                 self.queue.ready.notify_all();
             }
         }
@@ -579,10 +608,6 @@ pub mod supervisor {
                     ));
                 }
 
-                let _multi_agent = self
-                    .multi_agent
-                    .lock()
-                    .map_err(|_| io::Error::other("supervisor multi-agent lock poisoned"))?;
                 let request = &requests[0];
                 let target = match self.delegated_target_agent(&request.target) {
                     Some(target) => target,
@@ -598,10 +623,17 @@ pub mod supervisor {
                         "error delegated target cannot be the requesting agent when reply=delegator"
                     ));
                 }
-                let reply = match self.perform_delegated_task(
+                let queued_task = target.task_queue.enqueue(&target.identity, response)?;
+                if queued_task.was_queued() {
+                    return response.emit_progress(format_args!(
+                        "error delegated target is busy for reply=delegator"
+                    ));
+                }
+                let reply = match self.perform_delegated_queued_task(
                     requester_identity.clone(),
                     target,
                     request,
+                    queued_task,
                     response,
                 ) {
                     Ok(reply) => reply,
@@ -681,23 +713,6 @@ pub mod supervisor {
             }
 
             Ok(DelegationOutcome { replies })
-        }
-
-        fn perform_delegated_task(
-            &self,
-            requester_identity: String,
-            target: AgentHandle,
-            request: &DelegateRequest,
-            response: &mut ResponseStream<'_>,
-        ) -> io::Result<TaskReply> {
-            let queued_task = target.task_queue.enqueue(&target.identity, response)?;
-            self.perform_delegated_queued_task(
-                requester_identity,
-                target,
-                request,
-                queued_task,
-                response,
-            )
         }
 
         fn perform_delegated_queued_task(

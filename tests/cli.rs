@@ -1810,6 +1810,93 @@ fn ask_rejects_self_targeted_delegator_delegation_without_deadlocking() {
 }
 
 #[test]
+fn delegator_delegation_to_busy_target_cancels_queued_ticket() {
+    let afs_home = unique_afs_home("ask-delegate-busy-target");
+    let source_dir = unique_afs_home("ask-delegate-busy-source");
+    let target_dir = unique_afs_home("ask-delegate-busy-target-dir");
+    let pi_runtime = fake_pi_runtime("ask-delegate-busy-runtime");
+    let socket_path = supervisor_socket(&afs_home);
+    std::fs::create_dir_all(&source_dir).expect("test should create source managed directory");
+    std::fs::create_dir_all(&target_dir).expect("test should create target managed directory");
+    let source_file = source_dir.join("request.md");
+    let target_file = target_dir.join("target.md");
+    std::fs::write(&source_file, "needs delegated context\n")
+        .expect("test should create source file");
+    std::fs::write(&target_file, "target context\n").expect("test should create target file");
+    let source_dir = source_dir
+        .canonicalize()
+        .expect("source directory should canonicalize");
+    let target_dir = target_dir
+        .canonicalize()
+        .expect("target directory should canonicalize");
+    let source_file = source_file
+        .canonicalize()
+        .expect("source file should canonicalize");
+    let target_file = target_file
+        .canonicalize()
+        .expect("target file should canonicalize");
+    let mut daemon = start_daemon_with_pi_runtime(&afs_home, &pi_runtime);
+    await_socket(&socket_path);
+
+    assert!(
+        install_managed_dir(&afs_home, &source_dir).status.success(),
+        "source install should succeed"
+    );
+    assert!(
+        install_managed_dir(&afs_home, &target_dir).status.success(),
+        "target install should succeed"
+    );
+    std::fs::write(
+        source_dir.join(".afs/delegate-target"),
+        target_dir.display().to_string(),
+    )
+    .expect("test should configure target delegation");
+    std::fs::write(source_dir.join(".afs/delegate-reply-target"), "delegator")
+        .expect("test should configure delegator reply target");
+    let delay_path = target_dir.join(".afs/ask-delay-seconds");
+    std::fs::write(&delay_path, "2").expect("test should configure target ask delay");
+
+    let blocking_prompt = format!("hold {}", target_file.display());
+    let blocking = spawn_afs_ask_streamed(&afs_home, &blocking_prompt);
+    assert!(
+        wait_until(Duration::from_secs(1), || {
+            std::fs::read_to_string(target_dir.join(".afs/ask-received"))
+                .map(|log| log.contains(&format!("prompt={blocking_prompt}")))
+                .unwrap_or(false)
+        }),
+        "target ask should hold the target agent before delegation starts"
+    );
+    std::fs::remove_file(&delay_path).expect("later target asks should not inherit the delay");
+
+    let delegating =
+        spawn_afs_ask_streamed(&afs_home, &format!("coordinate {}", source_file.display()));
+    let delegating_lines = delegating.finish_with_timeout(Duration::from_secs(1));
+    assert!(
+        delegating_lines
+            .iter()
+            .any(|(_, line)| line == "progress: error delegated target is busy for reply=delegator"),
+        "busy delegator-targeted delegation should fail explicitly; lines:\n{delegating_lines:#?}"
+    );
+    assert!(
+        !target_dir.join(".afs/task-received").exists(),
+        "busy target should not receive a queued TASK that cannot run immediately"
+    );
+
+    let _ = blocking.finish();
+    let after_busy =
+        spawn_afs_ask_streamed(&afs_home, &format!("after busy {}", target_file.display()));
+    let after_busy_lines = after_busy.finish_with_timeout(Duration::from_secs(1));
+    assert!(
+        after_busy_lines
+            .iter()
+            .any(|(_, line)| line.contains("answered about")),
+        "dropping the unstarted busy-target ticket must not wedge the target queue; lines:\n{after_busy_lines:#?}"
+    );
+
+    stop_daemon(&mut daemon);
+}
+
+#[test]
 fn delegated_task_change_report_includes_agent_history_entry() {
     let afs_home = unique_afs_home("ask-delegate-change-report");
     let source_dir = unique_afs_home("ask-change-source");
