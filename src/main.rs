@@ -38,24 +38,29 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
-        Some("ask") => match afs::client::ask(&args.collect::<Vec<_>>().join(" ")) {
-            Ok(response) => {
-                print!("{response}");
-                ExitCode::SUCCESS
+        Some("ask") => {
+            let prompt = args.collect::<Vec<_>>().join(" ");
+            let mut stdout = io::stdout().lock();
+            let result = afs::client::stream_ask(&prompt, |line| {
+                let _ = writeln!(stdout, "{line}");
+                let _ = stdout.flush();
+            });
+            match result {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(afs::client::Error::DaemonNotRunning) => {
+                    eprintln!("daemon is not running");
+                    ExitCode::FAILURE
+                }
+                Err(afs::client::Error::Supervisor(message)) => {
+                    eprintln!("{message}");
+                    ExitCode::FAILURE
+                }
+                Err(afs::client::Error::Io(error)) => {
+                    eprintln!("{error}");
+                    ExitCode::FAILURE
+                }
             }
-            Err(afs::client::Error::DaemonNotRunning) => {
-                eprintln!("daemon is not running");
-                ExitCode::FAILURE
-            }
-            Err(afs::client::Error::Supervisor(message)) => {
-                eprintln!("{message}");
-                ExitCode::FAILURE
-            }
-            Err(afs::client::Error::Io(error)) => {
-                eprintln!("{error}");
-                ExitCode::FAILURE
-            }
-        },
+        }
         Some("install") => {
             let Some(path) = args.next() else {
                 eprintln!("usage: afs install <path>");

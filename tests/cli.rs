@@ -202,6 +202,9 @@ while IFS= read -r _line; do
       printf 'path=%s\n' "$asked_path"
       printf 'prompt=%s\n' "$asked_prompt"
     } >> "$AFS_AGENT_HOME/ask-received"
+    if [ -f "$AFS_AGENT_HOME/ask-delay-seconds" ]; then
+      sleep "$(cat "$AFS_AGENT_HOME/ask-delay-seconds")"
+    fi
     if [ -f "$AFS_AGENT_HOME/delegate-target" ]; then
       delegate_target="$(cat "$AFS_AGENT_HOME/delegate-target")"
       delegate_reply_target="supervisor"
@@ -354,6 +357,42 @@ fn afs_ask(afs_home: &std::path::Path, prompt: &str) -> std::process::Output {
         .arg(prompt)
         .output()
         .expect("afs ask should run")
+}
+
+fn afs_ask_streamed(afs_home: &std::path::Path, prompt: &str) -> Vec<(Duration, String)> {
+    use std::io::{BufRead, BufReader};
+
+    let start = Instant::now();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_afs"))
+        .env("AFS_HOME", afs_home)
+        .arg("ask")
+        .arg(prompt)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("afs ask should spawn");
+
+    let stdout = child.stdout.take().expect("afs ask should expose stdout");
+    let reader = std::thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        let mut lines = Vec::new();
+        let mut buffer = String::new();
+        loop {
+            buffer.clear();
+            let n = reader
+                .read_line(&mut buffer)
+                .expect("stdout read should succeed");
+            if n == 0 {
+                break;
+            }
+            let trimmed = buffer.trim_end_matches(['\n', '\r']).to_string();
+            lines.push((start.elapsed(), trimmed));
+        }
+        lines
+    });
+
+    let _ = child.wait().expect("afs ask should exit");
+    reader.join().expect("stdout reader thread should join")
 }
 
 fn install_managed_dir(
@@ -2675,7 +2714,7 @@ fn removing_top_level_managed_directory_that_no_longer_exists_unregisters_cleanl
         "top-level afs install should succeed"
     );
 
-    std::fs::remove_dir_all(&managed_dir).expect("test should wipe the managed directory off disk");
+    remove_dir_all_retry(&managed_dir);
 
     let remove = remove_managed_dir(&afs_home, &managed_dir);
     assert!(
@@ -4904,6 +4943,307 @@ fn rediscovery_finds_move_to_sibling_ancestor_directory() {
     );
 
     stop_daemon(&mut restarted_daemon);
+}
+
+#[test]
+fn broadcast_progress_streams_before_final_body() {
+    let afs_home = unique_afs_home("ask-stream-broadcast");
+    let fast_dir = unique_afs_home("ask-stream-broadcast-fast");
+    let slow_dir = unique_afs_home("ask-stream-broadcast-slow");
+    let pi_runtime = fake_pi_runtime("ask-stream-broadcast-runtime");
+    let socket_path = supervisor_socket(&afs_home);
+    std::fs::create_dir_all(&fast_dir).expect("test should create fast managed directory");
+    std::fs::create_dir_all(&slow_dir).expect("test should create slow managed directory");
+    let fast_file = fast_dir.join("notes.md");
+    std::fs::write(&fast_file, "fast context\n").expect("test should create fast reference");
+    let fast_dir = fast_dir
+        .canonicalize()
+        .expect("fast directory should canonicalize");
+    let slow_dir = slow_dir
+        .canonicalize()
+        .expect("slow directory should canonicalize");
+    let fast_file = fast_file
+        .canonicalize()
+        .expect("fast reference should canonicalize");
+
+    let mut daemon =
+        start_daemon_with_pi_runtime_and_broadcast_timeout(&afs_home, &pi_runtime, 3000);
+    await_socket(&socket_path);
+
+    let fast_install = install_managed_dir(&afs_home, &fast_dir);
+    assert!(fast_install.status.success(), "fast install should succeed");
+    let slow_install = install_managed_dir(&afs_home, &slow_dir);
+    assert!(slow_install.status.success(), "slow install should succeed");
+
+    let fast_identity =
+        std::fs::read_to_string(fast_dir.join(".afs/identity")).expect("fast identity exists");
+    std::fs::write(
+        fast_dir.join(".afs/broadcast-response"),
+        format!("possible\tfast reply\tfast wins\t{}\n", fast_file.display()),
+    )
+    .expect("test should configure fast broadcast response");
+    std::fs::write(slow_dir.join(".afs/broadcast-delay-seconds"), "2")
+        .expect("test should configure slow broadcast delay");
+    std::fs::write(
+        slow_dir.join(".afs/broadcast-response"),
+        "strong\tslow reply\tslow wins\t\n",
+    )
+    .expect("test should configure slow broadcast response");
+
+    let lines = afs_ask_streamed(&afs_home, "what context is available");
+
+    let waiting = lines
+        .iter()
+        .find(|(_, line)| line.starts_with("progress: broadcast waiting"))
+        .expect("streamed output should include broadcast waiting progress");
+    let fast_reply = lines
+        .iter()
+        .find(|(_, line)| {
+            line.starts_with(&format!(
+                "progress: broadcast reply agent={}",
+                fast_identity.trim()
+            ))
+        })
+        .expect("streamed output should include the fast agent's broadcast reply progress");
+    let body = lines
+        .iter()
+        .find(|(_, line)| line == "answers:")
+        .expect("streamed output should include the answers body line");
+
+    assert!(
+        waiting.0 + Duration::from_millis(1500) <= body.0,
+        "broadcast waiting progress must be flushed before the slow agent replies; \
+         waiting at {:?}, body at {:?}",
+        waiting.0,
+        body.0,
+    );
+    assert!(
+        fast_reply.0 < body.0,
+        "fast broadcast reply progress must be flushed before the body; \
+         fast_reply at {:?}, body at {:?}",
+        fast_reply.0,
+        body.0,
+    );
+
+    stop_daemon(&mut daemon);
+}
+
+#[test]
+fn delegated_supervisor_progress_streams_before_final_body() {
+    let afs_home = unique_afs_home("ask-stream-delegate");
+    let source_dir = unique_afs_home("ask-stream-delegate-source");
+    let target_dir = unique_afs_home("ask-stream-delegate-target");
+    let pi_runtime = fake_pi_runtime("ask-stream-delegate-runtime");
+    let socket_path = supervisor_socket(&afs_home);
+    std::fs::create_dir_all(&source_dir).expect("test should create source dir");
+    std::fs::create_dir_all(&target_dir).expect("test should create target dir");
+    let source_file = source_dir.join("request.md");
+    std::fs::write(&source_file, "needs delegated work\n").expect("test should create source file");
+    let source_dir = source_dir
+        .canonicalize()
+        .expect("source dir should canonicalize");
+    let target_dir = target_dir
+        .canonicalize()
+        .expect("target dir should canonicalize");
+    let source_file = source_file
+        .canonicalize()
+        .expect("source file should canonicalize");
+
+    let mut daemon = start_daemon_with_pi_runtime(&afs_home, &pi_runtime);
+    await_socket(&socket_path);
+
+    assert!(
+        install_managed_dir(&afs_home, &source_dir).status.success(),
+        "source install should succeed"
+    );
+    assert!(
+        install_managed_dir(&afs_home, &target_dir).status.success(),
+        "target install should succeed"
+    );
+
+    let source_identity =
+        std::fs::read_to_string(source_dir.join(".afs/identity")).expect("source identity exists");
+    let target_identity =
+        std::fs::read_to_string(target_dir.join(".afs/identity")).expect("target identity exists");
+
+    std::fs::write(
+        source_dir.join(".afs/delegate-target"),
+        target_dir.display().to_string(),
+    )
+    .expect("test should configure delegated target");
+    std::fs::write(source_dir.join(".afs/delegate-reply-target"), "supervisor")
+        .expect("test should configure reply target");
+    std::fs::write(source_dir.join(".afs/delegate-prompt"), "first task")
+        .expect("test should configure first delegated prompt");
+    std::fs::write(
+        source_dir.join(".afs/delegate-second-prompt"),
+        "second task",
+    )
+    .expect("test should configure second delegated prompt");
+    std::fs::write(target_dir.join(".afs/task-delay-seconds"), "1")
+        .expect("test should configure target task delay");
+
+    let lines = afs_ask_streamed(&afs_home, &format!("coordinate {}", source_file.display()));
+
+    let route_delegated = lines
+        .iter()
+        .find(|(_, line)| {
+            line == &format!("progress: route=delegated from={}", source_identity.trim())
+        })
+        .expect("streamed output should include route=delegated progress");
+    let queued = lines
+        .iter()
+        .find(|(_, line)| {
+            line == &format!(
+                "progress: queued task agent={} queue=1",
+                target_identity.trim()
+            )
+        })
+        .expect("streamed output should include queued task progress");
+    let delegating = lines
+        .iter()
+        .find(|(_, line)| {
+            line == &format!(
+                "progress: delegating from={} to={} reply=supervisor",
+                source_identity.trim(),
+                target_identity.trim()
+            )
+        })
+        .expect("streamed output should include delegating progress");
+    let task_complete = lines
+        .iter()
+        .find(|(_, line)| {
+            line == &format!(
+                "progress: task complete agent={} changed_files=0",
+                target_identity.trim()
+            )
+        })
+        .expect("streamed output should include task complete progress");
+    let started = lines
+        .iter()
+        .find(|(_, line)| {
+            line == &format!(
+                "progress: started task agent={} queue=0",
+                target_identity.trim()
+            )
+        })
+        .expect("streamed output should include started task progress");
+    let body = lines
+        .iter()
+        .find(|(_, line)| line.starts_with("references:"))
+        .expect("streamed output should include the references body line");
+
+    assert!(
+        route_delegated.0 < body.0
+            && queued.0 < body.0
+            && delegating.0 < body.0
+            && started.0 < body.0
+            && task_complete.0 < body.0,
+        "all delegation progress lines must arrive before the final body in line order"
+    );
+    assert!(
+        delegating.0 + Duration::from_millis(500) <= body.0,
+        "delegating progress must be flushed at least 500ms before the body; \
+         delegating at {:?}, body at {:?}",
+        delegating.0,
+        body.0,
+    );
+    assert!(
+        queued.0 + Duration::from_millis(500) <= body.0,
+        "queued task progress must be flushed at least 500ms before the body; \
+         queued at {:?}, body at {:?}",
+        queued.0,
+        body.0,
+    );
+
+    stop_daemon(&mut daemon);
+}
+
+#[test]
+fn direct_ask_streams_route_direct_progress() {
+    let afs_home = unique_afs_home("ask-stream-direct");
+    let managed_dir = unique_afs_home("ask-stream-direct-managed");
+    let pi_runtime = fake_pi_runtime("ask-stream-direct-runtime");
+    let socket_path = supervisor_socket(&afs_home);
+    std::fs::create_dir_all(&managed_dir).expect("test should create managed dir");
+    let managed_file = managed_dir.join("notes.md");
+    std::fs::write(&managed_file, "direct context\n").expect("test should create managed file");
+    let managed_dir = managed_dir
+        .canonicalize()
+        .expect("managed dir should canonicalize");
+    let managed_file = managed_file
+        .canonicalize()
+        .expect("managed file should canonicalize");
+
+    let mut daemon = start_daemon_with_pi_runtime(&afs_home, &pi_runtime);
+    await_socket(&socket_path);
+
+    assert!(
+        install_managed_dir(&afs_home, &managed_dir)
+            .status
+            .success(),
+        "install should succeed"
+    );
+    let identity =
+        std::fs::read_to_string(managed_dir.join(".afs/identity")).expect("identity exists");
+    std::fs::write(managed_dir.join(".afs/ask-delay-seconds"), "1")
+        .expect("test should configure ask delay");
+
+    let lines = afs_ask_streamed(&afs_home, &format!("summarize {}", managed_file.display()));
+
+    let route_direct = lines
+        .iter()
+        .find(|(_, line)| line == &format!("progress: route=direct agent={}", identity.trim()))
+        .expect("streamed output should include route=direct progress");
+    let answer = lines
+        .iter()
+        .find(|(_, line)| line.starts_with(&format!("agent {} answered about", identity.trim())))
+        .expect("streamed output should include the agent answer");
+
+    assert!(
+        route_direct.0 + Duration::from_millis(500) <= answer.0,
+        "route=direct progress must be flushed at least 500ms before the answer; \
+         route_direct at {:?}, answer at {:?}",
+        route_direct.0,
+        answer.0,
+    );
+    let any_broadcast = lines.iter().any(|(_, line)| line.contains("broadcast"));
+    assert!(
+        !any_broadcast,
+        "direct ask should not emit broadcast progress; got lines:\n{:#?}",
+        lines
+    );
+    let any_delegated = lines.iter().any(|(_, line)| line.contains("delegating"));
+    assert!(
+        !any_delegated,
+        "direct ask without delegation should not emit delegation progress; got lines:\n{:#?}",
+        lines
+    );
+
+    stop_daemon(&mut daemon);
+}
+
+fn remove_dir_all_retry(path: &std::path::Path) {
+    // The directory monitor inside the daemon races with rmdir: while the test
+    // is removing files, the monitor can still be writing AFS history entries
+    // for the same paths. Retry on ENOTEMPTY/EBUSY for a short budget rather
+    // than failing on the race window.
+    const ENOTEMPTY: i32 = 39;
+    const EBUSY: i32 = 16;
+    let deadline = Instant::now() + Duration::from_millis(2_000);
+    loop {
+        match std::fs::remove_dir_all(path) {
+            Ok(()) => return,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+            Err(error)
+                if matches!(error.raw_os_error(), Some(ENOTEMPTY) | Some(EBUSY))
+                    && Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Err(error) => panic!("test should wipe the managed directory off disk: {error:?}"),
+        }
+    }
 }
 
 fn await_socket(socket_path: &std::path::Path) {

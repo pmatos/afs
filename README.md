@@ -69,6 +69,9 @@ treating this as a complete v1.
   reply either to the supervisor or back to the delegator.
 - Delegated file changes are recorded as agent history entries and reported in
   the final answer.
+- `afs ask` streams `progress: …` lines while it works (broadcast wait,
+  per-agent broadcast replies, delegation routing, queueing, task start, and
+  per-task file-change milestones) before the existing final-answer block.
 - Filesystem monitoring records external changes while the daemon is running.
 - Startup reconciliation records changes missed while the daemon was stopped.
 - Editor-style atomic save bursts are collapsed into one meaningful external
@@ -247,6 +250,29 @@ Direct and delegated answers include:
 - changed files
 - history entries for delegated file changes
 
+While the request is in flight, `afs ask` streams `progress: …` lines so
+multi-agent conversations do not feel stalled. The supervisor emits these
+lines (each terminated by `\n`) before the final-answer block:
+
+- `progress: route=direct agent=<id>` after explicit-path resolution.
+- `progress: route=broadcast agents=<n> timeout_ms=<m>` and
+  `progress: broadcast waiting agents=<n>` while a broadcast is in flight.
+- `progress: broadcast reply agent=<id> relevance=<possible|strong|none>` per
+  parseable reply (timed-out agents emit no line).
+- `progress: route=delegated from=<id>` when the owning agent decides to
+  delegate after a direct ask.
+- `progress: queued task agent=<id> queue=<n>` when a delegated task waits
+  behind another for the same target, and
+  `progress: started task agent=<id> queue=<n>` when the queue drains.
+- `progress: delegating from=<id> to=<id> reply=<delegator|supervisor>` before
+  each delegated task runs.
+- `progress: task complete agent=<id> changed_files=<n>` after each delegated
+  task returns.
+
+The streamed body is otherwise unchanged; consumers that buffer the entire
+`afs ask` response see the same final answer plus the additional progress
+lines at the start.
+
 ### `afs history <path>`
 
 Shows history for the owning managed directory. Output is newest first:
@@ -386,6 +412,8 @@ Closed child-issue coverage:
   restarted.
 - #14: per-directory AFS ignore policy seeded from `.gitignore`, with explicit
   ask routing still honored on ignored paths.
+- #18: streamed `afs ask` progress for broadcast wait, replies, delegation,
+  queueing, task start, and per-task file-change milestones.
 - #20: top-level managed-directory remove lifecycle with optional history
   archive or discard.
 
@@ -422,10 +450,12 @@ Implemented or usable:
   `failed=N` in `afs agents` and as an honest caveat in `afs ask`. Binary
   files are tracked in AFS history and restored byte-for-byte through
   `afs undo`.
+- Streamed `afs ask` progress lines (broadcast wait, broadcast replies,
+  delegation routing, queueing, task start, per-task file-change milestones)
+  emitted before the final-answer block while the request is in flight.
 
 Missing or partial:
 
-- True streamed progress from `afs ask`: #18.
 - Concurrent per-agent FIFO task queue: #19.
 - Detailed agent lifecycle status for indexing, reconciliation, and queued work:
   #21.

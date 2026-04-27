@@ -119,15 +119,18 @@ pub mod supervisor {
         }
 
         let request = request.trim_end_matches('\n').trim_end_matches('\r');
-        let response = if let Some(payload) = request.strip_prefix("ASK\t") {
+        if let Some(payload) = request.strip_prefix("ASK\t") {
             let Some((cwd, prompt)) = payload.split_once('\t') else {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     "ASK request is missing current directory",
                 ));
             };
-            state.ask(Path::new(cwd), prompt)
-        } else if let Some(path) = request.strip_prefix("INSTALL ") {
+            let mut response = ResponseStream::new(&mut stream);
+            return state.stream_ask(Path::new(cwd), prompt, &mut response);
+        }
+
+        let response = if let Some(path) = request.strip_prefix("INSTALL ") {
             state.install(Path::new(path))
         } else if let Some(payload) = request.strip_prefix("REMOVE\t") {
             let Some((path, flag)) = payload.split_once('\t') else {
@@ -513,86 +516,165 @@ pub mod supervisor {
             )
         }
 
-        fn ask(&mut self, cwd: &Path, prompt: &str) -> io::Result<String> {
-            let Some(requested_path) = explicit_prompt_path(cwd, prompt)? else {
-                return self.broadcast_ask(prompt);
+        fn stream_ask(
+            &mut self,
+            cwd: &Path,
+            prompt: &str,
+            response: &mut ResponseStream<'_>,
+        ) -> io::Result<()> {
+            let requested_path = match explicit_prompt_path(cwd, prompt) {
+                Ok(value) => value,
+                Err(error) => {
+                    return write_err_if_unstarted(response, &error.to_string());
+                }
+            };
+            let Some(requested_path) = requested_path else {
+                return self.stream_broadcast_ask(prompt, response);
             };
             let Some(agent_index) = self.owning_agent_index(&requested_path) else {
-                return Err(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!(
-                        "path is not managed: {}. Run afs install {} or afs install a suitable parent directory.",
-                        requested_path.display(),
-                        install_suggestion_path(&requested_path).display()
-                    ),
-                ));
+                let msg = format!(
+                    "path is not managed: {}. Run afs install {} or afs install a suitable parent directory.",
+                    requested_path.display(),
+                    install_suggestion_path(&requested_path).display()
+                );
+                return write_err_if_unstarted(response, &msg);
+            };
+            self.stream_direct_ask(agent_index, requested_path, prompt, response)
+        }
+
+        fn stream_direct_ask(
+            &mut self,
+            agent_index: usize,
+            requested_path: PathBuf,
+            prompt: &str,
+            response: &mut ResponseStream<'_>,
+        ) -> io::Result<()> {
+            response.emit_progress(format_args!(
+                "route=direct agent={}",
+                self.agents[agent_index].identity
+            ))?;
+
+            let answer = match self.agents[agent_index].ask(prompt, &requested_path) {
+                Ok(answer) => answer,
+                Err(error) => {
+                    return response.emit_progress(format_args!("error {error}"));
+                }
             };
 
-            let answer = {
-                let agent = &mut self.agents[agent_index];
-                agent.ask(prompt, &requested_path)?
+            let delegate = match parse_delegate_request(&answer) {
+                Ok(value) => value,
+                Err(error) => {
+                    return response.emit_progress(format_args!("error {error}"));
+                }
             };
 
-            if let Some(request) = parse_delegate_request(&answer)? {
-                let requests = self.collect_delegate_requests(agent_index, request)?;
-                let reply_target = requests
-                    .first()
-                    .map(|request| request.reply_target)
-                    .ok_or_else(|| {
-                        io::Error::new(io::ErrorKind::InvalidInput, "delegation request is missing")
-                    })?;
+            if let Some(first_request) = delegate {
+                let requester_identity = self.agents[agent_index].identity.clone();
+                response
+                    .emit_progress(format_args!("route=delegated from={requester_identity}"))?;
+
+                let requests = match self.collect_delegate_requests(agent_index, first_request) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        return response.emit_progress(format_args!("error {error}"));
+                    }
+                };
+                let Some(reply_target) = requests.first().map(|request| request.reply_target)
+                else {
+                    return response
+                        .emit_progress(format_args!("error delegation request is missing"));
+                };
                 if requests
                     .iter()
                     .any(|request| request.reply_target != reply_target)
                 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "delegated task batch must use one reply target",
+                    return response.emit_progress(format_args!(
+                        "error delegated task batch must use one reply target"
                     ));
                 }
 
                 if reply_target == ReplyTarget::Supervisor {
-                    let outcome =
-                        self.perform_delegated_supervisor_tasks(agent_index, &requests)?;
+                    let outcome = match self.perform_delegated_supervisor_tasks(
+                        agent_index,
+                        &requests,
+                        response,
+                    ) {
+                        Ok(value) => value,
+                        Err(error) => {
+                            return response.emit_progress(format_args!("error {error}"));
+                        }
+                    };
                     let index_state = snapshot_index_state(&self.agents[agent_index].index);
-                    return Ok(format_delegated_supervisor_response(
+                    let body = format_delegated_supervisor_response(
                         &outcome,
                         &requested_path,
                         &self.agents[agent_index].identity,
                         &index_state,
-                    ));
+                    );
+                    return response.write_body(&body);
                 }
 
                 if requests.len() != 1 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "delegator reply target supports one delegated task per request",
+                    return response.emit_progress(format_args!(
+                        "error delegator reply target supports one delegated task per request"
                     ));
                 }
 
                 let request = &requests[0];
-                let reply = self.perform_delegated_task(agent_index, request)?;
-                let delegator_answer = {
-                    let agent = &mut self.agents[agent_index];
-                    agent.deliver_delegated_reply(&reply)?
+                let target_index = match self.delegated_target_agent_index(&request.target) {
+                    Some(target_index) => target_index,
+                    None => {
+                        return response.emit_progress(format_args!(
+                            "error delegated target is not managed: {}",
+                            request.target
+                        ));
+                    }
                 };
+                response.emit_progress(format_args!(
+                    "delegating from={} to={} reply=delegator",
+                    requester_identity, self.agents[target_index].identity
+                ))?;
+                let reply = match self.perform_delegated_task_at(
+                    requester_identity.clone(),
+                    target_index,
+                    request,
+                ) {
+                    Ok(reply) => reply,
+                    Err(error) => {
+                        return response.emit_progress(format_args!("error {error}"));
+                    }
+                };
+                response.emit_progress(format_args!(
+                    "task complete agent={} changed_files={}",
+                    reply.agent_identity,
+                    reply.changed_files.len()
+                ))?;
+                let delegator_answer =
+                    match self.agents[agent_index].deliver_delegated_reply(&reply) {
+                        Ok(answer) => answer,
+                        Err(error) => {
+                            return response.emit_progress(format_args!("error {error}"));
+                        }
+                    };
                 let index_state = snapshot_index_state(&self.agents[agent_index].index);
-                return Ok(format_delegated_delegator_response(
+                let body = format_delegated_delegator_response(
                     &delegator_answer,
                     &reply,
                     &requested_path,
                     &self.agents[agent_index].identity,
                     &index_state,
-                ));
+                );
+                return response.write_body(&body);
             }
 
             let index_state = snapshot_index_state(&self.agents[agent_index].index);
-            Ok(format_direct_ask_response(
+            let body = format_direct_ask_response(
                 &answer,
                 &requested_path,
                 &self.agents[agent_index].identity,
                 &index_state,
-            ))
+            );
+            response.write_body(&body)
         }
 
         fn collect_delegate_requests(
@@ -627,26 +709,11 @@ pub mod supervisor {
             Ok(requests)
         }
 
-        fn perform_delegated_task(
-            &mut self,
-            requester_index: usize,
-            request: &DelegateRequest,
-        ) -> io::Result<TaskReply> {
-            let requester_identity = self.agents[requester_index].identity.clone();
-            let Some(target_index) = self.delegated_target_agent_index(&request.target) else {
-                return Err(io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!("delegated target is not managed: {}", request.target),
-                ));
-            };
-
-            self.perform_delegated_task_at(requester_identity, target_index, request)
-        }
-
         fn perform_delegated_supervisor_tasks(
             &mut self,
             requester_index: usize,
             requests: &[DelegateRequest],
+            response: &mut ResponseStream<'_>,
         ) -> io::Result<DelegationOutcome> {
             let requester_identity = self.agents[requester_index].identity.clone();
             let mut target_indexes = Vec::new();
@@ -662,36 +729,44 @@ pub mod supervisor {
                 *target_counts.entry(target_index).or_default() += 1;
             }
 
-            let mut progress = Vec::new();
             for (target_index, count) in &target_counts {
                 if *count > 1 {
                     let queued = count - 1;
                     self.agents[*target_index].queued_tasks = queued;
-                    progress.push(format!(
-                        "progress: queued task agent={} queue={queued}",
+                    response.emit_progress(format_args!(
+                        "queued task agent={} queue={queued}",
                         self.agents[*target_index].identity
-                    ));
+                    ))?;
                 }
             }
 
             let mut replies = Vec::new();
             for (request, target_index) in requests.iter().zip(target_indexes) {
+                response.emit_progress(format_args!(
+                    "delegating from={} to={} reply=supervisor",
+                    requester_identity, self.agents[target_index].identity
+                ))?;
                 let reply = self.perform_delegated_task_at(
                     requester_identity.clone(),
                     target_index,
                     request,
                 )?;
+                response.emit_progress(format_args!(
+                    "task complete agent={} changed_files={}",
+                    self.agents[target_index].identity,
+                    reply.changed_files.len()
+                ))?;
                 replies.push(reply);
                 if self.agents[target_index].queued_tasks > 0 {
                     self.agents[target_index].queued_tasks -= 1;
-                    progress.push(format!(
-                        "progress: started task agent={} queue={}",
+                    response.emit_progress(format_args!(
+                        "started task agent={} queue={}",
                         self.agents[target_index].identity, self.agents[target_index].queued_tasks
-                    ));
+                    ))?;
                 }
             }
 
-            Ok(DelegationOutcome { replies, progress })
+            Ok(DelegationOutcome { replies })
         }
 
         fn perform_delegated_task_at(
@@ -761,24 +836,38 @@ pub mod supervisor {
             self.owning_agent_index(&target_path)
         }
 
-        fn broadcast_ask(&mut self, prompt: &str) -> io::Result<String> {
+        fn stream_broadcast_ask(
+            &mut self,
+            prompt: &str,
+            response: &mut ResponseStream<'_>,
+        ) -> io::Result<()> {
             let timeout = broadcast_reply_timeout();
-            let empty_outcome = CollaborationOutcome {
-                answers: Vec::new(),
-                progress: Vec::new(),
-            };
-            if self.agents.is_empty() {
-                return Ok(format_broadcast_ask_response(&[], &empty_outcome, timeout));
+            let n = self.agents.len();
+            response.emit_progress(format_args!(
+                "route=broadcast agents={n} timeout_ms={}",
+                timeout.as_millis()
+            ))?;
+            if n == 0 {
+                let empty = CollaborationOutcome {
+                    answers: Vec::new(),
+                };
+                return response.write_body(&format_broadcast_ask_response(&[], &empty, timeout));
             }
 
             for agent in &mut self.agents {
-                agent.send_broadcast(prompt)?;
-                set_nonblocking(&agent.stdout, true)?;
+                if let Err(error) = agent.send_broadcast(prompt) {
+                    return response.emit_progress(format_args!("error {error}"));
+                }
+                if let Err(error) = set_nonblocking(&agent.stdout, true) {
+                    return response.emit_progress(format_args!("error {error}"));
+                }
             }
 
+            response.emit_progress(format_args!("broadcast waiting agents={n}"))?;
+
             let deadline = Instant::now() + timeout;
-            let mut pending = (0..self.agents.len()).collect::<BTreeSet<_>>();
-            let mut buffers = vec![Vec::new(); self.agents.len()];
+            let mut pending = (0..n).collect::<BTreeSet<_>>();
+            let mut buffers = vec![Vec::new(); n];
             let mut indexed_replies: Vec<(usize, BroadcastReply)> = Vec::new();
 
             while !pending.is_empty() && Instant::now() < deadline {
@@ -786,13 +875,27 @@ pub mod supervisor {
                 for index in pending.iter().copied().collect::<Vec<_>>() {
                     let line = {
                         let agent = &mut self.agents[index];
-                        read_nonblocking_line(&mut agent.stdout, &mut buffers[index])?
+                        match read_nonblocking_line(&mut agent.stdout, &mut buffers[index]) {
+                            Ok(line) => line,
+                            Err(error) => {
+                                return response.emit_progress(format_args!("error {error}"));
+                            }
+                        }
                     };
 
                     if let Some(line) = line {
                         pending.remove(&index);
                         if let Some(reply) = parse_broadcast_reply(&line, &self.agents[index]) {
+                            response.emit_progress(format_args!(
+                                "broadcast reply agent={} relevance={}",
+                                reply.agent_identity, reply.relevance
+                            ))?;
                             indexed_replies.push((index, reply));
+                        } else {
+                            response.emit_progress(format_args!(
+                                "broadcast reply agent={} relevance=none",
+                                self.agents[index].identity
+                            ))?;
                         }
                         made_progress = true;
                     }
@@ -804,12 +907,13 @@ pub mod supervisor {
             }
 
             for agent in &self.agents {
-                set_nonblocking(&agent.stdout, false)?;
+                if let Err(error) = set_nonblocking(&agent.stdout, false) {
+                    return response.emit_progress(format_args!("error {error}"));
+                }
             }
 
             let mut outcome = CollaborationOutcome {
                 answers: Vec::new(),
-                progress: Vec::new(),
             };
 
             if indexed_replies.len() >= 2 {
@@ -827,7 +931,7 @@ pub mod supervisor {
                         .cloned()
                         .collect();
                     self.agents[agent_index].send_collaborate(prompt, &peers_excluding_self)?;
-                    self.run_collaboration_turn(agent_index, &mut outcome)?;
+                    self.run_collaboration_turn(agent_index, &mut outcome, response)?;
                 }
             }
 
@@ -835,13 +939,14 @@ pub mod supervisor {
                 .into_iter()
                 .map(|(_, reply)| reply)
                 .collect();
-            Ok(format_broadcast_ask_response(&replies, &outcome, timeout))
+            response.write_body(&format_broadcast_ask_response(&replies, &outcome, timeout))
         }
 
         fn run_collaboration_turn(
             &mut self,
             agent_index: usize,
             outcome: &mut CollaborationOutcome,
+            response: &mut ResponseStream<'_>,
         ) -> io::Result<()> {
             set_nonblocking(&self.agents[agent_index].stdout, true)?;
             let mut buffer: Vec<u8> = Vec::new();
@@ -867,10 +972,10 @@ pub mod supervisor {
                             Ok(reply) => reply,
                             Err(error) if error.kind() == io::ErrorKind::TimedOut => {
                                 let identity = self.agents[agent_index].identity.clone();
-                                outcome.progress.push(format!(
-                                    "progress: collaboration delegation timeout agent={identity} target={}",
+                                response.emit_progress(format_args!(
+                                    "collaboration delegation timeout agent={identity} target={}",
                                     req.target
-                                ));
+                                ))?;
                                 return Ok(());
                             }
                             Err(error) => return Err(error),
@@ -884,9 +989,9 @@ pub mod supervisor {
                                 Err(error) if error.kind() == io::ErrorKind::TimedOut => {
                                     let identity = self.agents[agent_index].identity.clone();
                                     outcome.answers.push(reply);
-                                    outcome.progress.push(format!(
-                                        "progress: collaboration timeout agent={identity}"
-                                    ));
+                                    response.emit_progress(format_args!(
+                                        "collaboration timeout agent={identity}"
+                                    ))?;
                                     return Ok(());
                                 }
                                 Err(error) => return Err(error),
@@ -924,9 +1029,8 @@ pub mod supervisor {
 
                 if Instant::now() >= deadline {
                     let identity = self.agents[agent_index].identity.clone();
-                    outcome
-                        .progress
-                        .push(format!("progress: collaboration timeout agent={identity}"));
+                    response
+                        .emit_progress(format_args!("collaboration timeout agent={identity}"))?;
                     set_nonblocking(&self.agents[agent_index].stdout, false)?;
                     return Ok(());
                 }
@@ -1231,12 +1335,10 @@ pub mod supervisor {
 
     struct DelegationOutcome {
         replies: Vec<TaskReply>,
-        progress: Vec<String>,
     }
 
     struct CollaborationOutcome {
         answers: Vec<TaskReply>,
-        progress: Vec<String>,
     }
 
     struct RecordedChange {
@@ -1719,10 +1821,6 @@ pub mod supervisor {
                 response.push_str(&format!("  {}\n", reply.answer));
             }
         }
-        for progress in &outcome.progress {
-            response.push_str(progress);
-            response.push('\n');
-        }
         response.push_str("references:\n");
         response.push_str(&format!("- {}\n", requested_path.display()));
         push_index_caveat(&mut response, index_state);
@@ -1829,10 +1927,6 @@ pub mod supervisor {
                 response.push_str(&format!("- agent={}\n", answer.agent_identity));
                 response.push_str(&format!("  {}\n", answer.answer));
             }
-        }
-        for progress in &outcome.progress {
-            response.push_str(progress);
-            response.push('\n');
         }
 
         let references = replies
@@ -2088,6 +2182,63 @@ pub mod supervisor {
             .filter(|milliseconds| *milliseconds > 0)
             .map(Duration::from_millis)
             .unwrap_or(DEFAULT_BROADCAST_REPLY_TIMEOUT)
+    }
+
+    struct ResponseStream<'a> {
+        stream: &'a mut UnixStream,
+        started: bool,
+    }
+
+    impl<'a> ResponseStream<'a> {
+        fn new(stream: &'a mut UnixStream) -> Self {
+            Self {
+                stream,
+                started: false,
+            }
+        }
+
+        fn started(&self) -> bool {
+            self.started
+        }
+
+        fn emit_progress(&mut self, args: std::fmt::Arguments<'_>) -> io::Result<()> {
+            self.ensure_started()?;
+            self.stream.write_all(b"progress: ")?;
+            self.stream.write_fmt(args)?;
+            self.stream.write_all(b"\n")?;
+            self.stream.flush()
+        }
+
+        fn write_body(&mut self, body: &str) -> io::Result<()> {
+            self.ensure_started()?;
+            self.stream.write_all(body.as_bytes())?;
+            self.stream.flush()
+        }
+
+        fn write_err(&mut self, msg: &str) -> io::Result<()> {
+            debug_assert!(
+                !self.started,
+                "ResponseStream::write_err called after OK was streamed",
+            );
+            self.stream.write_all(b"ERR\n")?;
+            writeln!(self.stream, "{msg}")
+        }
+
+        fn ensure_started(&mut self) -> io::Result<()> {
+            if !self.started {
+                self.stream.write_all(b"OK\n")?;
+                self.started = true;
+            }
+            Ok(())
+        }
+    }
+
+    fn write_err_if_unstarted(response: &mut ResponseStream<'_>, msg: &str) -> io::Result<()> {
+        if response.started() {
+            response.emit_progress(format_args!("error {msg}"))
+        } else {
+            response.write_err(msg)
+        }
     }
 
     fn read_blocking_line(stdout: &mut ChildStdout) -> io::Result<String> {
@@ -3614,7 +3765,7 @@ pub mod supervisor {
 }
 
 pub mod client {
-    use std::io::{self, Read, Write};
+    use std::io::{self, BufRead, BufReader, Read, Write};
     use std::os::unix::net::UnixStream;
     use std::path::Path;
 
@@ -3628,8 +3779,60 @@ pub mod client {
     }
 
     pub fn ask(prompt: &str) -> Result<String, Error> {
+        let mut buffer = String::new();
+        stream_ask(prompt, |line| {
+            buffer.push_str(line);
+            buffer.push('\n');
+        })?;
+        Ok(buffer)
+    }
+
+    pub fn stream_ask<F>(prompt: &str, mut on_line: F) -> Result<(), Error>
+    where
+        F: FnMut(&str),
+    {
         let cwd = std::env::current_dir().map_err(Error::Io)?;
-        send_request(&format!("ASK\t{}\t{prompt}", cwd.display()))
+        let request = format!("ASK\t{}\t{prompt}", cwd.display());
+        let stream = connect()?;
+        let mut writer = stream.try_clone().map_err(Error::Io)?;
+        writeln!(writer, "{request}").map_err(Error::Io)?;
+        writer.flush().map_err(Error::Io)?;
+        drop(writer);
+
+        let mut reader = BufReader::new(stream);
+        let mut header = String::new();
+        let read = reader.read_line(&mut header).map_err(Error::Io)?;
+        if read == 0 {
+            return Err(Error::Io(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "supervisor returned an invalid response",
+            )));
+        }
+        let header = header.trim_end_matches(['\n', '\r']);
+        match header {
+            "OK" => {
+                let mut line = String::new();
+                loop {
+                    line.clear();
+                    let n = reader.read_line(&mut line).map_err(Error::Io)?;
+                    if n == 0 {
+                        break;
+                    }
+                    let trimmed = line.trim_end_matches(['\n', '\r']);
+                    on_line(trimmed);
+                }
+                Ok(())
+            }
+            "ERR" => {
+                let mut message = String::new();
+                reader.read_to_string(&mut message).map_err(Error::Io)?;
+                Err(Error::Supervisor(message.trim_end().to_string()))
+            }
+            _ => Err(Error::Io(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "supervisor returned an invalid response",
+            ))),
+        }
     }
 
     pub fn install(path: &Path) -> Result<String, Error> {
@@ -3679,13 +3882,17 @@ pub mod client {
         ))
     }
 
-    fn send_request(request: &str) -> Result<String, Error> {
+    fn connect() -> Result<UnixStream, Error> {
         let home = supervisor::home().map_err(Error::Io)?;
         let socket_path = supervisor::socket_path(&home);
-        let mut stream = UnixStream::connect(socket_path).map_err(|error| match error.kind() {
+        UnixStream::connect(socket_path).map_err(|error| match error.kind() {
             io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused => Error::DaemonNotRunning,
             _ => Error::Io(error),
-        })?;
+        })
+    }
+
+    fn send_request(request: &str) -> Result<String, Error> {
+        let mut stream = connect()?;
 
         writeln!(stream, "{request}").map_err(Error::Io)?;
 
