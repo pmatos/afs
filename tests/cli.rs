@@ -395,6 +395,92 @@ fn afs_ask_streamed(afs_home: &std::path::Path, prompt: &str) -> Vec<(Duration, 
     reader.join().expect("stdout reader thread should join")
 }
 
+struct SpawnedAsk {
+    child: Child,
+    reader: std::thread::JoinHandle<Vec<(Duration, String)>>,
+}
+
+impl SpawnedAsk {
+    fn finish(mut self) -> Vec<(Duration, String)> {
+        let status = self.child.wait().expect("afs ask should exit");
+        let lines = self
+            .reader
+            .join()
+            .expect("stdout reader thread should join");
+        assert!(
+            status.success(),
+            "afs ask should succeed; stdout:\n{lines:#?}"
+        );
+        lines
+    }
+
+    fn finish_with_timeout(mut self, timeout: Duration) -> Vec<(Duration, String)> {
+        let start = Instant::now();
+        let mut status = None;
+        while start.elapsed() < timeout {
+            status = self
+                .child
+                .try_wait()
+                .expect("afs ask status should be readable");
+            if status.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        if status.is_none() {
+            self.child.kill().expect("hung afs ask should be killed");
+            let _ = self.child.wait().expect("killed afs ask should exit");
+        }
+
+        let lines = self
+            .reader
+            .join()
+            .expect("stdout reader thread should join");
+        let status = status.expect("afs ask should exit before timeout");
+        assert!(
+            status.success(),
+            "afs ask should succeed; stdout:\n{lines:#?}"
+        );
+        lines
+    }
+}
+
+fn spawn_afs_ask_streamed(afs_home: &std::path::Path, prompt: &str) -> SpawnedAsk {
+    use std::io::{BufRead, BufReader};
+
+    let start = Instant::now();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_afs"))
+        .env("AFS_HOME", afs_home)
+        .arg("ask")
+        .arg(prompt)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("afs ask should spawn");
+
+    let stdout = child.stdout.take().expect("afs ask should expose stdout");
+    let reader = std::thread::spawn(move || {
+        let mut reader = BufReader::new(stdout);
+        let mut lines = Vec::new();
+        let mut buffer = String::new();
+        loop {
+            buffer.clear();
+            let n = reader
+                .read_line(&mut buffer)
+                .expect("stdout read should succeed");
+            if n == 0 {
+                break;
+            }
+            let trimmed = buffer.trim_end_matches(['\n', '\r']).to_string();
+            lines.push((start.elapsed(), trimmed));
+        }
+        lines
+    });
+
+    SpawnedAsk { child, reader }
+}
+
 fn install_managed_dir(
     afs_home: &std::path::Path,
     managed_dir: &std::path::Path,
@@ -1673,6 +1759,138 @@ fn ask_allows_agent_to_delegate_direct_task_reply_back_to_delegator() {
     assert!(
         delegated_reply.contains("answer=target context for delegator"),
         "delegated reply should include the delegated task answer"
+    );
+
+    stop_daemon(&mut daemon);
+}
+
+#[test]
+fn ask_rejects_self_targeted_delegator_delegation_without_deadlocking() {
+    let afs_home = unique_afs_home("ask-delegate-self-to-delegator");
+    let managed_dir = unique_afs_home("ask-delegate-self-managed");
+    let pi_runtime = fake_pi_runtime("ask-delegate-self-runtime");
+    let socket_path = supervisor_socket(&afs_home);
+    std::fs::create_dir_all(&managed_dir).expect("test should create managed directory");
+    let source_file = managed_dir.join("request.md");
+    std::fs::write(&source_file, "needs delegated context\n")
+        .expect("test should create source file");
+    let managed_dir = managed_dir
+        .canonicalize()
+        .expect("managed directory should canonicalize");
+    let source_file = source_file
+        .canonicalize()
+        .expect("source file should canonicalize");
+    let mut daemon = start_daemon_with_pi_runtime(&afs_home, &pi_runtime);
+    await_socket(&socket_path);
+
+    let install = install_managed_dir(&afs_home, &managed_dir);
+    assert!(install.status.success(), "afs install should succeed");
+    let identity =
+        std::fs::read_to_string(managed_dir.join(".afs/identity")).expect("identity exists");
+    std::fs::write(managed_dir.join(".afs/delegate-target"), identity.trim())
+        .expect("test should configure self delegation target");
+    std::fs::write(managed_dir.join(".afs/delegate-reply-target"), "delegator")
+        .expect("test should configure delegator reply target");
+
+    let ask = spawn_afs_ask_streamed(&afs_home, &format!("coordinate {}", source_file.display()));
+    let lines = ask.finish_with_timeout(Duration::from_secs(2));
+
+    stop_daemon(&mut daemon);
+
+    assert!(
+        lines.iter().any(|(_, line)| {
+            line == "progress: error delegated target cannot be the requesting agent when reply=delegator"
+        }),
+        "self-targeted delegator delegation should fail explicitly; lines:\n{lines:#?}"
+    );
+    assert!(
+        !managed_dir.join(".afs/task-received").exists(),
+        "the supervisor should not enqueue a task that would wait behind the active turn"
+    );
+}
+
+#[test]
+fn delegator_delegation_to_busy_target_cancels_queued_ticket() {
+    let afs_home = unique_afs_home("ask-delegate-busy-target");
+    let source_dir = unique_afs_home("ask-delegate-busy-source");
+    let target_dir = unique_afs_home("ask-delegate-busy-target-dir");
+    let pi_runtime = fake_pi_runtime("ask-delegate-busy-runtime");
+    let socket_path = supervisor_socket(&afs_home);
+    std::fs::create_dir_all(&source_dir).expect("test should create source managed directory");
+    std::fs::create_dir_all(&target_dir).expect("test should create target managed directory");
+    let source_file = source_dir.join("request.md");
+    let target_file = target_dir.join("target.md");
+    std::fs::write(&source_file, "needs delegated context\n")
+        .expect("test should create source file");
+    std::fs::write(&target_file, "target context\n").expect("test should create target file");
+    let source_dir = source_dir
+        .canonicalize()
+        .expect("source directory should canonicalize");
+    let target_dir = target_dir
+        .canonicalize()
+        .expect("target directory should canonicalize");
+    let source_file = source_file
+        .canonicalize()
+        .expect("source file should canonicalize");
+    let target_file = target_file
+        .canonicalize()
+        .expect("target file should canonicalize");
+    let mut daemon = start_daemon_with_pi_runtime(&afs_home, &pi_runtime);
+    await_socket(&socket_path);
+
+    assert!(
+        install_managed_dir(&afs_home, &source_dir).status.success(),
+        "source install should succeed"
+    );
+    assert!(
+        install_managed_dir(&afs_home, &target_dir).status.success(),
+        "target install should succeed"
+    );
+    std::fs::write(
+        source_dir.join(".afs/delegate-target"),
+        target_dir.display().to_string(),
+    )
+    .expect("test should configure target delegation");
+    std::fs::write(source_dir.join(".afs/delegate-reply-target"), "delegator")
+        .expect("test should configure delegator reply target");
+    let delay_path = target_dir.join(".afs/ask-delay-seconds");
+    std::fs::write(&delay_path, "2").expect("test should configure target ask delay");
+
+    let blocking_prompt = format!("hold {}", target_file.display());
+    let blocking = spawn_afs_ask_streamed(&afs_home, &blocking_prompt);
+    assert!(
+        wait_until(Duration::from_secs(1), || {
+            std::fs::read_to_string(target_dir.join(".afs/ask-received"))
+                .map(|log| log.contains(&format!("prompt={blocking_prompt}")))
+                .unwrap_or(false)
+        }),
+        "target ask should hold the target agent before delegation starts"
+    );
+    std::fs::remove_file(&delay_path).expect("later target asks should not inherit the delay");
+
+    let delegating =
+        spawn_afs_ask_streamed(&afs_home, &format!("coordinate {}", source_file.display()));
+    let delegating_lines = delegating.finish_with_timeout(Duration::from_secs(1));
+    assert!(
+        delegating_lines
+            .iter()
+            .any(|(_, line)| line == "progress: error delegated target is busy for reply=delegator"),
+        "busy delegator-targeted delegation should fail explicitly; lines:\n{delegating_lines:#?}"
+    );
+    assert!(
+        !target_dir.join(".afs/task-received").exists(),
+        "busy target should not receive a queued TASK that cannot run immediately"
+    );
+
+    let _ = blocking.finish();
+    let after_busy =
+        spawn_afs_ask_streamed(&afs_home, &format!("after busy {}", target_file.display()));
+    let after_busy_lines = after_busy.finish_with_timeout(Duration::from_secs(1));
+    assert!(
+        after_busy_lines
+            .iter()
+            .any(|(_, line)| line.contains("answered about")),
+        "dropping the unstarted busy-target ticket must not wedge the target queue; lines:\n{after_busy_lines:#?}"
     );
 
     stop_daemon(&mut daemon);
@@ -5221,6 +5439,114 @@ fn direct_ask_streams_route_direct_progress() {
     );
 
     stop_daemon(&mut daemon);
+}
+
+#[test]
+fn concurrent_direct_asks_to_same_agent_queue_fifo_and_report_status() {
+    let afs_home = unique_afs_home("ask-concurrent-direct");
+    let managed_dir = unique_afs_home("ask-concurrent-direct-managed");
+    let pi_runtime = fake_pi_runtime("ask-concurrent-direct-runtime");
+    let socket_path = supervisor_socket(&afs_home);
+    std::fs::create_dir_all(&managed_dir).expect("test should create managed dir");
+    let managed_file = managed_dir.join("notes.md");
+    std::fs::write(&managed_file, "direct context\n").expect("test should create managed file");
+    let managed_dir = managed_dir
+        .canonicalize()
+        .expect("managed dir should canonicalize");
+    let managed_file = managed_file
+        .canonicalize()
+        .expect("managed file should canonicalize");
+
+    let mut daemon = start_daemon_with_pi_runtime(&afs_home, &pi_runtime);
+    await_socket(&socket_path);
+
+    assert!(
+        install_managed_dir(&afs_home, &managed_dir)
+            .status
+            .success(),
+        "install should succeed"
+    );
+    let identity =
+        std::fs::read_to_string(managed_dir.join(".afs/identity")).expect("identity exists");
+    let delay_path = managed_dir.join(".afs/ask-delay-seconds");
+    std::fs::write(&delay_path, "2").expect("test should configure initial ask delay");
+
+    let first_prompt = format!("first direct {}", managed_file.display());
+    let second_prompt = format!("second direct {}", managed_file.display());
+    let first = spawn_afs_ask_streamed(&afs_home, &first_prompt);
+    assert!(
+        wait_until(Duration::from_secs(1), || {
+            std::fs::read_to_string(managed_dir.join(".afs/ask-received"))
+                .map(|log| log.contains(&format!("prompt={first_prompt}")))
+                .unwrap_or(false)
+        }),
+        "first ask should reach the agent runtime before the second ask is spawned"
+    );
+    std::fs::remove_file(&delay_path).expect("second ask should not inherit the startup delay");
+
+    let second = spawn_afs_ask_streamed(&afs_home, &second_prompt);
+    let mut last_agents = String::new();
+    let saw_queue = wait_until(Duration::from_secs(3), || {
+        let agents = Command::new(env!("CARGO_BIN_EXE_afs"))
+            .env("AFS_HOME", &afs_home)
+            .arg("agents")
+            .output()
+            .expect("afs agents should run");
+        if !agents.status.success() {
+            return false;
+        }
+        last_agents = String::from_utf8_lossy(&agents.stdout).to_string();
+        last_agents.contains("queue=1")
+    });
+
+    let first_lines = first.finish();
+    let second_lines = second.finish();
+    let task_log = std::fs::read_to_string(managed_dir.join(".afs/ask-received"))
+        .expect("agent runtime should record both asks");
+    stop_daemon(&mut daemon);
+
+    assert!(
+        saw_queue,
+        "afs agents should expose the queued second ask while the first ask is active; last output:\n{last_agents}"
+    );
+    let queued_index = second_lines
+        .iter()
+        .position(|(_, line)| {
+            line == &format!("progress: queued task agent={} queue=1", identity.trim())
+        })
+        .expect("second ask should stream queued progress");
+    let started_index = second_lines
+        .iter()
+        .position(|(_, line)| {
+            line == &format!("progress: started task agent={} queue=0", identity.trim())
+        })
+        .expect("second ask should stream started progress when the first ask releases the agent");
+    let answer_index = second_lines
+        .iter()
+        .position(|(_, line)| {
+            line.starts_with(&format!("agent {} answered about", identity.trim()))
+        })
+        .expect("second ask should return the direct answer");
+    assert!(
+        queued_index < started_index && started_index < answer_index,
+        "second ask progress should show queued, then started, then answer; lines:\n{second_lines:#?}"
+    );
+    let first_position = task_log
+        .find(&format!("prompt={first_prompt}"))
+        .expect("runtime should record first ask");
+    let second_position = task_log
+        .find(&format!("prompt={second_prompt}"))
+        .expect("runtime should record second ask");
+    assert!(
+        first_position < second_position,
+        "agent runtime should receive concurrent direct asks FIFO; log:\n{task_log}"
+    );
+    assert!(
+        first_lines
+            .iter()
+            .any(|(_, line)| line.starts_with(&format!("agent {} answered about", identity.trim()))),
+        "first ask should also complete normally; lines:\n{first_lines:#?}"
+    );
 }
 
 fn remove_dir_all_retry(path: &std::path::Path) {

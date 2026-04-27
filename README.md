@@ -225,7 +225,8 @@ The index field is one of `warming`, `warming(scanned=N)`,
 `warming(scanned=N/total=M)`, `ready(files=N)`, or
 `ready(files=N, failed=M)` when M file(s) (for example, malformed PDFs)
 could not be extracted. The reconciliation field is currently a coarse
-status marker, not a full progress model.
+status marker, not a full progress model. The queue field reports waiting
+task turns for that agent; the active turn is not counted.
 
 ### `afs ask <prompt>`
 
@@ -261,8 +262,8 @@ lines (each terminated by `\n`) before the final-answer block:
   parseable reply (timed-out agents emit no line).
 - `progress: route=delegated from=<id>` when the owning agent decides to
   delegate after a direct ask.
-- `progress: queued task agent=<id> queue=<n>` when a delegated task waits
-  behind another for the same target, and
+- `progress: queued task agent=<id> queue=<n>` when a direct or delegated task
+  waits behind another turn for the same target, and
   `progress: started task agent=<id> queue=<n>` when the queue drains.
 - `progress: delegating from=<id> to=<id> reply=<delegator|supervisor>` before
   each delegated task runs.
@@ -414,6 +415,8 @@ Closed child-issue coverage:
   ask routing still honored on ignored paths.
 - #18: streamed `afs ask` progress for broadcast wait, replies, delegation,
   queueing, task start, and per-task file-change milestones.
+- #19: concurrent `afs ask` clients with per-agent FIFO task queueing and
+  queue depth visible through `afs agents`.
 - #20: top-level managed-directory remove lifecycle with optional history
   archive or discard.
 
@@ -453,10 +456,12 @@ Implemented or usable:
 - Streamed `afs ask` progress lines (broadcast wait, broadcast replies,
   delegation routing, queueing, task start, per-task file-change milestones)
   emitted before the final-answer block while the request is in flight.
+- Concurrent direct `afs ask` clients can target the same directory agent; the
+  agent runs one turn at a time in FIFO order while later turns report queued
+  and started progress, and `afs agents` exposes waiting queue depth.
 
 Missing or partial:
 
-- Concurrent per-agent FIFO task queue: #19.
 - Detailed agent lifecycle status for indexing, reconciliation, and queued work:
   #21.
 - Final PRD coverage audit before closing #1: #22.
