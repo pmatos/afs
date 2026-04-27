@@ -1387,7 +1387,7 @@ pub mod supervisor {
             Err(_) => return ReadOutcome::Failed,
         };
         if length > PDF_EXTRACT_BYTE_CAP {
-            return ReadOutcome::Failed;
+            return pdf_text_fallback(head, length);
         }
         let path_buf = path.to_path_buf();
         let extracted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -1403,24 +1403,26 @@ pub mod supervisor {
                     extracted_text: Some(text),
                 })
             }
-            Ok(Err(_)) | Err(_) => {
-                // The %PDF- magic was present but extraction failed. If the
-                // head buffer still classifies as text (no NUL bytes, valid
-                // UTF-8), this is a plain-text file that incidentally starts
-                // with the magic — index it as text rather than counting it
-                // as a broken PDF.
-                if classify_as_text(head) {
-                    let fingerprint_end = head.len().min(INDEX_FINGERPRINT_BYTES);
-                    let fingerprint = head[..fingerprint_end].to_vec();
-                    ReadOutcome::Indexed(IndexEntry {
-                        length,
-                        fingerprint,
-                        extracted_text: None,
-                    })
-                } else {
-                    ReadOutcome::Failed
-                }
-            }
+            Ok(Err(_)) | Err(_) => pdf_text_fallback(head, length),
+        }
+    }
+
+    // The %PDF- magic was present but PDF extraction is not viable (file
+    // too large to parse, parse error, or panic). If the head buffer still
+    // classifies as text, this is a plain-text file that incidentally starts
+    // with the magic — index it as text rather than counting it as a broken
+    // PDF.
+    fn pdf_text_fallback(head: &[u8], length: u64) -> ReadOutcome {
+        if classify_as_text(head) {
+            let fingerprint_end = head.len().min(INDEX_FINGERPRINT_BYTES);
+            let fingerprint = head[..fingerprint_end].to_vec();
+            ReadOutcome::Indexed(IndexEntry {
+                length,
+                fingerprint,
+                extracted_text: None,
+            })
+        } else {
+            ReadOutcome::Failed
         }
     }
 
