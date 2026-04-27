@@ -413,6 +413,37 @@ impl SpawnedAsk {
         );
         lines
     }
+
+    fn finish_with_timeout(mut self, timeout: Duration) -> Vec<(Duration, String)> {
+        let start = Instant::now();
+        let mut status = None;
+        while start.elapsed() < timeout {
+            status = self
+                .child
+                .try_wait()
+                .expect("afs ask status should be readable");
+            if status.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        if status.is_none() {
+            self.child.kill().expect("hung afs ask should be killed");
+            let _ = self.child.wait().expect("killed afs ask should exit");
+        }
+
+        let lines = self
+            .reader
+            .join()
+            .expect("stdout reader thread should join");
+        let status = status.expect("afs ask should exit before timeout");
+        assert!(
+            status.success(),
+            "afs ask should succeed; stdout:\n{lines:#?}"
+        );
+        lines
+    }
 }
 
 fn spawn_afs_ask_streamed(afs_home: &std::path::Path, prompt: &str) -> SpawnedAsk {
@@ -1731,6 +1762,51 @@ fn ask_allows_agent_to_delegate_direct_task_reply_back_to_delegator() {
     );
 
     stop_daemon(&mut daemon);
+}
+
+#[test]
+fn ask_rejects_self_targeted_delegator_delegation_without_deadlocking() {
+    let afs_home = unique_afs_home("ask-delegate-self-to-delegator");
+    let managed_dir = unique_afs_home("ask-delegate-self-managed");
+    let pi_runtime = fake_pi_runtime("ask-delegate-self-runtime");
+    let socket_path = supervisor_socket(&afs_home);
+    std::fs::create_dir_all(&managed_dir).expect("test should create managed directory");
+    let source_file = managed_dir.join("request.md");
+    std::fs::write(&source_file, "needs delegated context\n")
+        .expect("test should create source file");
+    let managed_dir = managed_dir
+        .canonicalize()
+        .expect("managed directory should canonicalize");
+    let source_file = source_file
+        .canonicalize()
+        .expect("source file should canonicalize");
+    let mut daemon = start_daemon_with_pi_runtime(&afs_home, &pi_runtime);
+    await_socket(&socket_path);
+
+    let install = install_managed_dir(&afs_home, &managed_dir);
+    assert!(install.status.success(), "afs install should succeed");
+    let identity =
+        std::fs::read_to_string(managed_dir.join(".afs/identity")).expect("identity exists");
+    std::fs::write(managed_dir.join(".afs/delegate-target"), identity.trim())
+        .expect("test should configure self delegation target");
+    std::fs::write(managed_dir.join(".afs/delegate-reply-target"), "delegator")
+        .expect("test should configure delegator reply target");
+
+    let ask = spawn_afs_ask_streamed(&afs_home, &format!("coordinate {}", source_file.display()));
+    let lines = ask.finish_with_timeout(Duration::from_secs(2));
+
+    stop_daemon(&mut daemon);
+
+    assert!(
+        lines.iter().any(|(_, line)| {
+            line == "progress: error delegated target cannot be the requesting agent when reply=delegator"
+        }),
+        "self-targeted delegator delegation should fail explicitly; lines:\n{lines:#?}"
+    );
+    assert!(
+        !managed_dir.join(".afs/task-received").exists(),
+        "the supervisor should not enqueue a task that would wait behind the active turn"
+    );
 }
 
 #[test]

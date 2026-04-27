@@ -593,6 +593,11 @@ pub mod supervisor {
                         ));
                     }
                 };
+                if target.identity == agent.identity {
+                    return response.emit_progress(format_args!(
+                        "error delegated target cannot be the requesting agent when reply=delegator"
+                    ));
+                }
                 let reply = match self.perform_delegated_task(
                     requester_identity.clone(),
                     target,
@@ -727,13 +732,13 @@ pub mod supervisor {
                 read_blocking_line(&mut runtime.stdout)?
             };
             drop(runtime);
-            drop(permit);
 
             let mut reply = parse_task_reply(&raw_reply, &target.identity);
             if let Some(change) = record_agent_change(&target.managed_dir, &target.agent_home)? {
                 reply.changed_files = change.files;
                 reply.history_entries = vec![change.history_entry];
             }
+            drop(permit);
             Ok(reply)
         }
     }
