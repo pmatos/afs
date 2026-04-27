@@ -172,6 +172,23 @@ fn start_daemon_with_index_warm_delay(
         .expect("afs daemon should start")
 }
 
+fn start_daemon_with_reconciliation_delay(
+    afs_home: &std::path::Path,
+    pi_runtime: &std::path::Path,
+    delay_ms: u64,
+) -> Child {
+    write_default_config(afs_home);
+    Command::new(env!("CARGO_BIN_EXE_afs"))
+        .env("AFS_HOME", afs_home)
+        .env("AFS_PI_RUNTIME", pi_runtime)
+        .env("AFS_RECONCILIATION_DELAY_MS", delay_ms.to_string())
+        .arg("daemon")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("afs daemon should start")
+}
+
 fn fake_pi_runtime(test_name: &str) -> std::path::PathBuf {
     let runtime_dir = unique_afs_home(test_name);
     std::fs::create_dir_all(&runtime_dir).expect("test should create fake runtime directory");
@@ -3531,9 +3548,10 @@ fn restart_reconciliation_records_missed_changes_as_one_history_batch() {
                 .output()
                 .expect("afs agents should run");
             agents.status.success()
-                && String::from_utf8_lossy(&agents.stdout).contains("reconciliation=idle")
+                && String::from_utf8_lossy(&agents.stdout)
+                    .contains("reconciliation=complete(changed_files=2)")
         }),
-        "restarted agent should finish Startup Reconciliation before reporting idle"
+        "restarted agent should report completed Startup Reconciliation"
     );
 
     let history = afs_history(&afs_home, &managed_dir);
@@ -3561,6 +3579,116 @@ fn restart_reconciliation_records_missed_changes_as_one_history_batch() {
     assert!(
         entries[0].contains("undoable=yes"),
         "history should show reconciliation undoability"
+    );
+
+    stop_daemon(&mut restarted_daemon);
+}
+
+#[test]
+fn agents_reports_reconciliation_running_then_complete_after_restart() {
+    let afs_home = unique_afs_home("reconciliation-status");
+    let managed_dir = unique_afs_home("reconciliation-status-managed");
+    let pi_runtime = fake_pi_runtime("reconciliation-status-runtime");
+    let socket_path = supervisor_socket(&afs_home);
+    std::fs::create_dir_all(&managed_dir).expect("test should create managed directory");
+    std::fs::write(managed_dir.join("notes.txt"), "before\n")
+        .expect("test should create managed file");
+    let managed_dir = managed_dir
+        .canonicalize()
+        .expect("managed directory should canonicalize");
+    let mut daemon = start_daemon_with_pi_runtime(&afs_home, &pi_runtime);
+    await_socket(&socket_path);
+
+    let install = install_managed_dir(&afs_home, &managed_dir);
+    assert!(install.status.success(), "afs install should succeed");
+
+    stop_daemon(&mut daemon);
+
+    std::fs::write(managed_dir.join("offline.txt"), "created while stopped\n")
+        .expect("test should create offline change");
+
+    let mut restarted_daemon = start_daemon_with_reconciliation_delay(&afs_home, &pi_runtime, 1000);
+    await_socket(&socket_path);
+
+    let mut last_agents = String::new();
+    let saw_running = wait_until(Duration::from_secs(2), || {
+        let agents = Command::new(env!("CARGO_BIN_EXE_afs"))
+            .env("AFS_HOME", &afs_home)
+            .arg("agents")
+            .output()
+            .expect("afs agents should run");
+        if !agents.status.success() {
+            return false;
+        }
+        last_agents = String::from_utf8_lossy(&agents.stdout).to_string();
+        last_agents.contains("reconciliation=running")
+    });
+    assert!(
+        saw_running,
+        "afs agents should expose startup reconciliation while it is in progress; last output:\n{last_agents}"
+    );
+
+    let saw_complete = wait_until(Duration::from_secs(5), || {
+        let agents = Command::new(env!("CARGO_BIN_EXE_afs"))
+            .env("AFS_HOME", &afs_home)
+            .arg("agents")
+            .output()
+            .expect("afs agents should run");
+        if !agents.status.success() {
+            return false;
+        }
+        last_agents = String::from_utf8_lossy(&agents.stdout).to_string();
+        last_agents.contains("reconciliation=complete(changed_files=1)")
+    });
+    assert!(
+        saw_complete,
+        "afs agents should report completed startup reconciliation with changed file count; last output:\n{last_agents}"
+    );
+
+    stop_daemon(&mut restarted_daemon);
+}
+
+#[test]
+fn direct_ask_warns_when_startup_reconciliation_is_running() {
+    let afs_home = unique_afs_home("ask-reconciliation-caveat");
+    let managed_dir = unique_afs_home("ask-reconciliation-caveat-managed");
+    let pi_runtime = fake_pi_runtime("ask-reconciliation-caveat-runtime");
+    let socket_path = supervisor_socket(&afs_home);
+    std::fs::create_dir_all(&managed_dir).expect("test should create managed directory");
+    let target = managed_dir.join("notes.txt");
+    std::fs::write(&target, "before\n").expect("test should create managed file");
+    let managed_dir = managed_dir
+        .canonicalize()
+        .expect("managed directory should canonicalize");
+    let target = target.canonicalize().expect("target should canonicalize");
+    let mut daemon = start_daemon_with_pi_runtime(&afs_home, &pi_runtime);
+    await_socket(&socket_path);
+
+    let install = install_managed_dir(&afs_home, &managed_dir);
+    assert!(install.status.success(), "afs install should succeed");
+
+    stop_daemon(&mut daemon);
+
+    std::fs::write(&target, "changed while stopped\n")
+        .expect("test should change the managed file offline");
+
+    let mut restarted_daemon = start_daemon_with_reconciliation_delay(&afs_home, &pi_runtime, 1000);
+    await_socket(&socket_path);
+    let agents = await_index_token(&afs_home, "reconciliation=running", Duration::from_secs(2));
+    assert!(
+        agents.contains("reconciliation=running"),
+        "test should observe reconciliation running before ask; got:\n{agents}"
+    );
+
+    let ask = afs_ask(&afs_home, &format!("summarize {}", target.display()));
+    assert!(
+        ask.status.success(),
+        "afs ask should succeed during reconciliation"
+    );
+    let stdout = String::from_utf8_lossy(&ask.stdout);
+    assert!(
+        stdout.contains("caveat: startup reconciliation is running; answer may be incomplete"),
+        "afs ask should explain that reconciliation is still running; got:\n{stdout}"
     );
 
     stop_daemon(&mut restarted_daemon);
@@ -5496,18 +5624,32 @@ fn concurrent_direct_asks_to_same_agent_queue_fifo_and_report_status() {
             return false;
         }
         last_agents = String::from_utf8_lossy(&agents.stdout).to_string();
-        last_agents.contains("queue=1")
+        last_agents.contains("active=true") && last_agents.contains("queue=1")
     });
 
     let first_lines = first.finish();
     let second_lines = second.finish();
     let task_log = std::fs::read_to_string(managed_dir.join(".afs/ask-received"))
         .expect("agent runtime should record both asks");
+    let final_agents = Command::new(env!("CARGO_BIN_EXE_afs"))
+        .env("AFS_HOME", &afs_home)
+        .arg("agents")
+        .output()
+        .expect("afs agents should run");
+    assert!(
+        final_agents.status.success(),
+        "final afs agents should succeed"
+    );
+    let final_agents_stdout = String::from_utf8_lossy(&final_agents.stdout);
     stop_daemon(&mut daemon);
 
     assert!(
         saw_queue,
-        "afs agents should expose the queued second ask while the first ask is active; last output:\n{last_agents}"
+        "afs agents should expose active work and the queued second ask while the first ask is active; last output:\n{last_agents}"
+    );
+    assert!(
+        final_agents_stdout.contains("active=false") && final_agents_stdout.contains("queue=0"),
+        "afs agents should show no active or queued work after both asks finish; got:\n{final_agents_stdout}"
     );
     let queued_index = second_lines
         .iter()
@@ -5937,7 +6079,7 @@ fn corrupted_pdf_degrades_gracefully_with_failure_caveat() {
 
     let stdout = await_index_token(
         &afs_home,
-        "index=ready(files=0, failed=1)",
+        "index=incomplete(files=0, failed=1)",
         Duration::from_secs(10),
     );
     assert!(

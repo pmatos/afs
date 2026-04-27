@@ -24,7 +24,6 @@ the PRD is complete just because the linked child issues are closed.
 Before judging PRD #1 completion, compare the live issue body and README status
 against the actual source and tests. Known gaps as of the current code include:
 
-- Detailed agent lifecycle status beyond coarse CLI markers (#21).
 - Final PRD coverage audit before closing #1 (#22).
 
 When documenting or extending AFS, distinguish between "available today" and

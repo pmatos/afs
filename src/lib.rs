@@ -28,6 +28,7 @@ pub mod supervisor {
     const INDEX_FINGERPRINT_BYTES: usize = 256;
     const INDEX_SETTLED_PATH_CAP: usize = 1024;
     const INDEX_WARM_DELAY_ENV: &str = "AFS_INDEX_WARM_DELAY_MS";
+    const RECONCILIATION_DELAY_ENV: &str = "AFS_RECONCILIATION_DELAY_MS";
 
     pub fn run_foreground() -> io::Result<()> {
         let home = home()?;
@@ -100,6 +101,7 @@ pub mod supervisor {
         task_queue: Arc<AgentTaskQueue>,
         monitor: Option<DirectoryMonitor>,
         index: Arc<Mutex<DirectoryIndex>>,
+        reconciliation: Arc<Mutex<ReconciliationState>>,
     }
 
     struct AgentRuntimeIo {
@@ -115,6 +117,7 @@ pub mod supervisor {
         runtime: Arc<Mutex<AgentRuntimeIo>>,
         task_queue: Arc<AgentTaskQueue>,
         index: Arc<Mutex<DirectoryIndex>>,
+        reconciliation: Arc<Mutex<ReconciliationState>>,
     }
 
     struct AgentTaskQueue {
@@ -126,6 +129,12 @@ pub mod supervisor {
         next_ticket: usize,
         serving_ticket: usize,
         cancelled_tickets: BTreeSet<usize>,
+        active: bool,
+    }
+
+    struct AgentQueueStatus {
+        active: bool,
+        queued: usize,
     }
 
     struct QueuedAgentTask {
@@ -224,6 +233,7 @@ pub mod supervisor {
                     next_ticket: 0,
                     serving_ticket: 0,
                     cancelled_tickets: BTreeSet::new(),
+                    active: false,
                 }),
                 ready: Condvar::new(),
             }
@@ -259,11 +269,17 @@ pub mod supervisor {
             })
         }
 
-        fn queue_depth(&self) -> usize {
+        fn status(&self) -> AgentQueueStatus {
             let Ok(state) = self.state.lock() else {
-                return 0;
+                return AgentQueueStatus {
+                    active: false,
+                    queued: 0,
+                };
             };
-            Self::queue_depth_locked(&state)
+            AgentQueueStatus {
+                active: state.active,
+                queued: Self::queue_depth_locked(&state),
+            }
         }
 
         fn queue_depth_locked(state: &AgentTaskQueueState) -> usize {
@@ -300,6 +316,7 @@ pub mod supervisor {
                     .wait(state)
                     .map_err(|_| io::Error::other("agent task queue lock poisoned"))?;
             }
+            state.active = true;
             let queue_depth = AgentTaskQueue::queue_depth_locked(&state);
             drop(state);
 
@@ -336,6 +353,7 @@ pub mod supervisor {
     impl Drop for AgentTaskPermit {
         fn drop(&mut self) {
             if let Ok(mut state) = self.queue.state.lock() {
+                state.active = false;
                 state.serving_ticket += 1;
                 AgentTaskQueue::advance_cancelled_locked(&mut state);
                 self.queue.ready.notify_all();
@@ -352,6 +370,7 @@ pub mod supervisor {
                 runtime: self.runtime.clone(),
                 task_queue: self.task_queue.clone(),
                 index: self.index.clone(),
+                reconciliation: self.reconciliation.clone(),
             }
         }
     }
@@ -593,11 +612,13 @@ pub mod supervisor {
                         }
                     };
                     let index_state = snapshot_index_state(&agent.index);
+                    let reconciliation_state = snapshot_reconciliation_state(&agent.reconciliation);
                     let body = format_delegated_supervisor_response(
                         &outcome,
                         &requested_path,
                         &agent.identity,
                         &index_state,
+                        &reconciliation_state,
                     );
                     return response.write_body(&body);
                 }
@@ -653,20 +674,28 @@ pub mod supervisor {
                     }
                 };
                 let index_state = snapshot_index_state(&agent.index);
+                let reconciliation_state = snapshot_reconciliation_state(&agent.reconciliation);
                 let body = format_delegated_delegator_response(
                     &delegator_answer,
                     &reply,
                     &requested_path,
                     &agent.identity,
                     &index_state,
+                    &reconciliation_state,
                 );
                 return response.write_body(&body);
             }
 
             drop(turn);
             let index_state = snapshot_index_state(&agent.index);
-            let body =
-                format_direct_ask_response(&answer, &requested_path, &agent.identity, &index_state);
+            let reconciliation_state = snapshot_reconciliation_state(&agent.reconciliation);
+            let body = format_direct_ask_response(
+                &answer,
+                &requested_path,
+                &agent.identity,
+                &index_state,
+                &reconciliation_state,
+            );
             response.write_body(&body)
         }
 
@@ -808,7 +837,12 @@ pub mod supervisor {
                 .iter()
                 .any(|agent| agent.managed_dir == managed_dir)
             {
-                self.start_registered_agent(managed_dir.clone(), agent_home, identity.trim())?;
+                self.start_registered_agent(
+                    managed_dir.clone(),
+                    agent_home,
+                    identity.trim(),
+                    ReconciliationState::Idle,
+                )?;
                 self.write_registry()?;
             }
 
@@ -1035,11 +1069,14 @@ pub mod supervisor {
                     None => "running",
                 };
                 let index_token = format_index_token(&agent.index);
+                let reconciliation_token = format_reconciliation_token(&agent.reconciliation);
+                let queue_status = agent.task_queue.status();
                 status.push_str(&format!(
-                    "{}\tagent={}\truntime=pi-rpc-stdio\thealth={health}\tindex={index_token}\treconciliation=idle\tqueue={}\n",
+                    "{}\tagent={}\truntime=pi-rpc-stdio\thealth={health}\tindex={index_token}\treconciliation={reconciliation_token}\tactive={}\tqueue={}\n",
                     agent.managed_dir.display(),
                     agent.identity,
-                    agent.task_queue.queue_depth()
+                    queue_status.active,
+                    queue_status.queued
                 ));
             }
             Ok(status)
@@ -1409,14 +1446,19 @@ pub mod supervisor {
                     }
                 }
 
-                record_startup_reconciliation(&managed_dir, &agent_home)?;
                 rebuilt.push_str(&identity);
                 rebuilt.push('\t');
                 rebuilt.push_str(&managed_dir.to_string_lossy());
                 rebuilt.push('\t');
                 rebuilt.push_str(&agent_home.to_string_lossy());
                 rebuilt.push('\n');
-                self.start_registered_agent(managed_dir, agent_home, &identity)?;
+                let reconciliation = self.start_registered_agent(
+                    managed_dir.clone(),
+                    agent_home.clone(),
+                    &identity,
+                    ReconciliationState::Running,
+                )?;
+                spawn_startup_reconciliation_task(managed_dir, agent_home, reconciliation);
             }
 
             if registry_changed {
@@ -1431,7 +1473,8 @@ pub mod supervisor {
             managed_dir: PathBuf,
             agent_home: PathBuf,
             identity: &str,
-        ) -> io::Result<()> {
+            reconciliation_state: ReconciliationState,
+        ) -> io::Result<Arc<Mutex<ReconciliationState>>> {
             let mut process = start_directory_agent_process(&managed_dir, &agent_home, identity)?;
             let stdin = process
                 .stdin
@@ -1442,8 +1485,13 @@ pub mod supervisor {
                 .take()
                 .ok_or_else(|| io::Error::other("AFS agent runtime stdout is unavailable"))?;
             let index = Arc::new(Mutex::new(DirectoryIndex::new()));
-            let monitor =
-                start_directory_monitor(managed_dir.clone(), agent_home.clone(), index.clone())?;
+            let reconciliation = Arc::new(Mutex::new(reconciliation_state));
+            let monitor = start_directory_monitor(
+                managed_dir.clone(),
+                agent_home.clone(),
+                index.clone(),
+                reconciliation.clone(),
+            )?;
             spawn_warm_task(managed_dir.clone(), agent_home.clone(), index.clone());
             self.agents.push(RegisteredAgent {
                 identity: identity.to_string(),
@@ -1454,8 +1502,9 @@ pub mod supervisor {
                 task_queue: Arc::new(AgentTaskQueue::new()),
                 monitor: Some(monitor),
                 index,
+                reconciliation: reconciliation.clone(),
             });
-            Ok(())
+            Ok(reconciliation)
         }
     }
 
@@ -1485,6 +1534,7 @@ pub mod supervisor {
                     self.managed_dir.clone(),
                     self.agent_home.clone(),
                     self.index.clone(),
+                    self.reconciliation.clone(),
                 )?);
             }
             Ok(())
@@ -1615,6 +1665,14 @@ pub mod supervisor {
     struct RecordedChange {
         history_entry: String,
         files: Vec<String>,
+    }
+
+    #[derive(Clone, Debug)]
+    enum ReconciliationState {
+        Idle,
+        Running,
+        Complete { changed_files: usize },
+        Error,
     }
 
     #[derive(Clone, Debug)]
@@ -1870,8 +1928,38 @@ pub mod supervisor {
         });
     }
 
+    fn spawn_startup_reconciliation_task(
+        managed_dir: PathBuf,
+        agent_home: PathBuf,
+        reconciliation: Arc<Mutex<ReconciliationState>>,
+    ) {
+        thread::spawn(move || {
+            if let Some(delay) = reconciliation_delay() {
+                thread::sleep(delay);
+            }
+            let state = match record_startup_reconciliation(&managed_dir, &agent_home) {
+                Ok(Some(change)) => ReconciliationState::Complete {
+                    changed_files: change.files.len(),
+                },
+                Ok(None) => ReconciliationState::Complete { changed_files: 0 },
+                Err(_) => ReconciliationState::Error,
+            };
+            if let Ok(mut guard) = reconciliation.lock() {
+                *guard = state;
+            }
+        });
+    }
+
     fn warm_delay_per_file() -> Option<Duration> {
         std::env::var(INDEX_WARM_DELAY_ENV)
+            .ok()
+            .and_then(|raw| raw.parse::<u64>().ok())
+            .filter(|ms| *ms > 0)
+            .map(Duration::from_millis)
+    }
+
+    fn reconciliation_delay() -> Option<Duration> {
+        std::env::var(RECONCILIATION_DELAY_ENV)
             .ok()
             .and_then(|raw| raw.parse::<u64>().ok())
             .filter(|ms| *ms > 0)
@@ -2015,6 +2103,15 @@ pub mod supervisor {
         }
     }
 
+    fn snapshot_reconciliation_state(
+        reconciliation: &Arc<Mutex<ReconciliationState>>,
+    ) -> ReconciliationState {
+        match reconciliation.lock() {
+            Ok(guard) => guard.clone(),
+            Err(_) => ReconciliationState::Error,
+        }
+    }
+
     fn format_index_token(index: &Arc<Mutex<DirectoryIndex>>) -> String {
         let snapshot = match index.lock() {
             Ok(guard) => guard.snapshot_state(),
@@ -2035,8 +2132,23 @@ pub mod supervisor {
             } => format!("warming(scanned={scanned}/total={total})"),
             IndexState::Ready { files, failed: 0 } => format!("ready(files={files})"),
             IndexState::Ready { files, failed } => {
-                format!("ready(files={files}, failed={failed})")
+                format!("incomplete(files={files}, failed={failed})")
             }
+        }
+    }
+
+    fn format_reconciliation_token(reconciliation: &Arc<Mutex<ReconciliationState>>) -> String {
+        let snapshot = match reconciliation.lock() {
+            Ok(guard) => guard.clone(),
+            Err(_) => return "error".to_string(),
+        };
+        match snapshot {
+            ReconciliationState::Idle => "idle".to_string(),
+            ReconciliationState::Running => "running".to_string(),
+            ReconciliationState::Complete { changed_files } => {
+                format!("complete(changed_files={changed_files})")
+            }
+            ReconciliationState::Error => "error".to_string(),
         }
     }
 
@@ -2045,6 +2157,7 @@ pub mod supervisor {
         requested_path: &Path,
         agent_identity: &str,
         index_state: &IndexState,
+        reconciliation_state: &ReconciliationState,
     ) -> String {
         let mut response = String::new();
         response.push_str(answer);
@@ -2054,6 +2167,7 @@ pub mod supervisor {
         response.push_str("references:\n");
         response.push_str(&format!("- {}\n", requested_path.display()));
         push_index_caveat(&mut response, index_state);
+        push_reconciliation_caveat(&mut response, reconciliation_state);
         response.push_str(&format!("participating_agents: {agent_identity}\n"));
         response.push_str("changed_files: none\n");
         response
@@ -2073,11 +2187,30 @@ pub mod supervisor {
         }
     }
 
+    fn push_reconciliation_caveat(
+        response: &mut String,
+        reconciliation_state: &ReconciliationState,
+    ) {
+        match reconciliation_state {
+            ReconciliationState::Running => {
+                response.push_str(
+                    "caveat: startup reconciliation is running; answer may be incomplete\n",
+                );
+            }
+            ReconciliationState::Error => {
+                response
+                    .push_str("caveat: startup reconciliation failed; answer may be incomplete\n");
+            }
+            ReconciliationState::Idle | ReconciliationState::Complete { .. } => {}
+        }
+    }
+
     fn format_delegated_supervisor_response(
         outcome: &DelegationOutcome,
         requested_path: &Path,
         requester_identity: &str,
         index_state: &IndexState,
+        reconciliation_state: &ReconciliationState,
     ) -> String {
         let mut response = String::new();
         if let [reply] = outcome.replies.as_slice() {
@@ -2095,6 +2228,7 @@ pub mod supervisor {
         response.push_str("references:\n");
         response.push_str(&format!("- {}\n", requested_path.display()));
         push_index_caveat(&mut response, index_state);
+        push_reconciliation_caveat(&mut response, reconciliation_state);
         let participating_agents = participating_agents(
             requester_identity,
             outcome
@@ -2130,6 +2264,7 @@ pub mod supervisor {
         requested_path: &Path,
         requester_identity: &str,
         index_state: &IndexState,
+        reconciliation_state: &ReconciliationState,
     ) -> String {
         let mut response = String::new();
         response.push_str(answer);
@@ -2139,6 +2274,7 @@ pub mod supervisor {
         response.push_str("references:\n");
         response.push_str(&format!("- {}\n", requested_path.display()));
         push_index_caveat(&mut response, index_state);
+        push_reconciliation_caveat(&mut response, reconciliation_state);
         response.push_str(&format!(
             "participating_agents: {}, {}\n",
             requester_identity, reply.agent_identity
@@ -2810,13 +2946,19 @@ pub mod supervisor {
         managed_dir: PathBuf,
         agent_home: PathBuf,
         index: Arc<Mutex<DirectoryIndex>>,
+        reconciliation: Arc<Mutex<ReconciliationState>>,
     ) -> io::Result<DirectoryMonitor> {
         let (ready_sender, ready_receiver) = mpsc::channel();
         let (stop_sender, stop_receiver) = mpsc::channel();
         let handle = thread::spawn(move || {
-            if let Err(error) =
-                monitor_directory(managed_dir, agent_home, index, ready_sender, stop_receiver)
-            {
+            if let Err(error) = monitor_directory(
+                managed_dir,
+                agent_home,
+                index,
+                reconciliation,
+                ready_sender,
+                stop_receiver,
+            ) {
                 eprintln!("directory monitor stopped: {error}");
             }
         });
@@ -2837,6 +2979,7 @@ pub mod supervisor {
         managed_dir: PathBuf,
         agent_home: PathBuf,
         index: Arc<Mutex<DirectoryIndex>>,
+        reconciliation: Arc<Mutex<ReconciliationState>>,
         ready_sender: mpsc::Sender<Result<(), String>>,
         stop_receiver: mpsc::Receiver<()>,
     ) -> io::Result<()> {
@@ -2865,6 +3008,9 @@ pub mod supervisor {
                         let mut settled = SettledPaths::new();
                         settled.absorb(&managed_dir, &event.paths);
                         wait_for_settled_events(&receiver, &managed_dir, &mut settled);
+                        if !wait_for_reconciliation_to_finish(&reconciliation, &stop_receiver) {
+                            return Ok(());
+                        }
                         record_external_change(&managed_dir, &agent_home)?;
                         update_index_after_settle(&managed_dir, &agent_home, &index, settled);
                     }
@@ -2873,6 +3019,26 @@ pub mod supervisor {
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => return Ok(()),
             }
+        }
+    }
+
+    fn wait_for_reconciliation_to_finish(
+        reconciliation: &Arc<Mutex<ReconciliationState>>,
+        stop_receiver: &mpsc::Receiver<()>,
+    ) -> bool {
+        loop {
+            match stop_receiver.try_recv() {
+                Ok(()) | Err(mpsc::TryRecvError::Disconnected) => return false,
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+            let running = match reconciliation.lock() {
+                Ok(guard) => matches!(*guard, ReconciliationState::Running),
+                Err(_) => false,
+            };
+            if !running {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(20));
         }
     }
 
@@ -3014,7 +3180,10 @@ pub mod supervisor {
         record_snapshot_delta(managed_dir, agent_home, "agent", "Agent change")
     }
 
-    fn record_startup_reconciliation(managed_dir: &Path, agent_home: &Path) -> io::Result<()> {
+    fn record_startup_reconciliation(
+        managed_dir: &Path,
+        agent_home: &Path,
+    ) -> io::Result<Option<RecordedChange>> {
         std::fs::create_dir_all(agent_home.join(HISTORY_DIR))?;
         ensure_history_baseline_commit(managed_dir, agent_home)?;
         record_snapshot_delta(
@@ -3023,7 +3192,6 @@ pub mod supervisor {
             "reconciliation",
             "Startup reconciliation",
         )
-        .map(|_| ())
     }
 
     fn record_snapshot_delta(

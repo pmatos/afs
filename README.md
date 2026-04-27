@@ -40,10 +40,10 @@ treating this as a complete v1.
 - Directory agents are launched through an external Pi runtime command over
   stdio RPC, configured via `afs login`.
 - `afs agents` reports registered agents, runtime health, index state,
-  reconciliation state, and queue depth. The index column shows
+  reconciliation state, active work, and queue depth. The index column shows
   `index=warming(scanned=N)` while the local text index warms,
   `index=ready(files=N)` once it is current, and
-  `index=ready(files=N, failed=M)` if some files could not be extracted.
+  `index=incomplete(files=N, failed=M)` if some files could not be extracted.
 - Each managed directory has a Rust-owned local index of its content.
   The index warms on install, updates on filesystem events, and is rebuilt
   after a saturated burst of changes. PDF files contribute their extracted
@@ -218,15 +218,15 @@ Top-level removal:
 Shows one line per registered agent:
 
 ```text
-<managed-dir> agent=<id> runtime=pi-rpc-stdio health=<running|stopped> index=<index-state> reconciliation=idle queue=<n>
+<managed-dir> agent=<id> runtime=pi-rpc-stdio health=<running|stopped> index=<index-state> reconciliation=<reconciliation-state> active=<true|false> queue=<n>
 ```
 
 The index field is one of `warming`, `warming(scanned=N)`,
 `warming(scanned=N/total=M)`, `ready(files=N)`, or
-`ready(files=N, failed=M)` when M file(s) (for example, malformed PDFs)
-could not be extracted. The reconciliation field is currently a coarse
-status marker, not a full progress model. The queue field reports waiting
-task turns for that agent; the active turn is not counted.
+`incomplete(files=N, failed=M)` when M file(s) (for example, malformed PDFs)
+could not be extracted. The reconciliation field is one of `idle`, `running`,
+`complete(changed_files=N)`, or `error`. The active field reports whether the
+agent is currently handling a turn, and the queue field reports waiting turns.
 
 ### `afs ask <prompt>`
 
@@ -245,8 +245,10 @@ Direct and delegated answers include:
 - file references
 - an index-warming caveat (only while the owning agent's local index is
   still warming)
-- an extraction-failure caveat (only once the index is ready and at
+- an extraction-failure caveat (once the scan is no longer warming and at
   least one file failed to extract; the caveat reports how many)
+- a startup-reconciliation caveat while the owning agent is replaying missed
+  changes after daemon downtime
 - participating agents
 - changed files
 - history entries for delegated file changes
@@ -450,20 +452,22 @@ Implemented or usable:
   events, distinguishes warming and ready coverage in `afs agents`, and gates
   the `afs ask` warming caveat on real index state. PDF files contribute
   extracted text to the index; extraction failures are surfaced as
-  `failed=N` in `afs agents` and as an honest caveat in `afs ask`. Binary
-  files are tracked in AFS history and restored byte-for-byte through
-  `afs undo`.
+  `incomplete(..., failed=N)` in `afs agents` and as an honest caveat in
+  `afs ask`. Binary files are tracked in AFS history and restored
+  byte-for-byte through `afs undo`.
 - Streamed `afs ask` progress lines (broadcast wait, broadcast replies,
   delegation routing, queueing, task start, per-task file-change milestones)
   emitted before the final-answer block while the request is in flight.
 - Concurrent direct `afs ask` clients can target the same directory agent; the
   agent runs one turn at a time in FIFO order while later turns report queued
-  and started progress, and `afs agents` exposes waiting queue depth.
+  and started progress, and `afs agents` exposes active work plus waiting
+  queue depth.
+- Detailed lifecycle status for startup reconciliation: `afs agents` reports
+  `running` while missed changes replay, `complete(changed_files=N)` after
+  replay, and direct/delegated asks include a caveat while replay is running.
 
 Missing or partial:
 
-- Detailed agent lifecycle status for indexing, reconciliation, and queued work:
-  #21.
 - Final PRD coverage audit before closing #1: #22.
 
 Because of these gaps, issue #1 should remain open until the missing PRD
