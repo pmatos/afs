@@ -95,21 +95,42 @@ the underlying provider (Claude or OpenAI). Pi is **not vendored in this
 repository** (intentionally — see PRD #1). Every command that talks to a
 provider, including `afs login`, shells out to it.
 
-Before running any of the steps below, make a `pi` executable available.
-Either put one on `$PATH`, or point AFS at it explicitly:
+The canonical Pi build is
+[`@mariozechner/pi-coding-agent`](https://github.com/badlogic/pi-mono/tree/main/packages/coding-agent)
+from the `badlogic/pi-mono` monorepo. Its CLI accepts the
+`--mode rpc --provider <claude|openai> [--model <model>]` invocation AFS
+uses to start each directory agent.
+
+Install it globally with npm (Node.js required):
 
 ```sh
-export AFS_PI_RUNTIME=/path/to/pi
+npm install -g @mariozechner/pi-coding-agent
 ```
 
-If neither is set, `afs login` and `afs daemon` will fail with:
+This places a `pi` executable in your npm global `bin/` directory (run
+`npm config get prefix` to find it; the binary is at `<prefix>/bin/pi`).
+Confirm with `which pi`.
+
+If `pi` is on `$PATH`, AFS finds it automatically — no extra configuration
+needed. If it is not on `$PATH`, or you want to pin a specific build, point
+AFS at it explicitly:
+
+```sh
+export AFS_PI_RUNTIME=/absolute/path/to/pi
+```
+
+If neither condition is met, `afs login` and `afs daemon` will fail with:
 
 ```text
 AFS agent runtime not found: pi (set AFS_PI_RUNTIME)
 ```
 
+Pi has its own provider authentication. You can either set
+`ANTHROPIC_API_KEY` / `OPENAI_API_KEY` in the environment before
+`afs login`, or let `afs login` drive Pi's interactive OAuth flow.
+
 See [Agent Runtime Protocol](#agent-runtime-protocol) for the stdio RPC
-contract Pi must implement.
+contract Pi must implement if you want to plug in a different runtime.
 
 ### Build, log in, and run
 
