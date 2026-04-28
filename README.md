@@ -299,7 +299,12 @@ lines (each terminated by `\n`) before the final-answer block:
 - `progress: route=broadcast agents=<n> timeout_ms=<m>` and
   `progress: broadcast waiting agents=<n>` while a broadcast is in flight.
 - `progress: broadcast reply agent=<id> relevance=<possible|strong|none>` per
-  parseable reply (timed-out agents emit no line).
+  parseable reply (timed-out agents emit no line). When the agent's first reply
+  line does not start with `possible<TAB>` or `strong<TAB>`, AFS reports
+  `relevance=none` and follows it with
+  `progress: broadcast reply agent=<id> raw=<sanitized first line>` so the
+  unparseable text is visible (truncated to 200 characters; control characters
+  and tabs are escaped).
 - `progress: route=delegated from=<id>` when the owning agent decides to
   delegate after a direct ask.
 - `progress: queued task agent=<id> queue=<n>` when a direct or delegated task
@@ -356,6 +361,10 @@ receives these environment variables:
 - `AFS_MANAGED_DIR`
 - `AFS_AGENT_RPC=stdio`
 - `<api-key-env>` when the configured auth method is `api_key`
+
+The runtime's stdout is consumed by the supervisor as the protocol channel
+described below. Its stderr is appended to `<AFS_AGENT_HOME>/runtime.log`, which
+is the place to look when an agent's replies are silently rejected.
 
 ### Wire format
 

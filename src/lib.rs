@@ -3,6 +3,7 @@ mod agent_rpc;
 pub mod supervisor {
     use notify::{RecommendedWatcher, RecursiveMode, Watcher};
     use std::collections::{BTreeMap, BTreeSet};
+    use std::fs::OpenOptions;
     use std::io::{self, BufRead, Read, Write};
     use std::os::fd::AsRawFd;
     use std::os::unix::net::{UnixListener, UnixStream};
@@ -22,6 +23,7 @@ pub mod supervisor {
     const REGISTRY_FILE: &str = "registry.tsv";
     const ARCHIVES_DIR: &str = "archives";
     const IGNORE_FILE: &str = "ignore";
+    const RUNTIME_LOG_FILE: &str = "runtime.log";
     const PI_RUNTIME_ENV: &str = "AFS_PI_RUNTIME";
     const SHUTDOWN_DRAIN_ENV: &str = "AFS_AGENT_SHUTDOWN_DRAIN_MS";
     const DEFAULT_SHUTDOWN_DRAIN: Duration = Duration::from_millis(500);
@@ -3131,6 +3133,10 @@ pub mod supervisor {
         if let Some(model) = config.model.as_deref() {
             command.arg("--model").arg(model);
         }
+        let runtime_log = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(agent_home.join(RUNTIME_LOG_FILE))?;
         command
             .current_dir(managed_dir)
             .env("AFS_AGENT_ID", identity)
@@ -3139,7 +3145,7 @@ pub mod supervisor {
             .env("AFS_AGENT_RPC", "stdio")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(Stdio::from(runtime_log))
             .spawn()
             .map_err(|error| {
                 if error.kind() == io::ErrorKind::NotFound {

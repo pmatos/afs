@@ -32,6 +32,9 @@ fn main() {
     let _ = fs::create_dir_all(&agent_home);
     write_spawn_observed(&agent_home);
     write_runtime_started(&agent_home);
+    if let Ok(banner) = fs::read_to_string(agent_home.join("runtime-stderr")) {
+        let _ = io::stderr().write_all(banner.as_bytes());
+    }
 
     let stdin = io::stdin();
     let mut handle = stdin.lock();
