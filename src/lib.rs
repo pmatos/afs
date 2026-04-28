@@ -1,3 +1,5 @@
+mod agent_rpc;
+
 pub mod supervisor {
     use notify::{RecommendedWatcher, RecursiveMode, Watcher};
     use std::collections::{BTreeMap, BTreeSet};
