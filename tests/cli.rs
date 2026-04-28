@@ -4149,6 +4149,10 @@ fn install_with_valid_config_spawns_agent_runtime_with_provider_and_model() {
         observed.contains("arg=--model") && observed.contains("arg=claude-sonnet-4-6"),
         "runtime should receive --model from config. got:\n{observed}"
     );
+    assert!(
+        observed.contains("arg=-e") && observed.contains("afs_reply.ts"),
+        "runtime should receive -e <path-to-afs_reply.ts>. got:\n{observed}"
+    );
 
     stop_daemon(&mut daemon);
 }
@@ -4200,6 +4204,10 @@ fn install_with_config_without_model_omits_model_flag() {
     assert!(
         !observed.contains("arg=--model"),
         "runtime should not receive --model when unset in config. got:\n{observed}"
+    );
+    assert!(
+        observed.contains("arg=-e") && observed.contains("afs_reply.ts"),
+        "runtime should receive -e <path-to-afs_reply.ts>. got:\n{observed}"
     );
 
     stop_daemon(&mut daemon);
@@ -4255,6 +4263,10 @@ fn install_forwards_runtime_provider_id_to_pi() {
     assert!(
         !observed.contains("arg=openai\n"),
         "runtime should not receive bare --provider openai when runtime_provider_id overrides it. got:\n{observed}"
+    );
+    assert!(
+        observed.contains("arg=-e") && observed.contains("afs_reply.ts"),
+        "runtime should receive -e <path-to-afs_reply.ts>. got:\n{observed}"
     );
 
     stop_daemon(&mut daemon);

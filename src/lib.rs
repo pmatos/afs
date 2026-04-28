@@ -2876,6 +2876,7 @@ pub mod supervisor {
                 "AFS is not configured. Run `afs login --provider claude|openai` to authenticate.",
             )
         })?;
+        let extension_path = ensure_extension_seeded(agent_home)?;
         let runtime = pi_runtime_command();
         let mut command = Command::new(&runtime);
         let runtime_provider = config
@@ -2886,7 +2887,9 @@ pub mod supervisor {
             .arg("--mode")
             .arg("rpc")
             .arg("--provider")
-            .arg(runtime_provider);
+            .arg(runtime_provider)
+            .arg("-e")
+            .arg(&extension_path);
         if let Some(model) = config.model.as_deref() {
             command.arg("--model").arg(model);
         }
@@ -2947,6 +2950,21 @@ pub mod supervisor {
             Err(error) => return Err(error),
         }
         std::fs::write(ignore_path, contents)
+    }
+
+    const AFS_REPLY_EXTENSION_SOURCE: &str = include_str!("../assets/pi-extensions/afs_reply.ts");
+
+    /// Writes the AFS-owned `afs_reply.ts` Pi extension into the
+    /// agent's `<AGENT_HOME>/extensions/` directory. Overwrites on
+    /// every call so a stale on-disk extension cannot lag behind the
+    /// running AFS binary. Returns the absolute path to the written
+    /// file for use as the `-e <path>` argument to `pi --mode rpc`.
+    fn ensure_extension_seeded(agent_home: &Path) -> io::Result<PathBuf> {
+        let extensions_dir = agent_home.join("extensions");
+        std::fs::create_dir_all(&extensions_dir)?;
+        let extension_path = extensions_dir.join("afs_reply.ts");
+        std::fs::write(&extension_path, AFS_REPLY_EXTENSION_SOURCE)?;
+        Ok(extension_path)
     }
 
     fn ensure_history_baseline_commit(managed_dir: &Path, agent_home: &Path) -> io::Result<()> {
