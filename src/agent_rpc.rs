@@ -43,17 +43,9 @@ pub(crate) mod envelope {
 #[derive(Serialize, Debug)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub(crate) enum RpcCommand<'a> {
-    Prompt {
-        id: &'a str,
-        message: &'a str,
-    },
-    Abort {
-        id: &'a str,
-    },
-    ExtensionUiResponse {
-        id: &'a str,
-        cancelled: bool,
-    },
+    Prompt { id: &'a str, message: &'a str },
+    Abort { id: &'a str },
+    ExtensionUiResponse { id: &'a str, cancelled: bool },
 }
 
 // ---------------------------------------------------------------------------

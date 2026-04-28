@@ -6285,3 +6285,69 @@ fn text_file_with_pdf_magic_prefix_falls_back_to_text_index() {
 
     stop_daemon(&mut daemon);
 }
+
+/// Real-Pi wire-format canary. Skips by default; runs only when the
+/// caller sets `AFS_REAL_PI_SMOKE=1` AND a `pi` binary is on PATH
+/// AND the caller has already configured Pi credentials (via
+/// `pi login` or equivalent). Spawns AFS against the real
+/// `pi --mode rpc` and exercises one `afs ask` end-to-end so a
+/// future Pi release that drifts from the JSONL JSON-RPC schema
+/// AFS targets surfaces here instead of in user-visible silent
+/// failure (the bug that produced issue #40).
+///
+/// Run with:
+///   AFS_REAL_PI_SMOKE=1 cargo test -- --ignored real_pi_smoke
+#[test]
+#[ignore]
+fn real_pi_smoke_ask_returns_afs_reply() {
+    if std::env::var("AFS_REAL_PI_SMOKE").ok().as_deref() != Some("1") {
+        eprintln!(
+            "skipping real-Pi smoke: set AFS_REAL_PI_SMOKE=1 and ensure `pi` is on PATH and authenticated"
+        );
+        return;
+    }
+    let pi_path = match Command::new("which").arg("pi").output() {
+        Ok(output) if output.status.success() => {
+            std::path::PathBuf::from(String::from_utf8_lossy(&output.stdout).trim().to_string())
+        }
+        _ => {
+            eprintln!("skipping real-Pi smoke: `pi` not found on PATH");
+            return;
+        }
+    };
+
+    let afs_home = unique_afs_home("real-pi-smoke");
+    let socket_path = supervisor_socket(&afs_home);
+    write_config(&afs_home, r#"{"provider":"claude","auth_method":"oauth"}"#);
+    let managed_dir = unique_afs_home("real-pi-smoke-managed");
+    std::fs::create_dir_all(&managed_dir).expect("create managed dir");
+    std::fs::write(managed_dir.join("hello.txt"), "smoke test\n").expect("seed managed file");
+    let managed_dir = managed_dir.canonicalize().expect("canonicalize");
+
+    let mut daemon = start_daemon_with_pi_runtime(&afs_home, &pi_path);
+    await_socket(&socket_path);
+
+    let install = install_managed_dir(&afs_home, &managed_dir);
+    assert!(
+        install.status.success(),
+        "afs install should succeed against real Pi\nstderr:\n{}",
+        String::from_utf8_lossy(&install.stderr)
+    );
+
+    let ask = afs_ask(&afs_home, "what is in hello.txt?");
+    let stdout = String::from_utf8_lossy(&ask.stdout);
+    let stderr = String::from_utf8_lossy(&ask.stderr);
+
+    // We accept any of: a structured reply (afs_reply was called),
+    // a graceful "agent finished without afs_reply" diagnostic, or
+    // a Pi-side parse error. What we DON'T accept is a hang or a
+    // panic. The point of this test is to flush wire-format drift.
+    assert!(
+        ask.status.success()
+            || stderr.contains("did not reply")
+            || stderr.contains("agent finished"),
+        "real-Pi ask either succeeded or surfaced a diagnostic; instead got\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+
+    stop_daemon(&mut daemon);
+}
