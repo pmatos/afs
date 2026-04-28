@@ -7,13 +7,11 @@
 //! `assets/pi-extensions/afs_reply.ts` extension so every directory
 //! agent ends every turn with a structured `afs_reply` tool call.
 //!
-//! Module landed alone (issue #44 / PRD #2 step 3): no call sites in
-//! `lib.rs` use it yet. Step 4 (issue #45) flips the wire format and
-//! consumes everything below. The transitional `allow(dead_code)`
-//! exists only so this step can be reviewed independently with a
-//! green verification gate.
-
-#![allow(dead_code)]
+//! Wired into `src/lib.rs`'s supervisor module by issue #45 (PRD #2
+//! step 4). `Turn::run` is the canonical blocking turn driver;
+//! `dispatch` plus `JsonlReader`/`JsonlWriter` let callers that need
+//! non-blocking polling (broadcast / collaboration) drive the same
+//! state machine line-by-line.
 
 use serde::{Deserialize, Serialize};
 use std::io::{self, Read, Write};
@@ -45,9 +43,19 @@ pub(crate) mod envelope {
 #[derive(Serialize, Debug)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub(crate) enum RpcCommand<'a> {
-    Prompt { id: &'a str, message: &'a str },
-    Abort { id: &'a str },
-    ExtensionUiResponse { id: &'a str, cancelled: bool },
+    Prompt {
+        id: &'a str,
+        message: &'a str,
+    },
+    /// `abort` is consumed by Step 5 (graceful shutdown).
+    #[allow(dead_code)]
+    Abort {
+        id: &'a str,
+    },
+    ExtensionUiResponse {
+        id: &'a str,
+        cancelled: bool,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -72,7 +80,7 @@ impl Relevance {
     }
 }
 
-#[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
+#[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum ReplyTarget {
     Delegator,
@@ -128,7 +136,7 @@ pub(crate) enum RpcEvent {
     /// `compaction_*`, `auto_retry_*`, `extension_error`, plus future
     /// types). Carries the raw `Value` so callers that want to peek
     /// can do so; `Turn::run` drops them.
-    Ignored(serde_json::Value),
+    Ignored(#[allow(dead_code)] serde_json::Value),
 }
 
 /// Decode one JSONL line into an `RpcEvent`. Reads
