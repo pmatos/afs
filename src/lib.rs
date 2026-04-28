@@ -23,6 +23,8 @@ pub mod supervisor {
     const ARCHIVES_DIR: &str = "archives";
     const IGNORE_FILE: &str = "ignore";
     const PI_RUNTIME_ENV: &str = "AFS_PI_RUNTIME";
+    const SHUTDOWN_DRAIN_ENV: &str = "AFS_AGENT_SHUTDOWN_DRAIN_MS";
+    const DEFAULT_SHUTDOWN_DRAIN: Duration = Duration::from_millis(500);
     const BROADCAST_REPLY_TIMEOUT_ENV: &str = "AFS_BROADCAST_REPLY_TIMEOUT_MS";
     const DEFAULT_BROADCAST_REPLY_TIMEOUT: Duration = Duration::from_secs(2);
     const SETTLE_WINDOW: Duration = Duration::from_millis(150);
@@ -448,6 +450,66 @@ pub mod supervisor {
             .filter_map(|reference| normalize_broadcast_reference(reference, managed_dir))
             .filter(|reference| !ignore_matches(&matcher, managed_dir, reference))
             .collect()
+    }
+
+    /// Send `{"type":"abort"}` to the agent and drain stdout for a
+    /// bounded window so Pi can finalize the in-flight LLM call
+    /// before the supervisor kills the process. Auto-cancels any
+    /// late dialog `extension_ui_request` so a user-installed
+    /// extension cannot deadlock shutdown. Returns once the
+    /// agent emits `agent_end`, the deadline expires, or the stream
+    /// closes.
+    fn abort_and_drain(io: &mut AgentRuntimeIo, deadline: Duration) -> io::Result<()> {
+        use crate::agent_rpc::{self, RpcCommand, RpcEvent};
+
+        let abort_id = format!("shutdown-{}", std::process::id());
+        {
+            let mut writer = agent_rpc::JsonlWriter::new(&mut io.stdin);
+            writer.send(&RpcCommand::Abort { id: &abort_id })?;
+        }
+        set_nonblocking(&io.stdout, true)?;
+        let until = Instant::now() + deadline;
+        let mut buffer: Vec<u8> = Vec::new();
+
+        let outcome = loop {
+            let line = match read_nonblocking_line(&mut io.stdout, &mut buffer) {
+                Ok(Some(line)) => line,
+                Ok(None) => {
+                    if Instant::now() >= until {
+                        break Ok(());
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                    continue;
+                }
+                Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => break Ok(()),
+                Err(error) => break Err(error),
+            };
+
+            match agent_rpc::dispatch(&line) {
+                Ok(RpcEvent::ExtensionUiRequest { id: ui_id, method }) => {
+                    if matches!(method.as_str(), "select" | "confirm" | "input" | "editor") {
+                        let mut writer = agent_rpc::JsonlWriter::new(&mut io.stdin);
+                        let _ = writer.send(&RpcCommand::ExtensionUiResponse {
+                            id: &ui_id,
+                            cancelled: true,
+                        });
+                    }
+                }
+                Ok(RpcEvent::AgentEnd) => break Ok(()),
+                _ => {}
+            }
+        };
+
+        let _ = set_nonblocking(&io.stdout, false);
+        outcome
+    }
+
+    fn shutdown_drain_window() -> Duration {
+        std::env::var(SHUTDOWN_DRAIN_ENV)
+            .ok()
+            .and_then(|raw| raw.parse::<u64>().ok())
+            .map(Duration::from_millis)
+            .unwrap_or(DEFAULT_SHUTDOWN_DRAIN)
     }
 
     fn delegate_requests_from_reply(reply: &crate::agent_rpc::AfsReply) -> Vec<DelegateRequest> {
@@ -1793,7 +1855,16 @@ pub mod supervisor {
             self.stop_monitor()?;
             self.stop_reconciliation()?;
             if self.process.try_wait()?.is_none() {
-                self.process.kill()?;
+                // Best-effort: send `abort` and drain stdout for a
+                // bounded window so Pi can finalize its session
+                // file before we kill the process. Errors here are
+                // non-fatal — fall through to `kill`.
+                if let Ok(mut runtime) = self.runtime.lock() {
+                    let _ = abort_and_drain(&mut runtime, shutdown_drain_window());
+                }
+                if self.process.try_wait()?.is_none() {
+                    self.process.kill()?;
+                }
             }
             let _ = self.process.wait()?;
             Ok(())

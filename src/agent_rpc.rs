@@ -47,8 +47,6 @@ pub(crate) enum RpcCommand<'a> {
         id: &'a str,
         message: &'a str,
     },
-    /// `abort` is consumed by Step 5 (graceful shutdown).
-    #[allow(dead_code)]
     Abort {
         id: &'a str,
     },
@@ -580,6 +578,27 @@ mod tests {
             }
             other => panic!("expected Ignored, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn late_ui_request_buffered_before_next_turn_is_auto_cancelled() {
+        // Pi may emit an extension_ui_request after the previous
+        // turn's agent_end (Step 5: graceful shutdown documents this
+        // path). The next Turn::run consumes the buffered request
+        // before its own prompt response arrives and auto-cancels
+        // it, keeping the agent unblocked.
+        let events = [
+            r#"{"type":"extension_ui_request","id":"late-1","method":"confirm","title":"Resume?"}"#,
+            r#"{"type":"response","command":"prompt","id":"t-2","success":true}"#,
+            r#"{"type":"tool_execution_end","toolName":"afs_reply","result":{"details":{"schema_version":1,"relevance":"strong","reason":"ok","answer":"resumed"}}}"#,
+            r#"{"type":"agent_end","messages":[]}"#,
+        ];
+        let (outcome, output) = run_with_events(&events, "t-2", "ping");
+        outcome.expect("turn succeeds with buffered UI cancel");
+        assert!(
+            output.contains(r#""id":"late-1""#) && output.contains(r#""cancelled":true"#),
+            "buffered UI request should be auto-cancelled; got: {output}"
+        );
     }
 
     #[test]
