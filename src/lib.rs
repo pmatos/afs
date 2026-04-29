@@ -240,16 +240,21 @@ pub mod supervisor {
         let mut timed_out = false;
 
         let result: io::Result<AfsReply> = loop {
+            // Wall-clock deadline check at the top of every
+            // iteration so a Pi session that keeps streaming
+            // non-terminating events (e.g. repeated `*_update`
+            // events without `agent_end`) cannot run past the
+            // deadline while holding the runtime mutex.
+            if Instant::now() >= deadline {
+                timed_out = true;
+                break Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "AFS agent runtime did not reply within the deadline",
+                ));
+            }
             let line = match read_nonblocking_line(&mut io.stdout, &mut buffer) {
                 Ok(Some(line)) => line,
                 Ok(None) => {
-                    if Instant::now() >= deadline {
-                        timed_out = true;
-                        break Err(io::Error::new(
-                            io::ErrorKind::TimedOut,
-                            "AFS agent runtime did not reply within the deadline",
-                        ));
-                    }
                     thread::sleep(Duration::from_millis(10));
                     continue;
                 }
@@ -342,12 +347,12 @@ pub mod supervisor {
             }
             let drain_until = Instant::now() + ABORT_DRAIN_AFTER_TIMEOUT;
             loop {
+                if Instant::now() >= drain_until {
+                    break;
+                }
                 let line = match read_nonblocking_line(&mut io.stdout, &mut buffer) {
                     Ok(Some(line)) => line,
                     Ok(None) => {
-                        if Instant::now() >= drain_until {
-                            break;
-                        }
                         thread::sleep(Duration::from_millis(10));
                         continue;
                     }
@@ -526,12 +531,17 @@ pub mod supervisor {
         let mut buffer: Vec<u8> = Vec::new();
 
         let outcome = loop {
+            // Wall-clock deadline check at the top of every
+            // iteration so an agent that keeps writing lines after
+            // `abort` (without ever sending `agent_end`) cannot
+            // hang `RegisteredAgent::stop` past the bounded drain
+            // window.
+            if Instant::now() >= until {
+                break Ok(());
+            }
             let line = match read_nonblocking_line(&mut io.stdout, &mut buffer) {
                 Ok(Some(line)) => line,
                 Ok(None) => {
-                    if Instant::now() >= until {
-                        break Ok(());
-                    }
                     thread::sleep(Duration::from_millis(10));
                     continue;
                 }
