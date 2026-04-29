@@ -576,6 +576,28 @@ pub mod supervisor {
             .unwrap_or(DEFAULT_SHUTDOWN_DRAIN)
     }
 
+    /// Try to acquire `mutex` within a bounded wall-clock window.
+    /// Returns `None` once `deadline` is reached without success or
+    /// if the mutex has been poisoned. Used so broadcast workers and
+    /// `RegisteredAgent::stop` cannot wait forever on a runtime
+    /// mutex held by a stuck turn — without this, a single stalled
+    /// turn would deadlock every later broadcast against the same
+    /// agent and prevent the supervisor from ever reaching `kill()`.
+    fn try_lock_until<T>(mutex: &Mutex<T>, deadline: Instant) -> Option<MutexGuard<'_, T>> {
+        loop {
+            match mutex.try_lock() {
+                Ok(guard) => return Some(guard),
+                Err(std::sync::TryLockError::Poisoned(_)) => return None,
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    if Instant::now() >= deadline {
+                        return None;
+                    }
+                    thread::sleep(Duration::from_millis(10));
+                }
+            }
+        }
+    }
+
     fn delegate_requests_from_reply(reply: &crate::agent_rpc::AfsReply) -> Vec<DelegateRequest> {
         reply
             .delegates
@@ -1558,9 +1580,20 @@ pub mod supervisor {
                 let message = broadcast_message.clone();
                 thread::spawn(move || {
                     let result = (|| -> io::Result<crate::agent_rpc::AfsReply> {
-                        let mut io_guard = runtime
-                            .lock()
-                            .map_err(|_| io::Error::other("agent runtime lock poisoned"))?;
+                        // Bound the lock-acquisition wait by the
+                        // worker deadline. Without this, a stuck
+                        // direct turn holding the mutex would block
+                        // the worker indefinitely past the broadcast
+                        // timeout.
+                        let mut io_guard = match try_lock_until(&runtime, worker_deadline) {
+                            Some(guard) => guard,
+                            None => {
+                                return Err(io::Error::new(
+                                    io::ErrorKind::TimedOut,
+                                    "agent runtime lock not available before broadcast deadline",
+                                ));
+                            }
+                        };
                         let id = next_turn_id();
                         pi_turn_with_deadline(&mut io_guard, &id, &message, worker_deadline)
                     })();
@@ -1927,10 +1960,15 @@ pub mod supervisor {
             if self.process.try_wait()?.is_none() {
                 // Best-effort: send `abort` and drain stdout for a
                 // bounded window so Pi can finalize its session
-                // file before we kill the process. Errors here are
-                // non-fatal — fall through to `kill`.
-                if let Ok(mut runtime) = self.runtime.lock() {
-                    let _ = abort_and_drain(&mut runtime, shutdown_drain_window());
+                // file before we kill the process. The mutex
+                // acquisition itself is bounded — if a stuck turn
+                // is holding the mutex we skip the drain and go
+                // straight to `kill()`, otherwise shutdown could
+                // hang forever waiting for that turn to finish.
+                let drain = shutdown_drain_window();
+                let lock_deadline = Instant::now() + drain;
+                if let Some(mut runtime) = try_lock_until(&self.runtime, lock_deadline) {
+                    let _ = abort_and_drain(&mut runtime, drain);
                 }
                 if self.process.try_wait()?.is_none() {
                     self.process.kill()?;
