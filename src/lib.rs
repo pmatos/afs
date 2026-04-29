@@ -464,8 +464,7 @@ pub mod supervisor {
     /// Builds a supervisor `BroadcastReply` from a directory agent's
     /// structured `AfsReply`. Returns `None` when the agent reports
     /// no relevance. Filters `file_references` against the agent's
-    /// per-directory ignore policy (the contract previously enforced
-    /// inline by `parse_broadcast_reply`).
+    /// per-directory ignore policy.
     fn build_broadcast_reply(
         reply: crate::agent_rpc::AfsReply,
         agent: &RegisteredAgent,
@@ -498,9 +497,8 @@ pub mod supervisor {
     }
 
     /// Apply a directory agent's ignore policy to broadcast file
-    /// references. Pulled out of the previous `parse_broadcast_reply`
-    /// so the structured-output adapter still honors per-directory
-    /// ignore rules.
+    /// references so the structured-output adapter honors
+    /// per-directory ignore rules.
     fn filter_broadcast_references(
         refs: &[String],
         agent_home: &Path,
