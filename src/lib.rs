@@ -200,12 +200,26 @@ pub mod supervisor {
         Ok(outcome.reply)
     }
 
-    /// Sends `message` and reads Pi events with a wall-clock
-    /// deadline. Sets stdout non-blocking for the duration; restores
-    /// blocking mode on every exit path. Returns
-    /// `io::ErrorKind::TimedOut` if no `agent_end` arrives before the
-    /// deadline. The in-flight Pi turn is left to complete naturally;
-    /// AFS's per-agent FIFO queue serializes any subsequent prompt.
+    /// How long to wait for `agent_end` after sending `abort` when a
+    /// `pi_turn_with_deadline` call exceeds its own deadline. Bounds
+    /// the time the runtime mutex stays held during cleanup.
+    const ABORT_DRAIN_AFTER_TIMEOUT: Duration = Duration::from_millis(500);
+
+    /// Sends `message` and reads Pi events with a wall-clock deadline.
+    /// Sets stdout non-blocking for the duration; restores blocking
+    /// mode on every exit path. Returns `io::ErrorKind::TimedOut` if
+    /// no `afs_reply` plus `agent_end` arrive before the deadline.
+    ///
+    /// On deadline expiry the function sends `{"type":"abort"}` and
+    /// drains stdout until Pi emits `agent_end` (or
+    /// [`ABORT_DRAIN_AFTER_TIMEOUT`] elapses). This leaves the agent
+    /// in a clean state — the runtime mutex is released without any
+    /// in-flight events lingering in the pipe — so a subsequent
+    /// prompt to the same agent is not contaminated by the previous
+    /// turn's tail. (Without the abort+drain, broadcast workers
+    /// could leave the mutex held for an unbounded time, blocking
+    /// every later broadcast against that agent and any
+    /// `RegisteredAgent::stop` call.)
     fn pi_turn_with_deadline(
         io: &mut AgentRuntimeIo,
         id: &str,
@@ -223,12 +237,14 @@ pub mod supervisor {
         let mut buffer: Vec<u8> = Vec::new();
         let mut captured: Option<AfsReply> = None;
         let mut warnings: Vec<String> = Vec::new();
+        let mut timed_out = false;
 
         let result: io::Result<AfsReply> = loop {
             let line = match read_nonblocking_line(&mut io.stdout, &mut buffer) {
                 Ok(Some(line)) => line,
                 Ok(None) => {
                     if Instant::now() >= deadline {
+                        timed_out = true;
                         break Err(io::Error::new(
                             io::ErrorKind::TimedOut,
                             "AFS agent runtime did not reply within the deadline",
@@ -314,6 +330,44 @@ pub mod supervisor {
                 Err(error) => break Err(error),
             }
         };
+
+        // On timeout, abort the in-flight Pi turn and drain the
+        // pipe so the next caller sees a clean session. Stdout is
+        // already non-blocking; reuse the same buffer.
+        if timed_out {
+            let abort_id = format!("{id}-timeout-abort");
+            {
+                let mut writer = agent_rpc::JsonlWriter::new(&mut io.stdin);
+                let _ = writer.send(&RpcCommand::Abort { id: &abort_id });
+            }
+            let drain_until = Instant::now() + ABORT_DRAIN_AFTER_TIMEOUT;
+            loop {
+                let line = match read_nonblocking_line(&mut io.stdout, &mut buffer) {
+                    Ok(Some(line)) => line,
+                    Ok(None) => {
+                        if Instant::now() >= drain_until {
+                            break;
+                        }
+                        thread::sleep(Duration::from_millis(10));
+                        continue;
+                    }
+                    Err(_) => break,
+                };
+                match agent_rpc::dispatch(&line) {
+                    Ok(RpcEvent::AgentEnd) => break,
+                    Ok(RpcEvent::ExtensionUiRequest { id: ui_id, method }) => {
+                        if matches!(method.as_str(), "select" | "confirm" | "input" | "editor") {
+                            let mut writer = agent_rpc::JsonlWriter::new(&mut io.stdin);
+                            let _ = writer.send(&RpcCommand::ExtensionUiResponse {
+                                id: &ui_id,
+                                cancelled: true,
+                            });
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
 
         let _ = set_nonblocking(&io.stdout, false);
         for warning in &warnings {
@@ -1475,13 +1529,19 @@ pub mod supervisor {
             }
 
             // Fan out one prompt per agent on its own thread so Pi's
-            // streaming events can be consumed in parallel. Threads
-            // hold the per-agent runtime mutex for the duration; if
-            // an agent doesn't reply before the deadline, its thread
-            // keeps running and the per-agent FIFO queue serializes
-            // any subsequent ask.
+            // streaming events can be consumed in parallel. Workers
+            // call `pi_turn_with_deadline`, not `pi_turn_blocking`, so
+            // an unresponsive agent does not pin the runtime mutex
+            // forever: when the deadline expires the worker sends
+            // `abort` to Pi, drains the in-flight events, and
+            // releases the mutex within `ABORT_DRAIN_AFTER_TIMEOUT`.
+            // Without that, every later broadcast would pile up
+            // waiting on the stuck mutex (broadcast bypasses the
+            // per-agent FIFO queue) and `RegisteredAgent::stop` would
+            // also block.
             let (tx, rx) = mpsc::channel::<(usize, io::Result<crate::agent_rpc::AfsReply>)>();
             let broadcast_message = build_broadcast_message(prompt);
+            let worker_deadline = Instant::now() + timeout;
             for (index, agent) in self.agents.iter().enumerate() {
                 let tx = tx.clone();
                 let runtime = agent.runtime.clone();
@@ -1492,7 +1552,7 @@ pub mod supervisor {
                             .lock()
                             .map_err(|_| io::Error::other("agent runtime lock poisoned"))?;
                         let id = next_turn_id();
-                        pi_turn_blocking(&mut io_guard, &id, &message)
+                        pi_turn_with_deadline(&mut io_guard, &id, &message, worker_deadline)
                     })();
                     let _ = tx.send((index, result));
                 });
