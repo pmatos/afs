@@ -1,6 +1,8 @@
 mod agent_rpc;
+mod managed_subtree;
 
 pub mod supervisor {
+    use crate::managed_subtree::{AGENT_HOME_DIR, IGNORE_FILE, ManagedSubtree};
     use notify::{RecommendedWatcher, RecursiveMode, Watcher};
     use std::collections::{BTreeMap, BTreeSet};
     use std::fs::OpenOptions;
@@ -17,12 +19,10 @@ pub mod supervisor {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     const SOCKET_FILE: &str = "supervisor.sock";
-    const AGENT_HOME_DIR: &str = ".afs";
     const HISTORY_DIR: &str = "history";
     const HISTORY_REPO_DIR: &str = "repo";
     const REGISTRY_FILE: &str = "registry.tsv";
     const ARCHIVES_DIR: &str = "archives";
-    const IGNORE_FILE: &str = "ignore";
     const RUNTIME_LOG_FILE: &str = "runtime.log";
     const PI_RUNTIME_ENV: &str = "AFS_PI_RUNTIME";
     const SHUTDOWN_DRAIN_ENV: &str = "AFS_AGENT_SHUTDOWN_DRAIN_MS";
@@ -472,11 +472,12 @@ pub mod supervisor {
         if matches!(reply.relevance, crate::agent_rpc::Relevance::None) {
             return None;
         }
-        let file_references = filter_broadcast_references(
-            &reply.file_references,
-            &agent.agent_home,
-            &agent.managed_dir,
-        );
+        let subtree = ManagedSubtree::new(&agent.managed_dir, &agent.agent_home);
+        let file_references = reply
+            .file_references
+            .iter()
+            .filter_map(|reference| subtree.file_reference(reference))
+            .collect();
         Some(BroadcastReply {
             agent_identity: agent.identity.clone(),
             managed_dir: agent.managed_dir.clone(),
@@ -494,21 +495,6 @@ pub mod supervisor {
             changed_files: reply.changed_files,
             history_entries: reply.history_entries,
         }
-    }
-
-    /// Apply a directory agent's ignore policy to broadcast file
-    /// references so the structured-output adapter honors
-    /// per-directory ignore rules.
-    fn filter_broadcast_references(
-        refs: &[String],
-        agent_home: &Path,
-        managed_dir: &Path,
-    ) -> Vec<String> {
-        let matcher = load_ignore_matcher(agent_home, managed_dir);
-        refs.iter()
-            .filter_map(|reference| normalize_broadcast_reference(reference, managed_dir))
-            .filter(|reference| !ignore_matches(&matcher, managed_dir, reference))
-            .collect()
     }
 
     /// Send `{"type":"abort"}` to the agent and drain stdout for a
@@ -1248,7 +1234,8 @@ pub mod supervisor {
 
             if !was_already_managed && let Some(parent_agent_index) = parent_agent_index {
                 let parent = &self.agents[parent_agent_index];
-                let affected = relative_managed_path(&parent.managed_dir, &managed_dir)?;
+                let parent_subtree = ManagedSubtree::new(&parent.managed_dir, &parent.agent_home);
+                let affected = parent_subtree.relative_path(&managed_dir)?;
                 record_ownership_event(
                     &parent.managed_dir,
                     &parent.agent_home,
@@ -1323,7 +1310,8 @@ pub mod supervisor {
             let outcome_result: io::Result<(PathBuf, RemoveOutcome)> = (|| {
                 stop_and_persist_registry(removed_agent, self)?;
 
-                let child_origin = relative_managed_path(&parent_managed_dir, &managed_dir)?;
+                let parent_subtree = ManagedSubtree::new(&parent_managed_dir, &parent_agent_home);
+                let child_origin = parent_subtree.relative_path(&managed_dir)?;
 
                 if !removed_agent_home.exists() {
                     record_ownership_event(
@@ -2232,8 +2220,8 @@ pub mod supervisor {
         }
 
         fn rescan_full(shared: &Arc<Mutex<DirectoryIndex>>, managed_dir: &Path, agent_home: &Path) {
-            let nested = nested_managed_relative_paths(managed_dir).unwrap_or_default();
-            let matcher = load_ignore_matcher(agent_home, managed_dir);
+            let subtree = ManagedSubtree::new(managed_dir, agent_home);
+            let nested = subtree.nested_managed_relative_paths().unwrap_or_default();
             let warm_delay = warm_delay_per_file();
 
             // Reserve a fresh generation, snapshot existing keys, reset state
@@ -2291,9 +2279,7 @@ pub mod supervisor {
                     }
 
                     if metadata.is_dir() {
-                        if !is_managed_content_path(managed_dir, &path)
-                            || is_nested_managed_path_with_list(managed_dir, &path, &nested)
-                        {
+                        if !subtree.is_content_path_with_nested(&path, &nested) {
                             continue;
                         }
                         stack.push(path);
@@ -2303,17 +2289,14 @@ pub mod supervisor {
                     if !metadata.is_file() {
                         continue;
                     }
-                    if !is_managed_content_path(managed_dir, &path)
-                        || path_has_agent_home_component(managed_dir, &path)
-                        || is_nested_managed_path_with_list(managed_dir, &path, &nested)
-                    {
+                    if !subtree.is_content_path_with_nested(&path, &nested) {
                         continue;
                     }
-                    if matcher_matches(matcher.as_ref(), managed_dir, &path) {
+                    if subtree.is_ignored(&path) {
                         continue;
                     }
 
-                    let relative = match relative_managed_path(managed_dir, &path) {
+                    let relative = match subtree.relative_path(&path) {
                         Ok(r) => r,
                         Err(_) => continue,
                     };
@@ -2454,36 +2437,6 @@ pub mod supervisor {
             .and_then(|raw| raw.parse::<u64>().ok())
             .filter(|ms| *ms > 0)
             .map(Duration::from_millis)
-    }
-
-    fn matcher_matches(
-        matcher: Option<&ignore::gitignore::Gitignore>,
-        managed_dir: &Path,
-        path: &Path,
-    ) -> bool {
-        let Some(matcher) = matcher else {
-            return false;
-        };
-        let Ok(relative) = path.strip_prefix(managed_dir) else {
-            return false;
-        };
-        matcher
-            .matched_path_or_any_parents(relative, false)
-            .is_ignore()
-    }
-
-    fn is_nested_managed_path_with_list(
-        managed_dir: &Path,
-        path: &Path,
-        nested: &[String],
-    ) -> bool {
-        for relative in nested {
-            let nested_root = managed_dir.join(relative);
-            if path == nested_root || path.starts_with(&nested_root) {
-                return true;
-            }
-        }
-        false
     }
 
     fn classify_as_text(bytes: &[u8]) -> bool {
@@ -2891,62 +2844,6 @@ pub mod supervisor {
         }
     }
 
-    fn load_ignore_matcher(
-        agent_home: &Path,
-        managed_dir: &Path,
-    ) -> Option<ignore::gitignore::Gitignore> {
-        let ignore_path = agent_home.join(IGNORE_FILE);
-        if !ignore_path.is_file() {
-            return None;
-        }
-        let mut builder = ignore::gitignore::GitignoreBuilder::new(managed_dir);
-        if builder.add(&ignore_path).is_some() {
-            return None;
-        }
-        builder.build().ok()
-    }
-
-    fn ignore_matches(
-        matcher: &Option<ignore::gitignore::Gitignore>,
-        managed_dir: &Path,
-        normalized_reference: &str,
-    ) -> bool {
-        let Some(matcher) = matcher else {
-            return false;
-        };
-        let reference_path = Path::new(normalized_reference);
-        let Ok(relative) = reference_path.strip_prefix(managed_dir) else {
-            return false;
-        };
-        matcher
-            .matched_path_or_any_parents(relative, false)
-            .is_ignore()
-    }
-
-    fn normalize_broadcast_reference(reference: &str, managed_dir: &Path) -> Option<String> {
-        let reference = reference.trim();
-        if reference.is_empty() {
-            return None;
-        }
-
-        let path = Path::new(reference);
-        let path = if path.is_absolute() {
-            path.to_path_buf()
-        } else {
-            managed_dir.join(path)
-        };
-
-        if matches!(path.try_exists(), Ok(true)) {
-            let canonical = path.canonicalize().ok()?;
-            return canonical
-                .starts_with(managed_dir)
-                .then(|| canonical.display().to_string());
-        }
-
-        path.starts_with(managed_dir)
-            .then(|| path.display().to_string())
-    }
-
     fn broadcast_reply_timeout() -> Duration {
         std::env::var(BROADCAST_REPLY_TIMEOUT_ENV)
             .ok()
@@ -3238,7 +3135,8 @@ pub mod supervisor {
         if git_has_commits(&git_dir)? {
             return Ok(());
         }
-        let nested = nested_managed_relative_paths(managed_dir)?;
+        let subtree = ManagedSubtree::new(managed_dir, agent_home);
+        let nested = subtree.nested_managed_relative_paths()?;
         git_stage_and_commit(
             &git_dir,
             managed_dir,
@@ -3253,36 +3151,6 @@ pub mod supervisor {
                 origin: None,
             },
         )
-    }
-
-    fn nested_managed_relative_paths(managed_dir: &Path) -> io::Result<Vec<String>> {
-        let mut results = Vec::new();
-        collect_nested_managed_relative_paths(managed_dir, managed_dir, &mut results)?;
-        Ok(results)
-    }
-
-    fn collect_nested_managed_relative_paths(
-        managed_dir: &Path,
-        current_dir: &Path,
-        results: &mut Vec<String>,
-    ) -> io::Result<()> {
-        for entry in std::fs::read_dir(current_dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            if path == managed_dir.join(AGENT_HOME_DIR) {
-                continue;
-            }
-            let file_type = entry.file_type()?;
-            if file_type.is_symlink() || !file_type.is_dir() {
-                continue;
-            }
-            if is_nested_managed_root(managed_dir, &path) {
-                results.push(relative_managed_path(managed_dir, &path)?);
-                continue;
-            }
-            collect_nested_managed_relative_paths(managed_dir, &path, results)?;
-        }
-        Ok(())
     }
 
     fn start_directory_monitor(
@@ -3332,6 +3200,7 @@ pub mod supervisor {
             return Err(error);
         }
         let _ = ready_sender.send(Ok(()));
+        let subtree = ManagedSubtree::new(&managed_dir, &agent_home);
 
         loop {
             if stop_receiver.try_recv().is_ok() {
@@ -3340,10 +3209,10 @@ pub mod supervisor {
 
             match receiver.recv_timeout(Duration::from_millis(50)) {
                 Ok(Ok(event)) => {
-                    if event_affects_managed_subtree(&managed_dir, &event.paths) {
+                    if event_affects_managed_subtree(&subtree, &event.paths) {
                         let mut settled = SettledPaths::new();
-                        settled.absorb(&managed_dir, &event.paths);
-                        wait_for_settled_events(&receiver, &managed_dir, &mut settled);
+                        settled.absorb(&subtree, &event.paths);
+                        wait_for_settled_events(&receiver, &subtree, &mut settled);
                         record_external_change(&managed_dir, &agent_home)?;
                         update_index_after_settle(&managed_dir, &agent_home, &index, settled);
                     }
@@ -3368,9 +3237,9 @@ pub mod supervisor {
             }
         }
 
-        fn absorb(&mut self, managed_dir: &Path, paths: &[PathBuf]) {
+        fn absorb(&mut self, subtree: &ManagedSubtree, paths: &[PathBuf]) {
             for path in paths {
-                if !is_managed_content_path(managed_dir, path) {
+                if !subtree.is_content_path(path) {
                     continue;
                 }
                 if self.paths.len() >= INDEX_SETTLED_PATH_CAP {
@@ -3392,10 +3261,10 @@ pub mod supervisor {
             DirectoryIndex::rescan_full(index, managed_dir, agent_home);
             return;
         }
-        let nested = nested_managed_relative_paths(managed_dir).unwrap_or_default();
-        let matcher = load_ignore_matcher(agent_home, managed_dir);
+        let subtree = ManagedSubtree::new(managed_dir, agent_home);
+        let nested = subtree.nested_managed_relative_paths().unwrap_or_default();
         let paths_vec: Vec<PathBuf> = settled.paths.into_iter().collect();
-        let actions = compute_path_updates(managed_dir, &paths_vec, matcher.as_ref(), &nested);
+        let actions = compute_path_updates(&subtree, &paths_vec, &nested);
         if actions.is_empty() {
             return;
         }
@@ -3405,24 +3274,20 @@ pub mod supervisor {
     }
 
     fn compute_path_updates(
-        managed_dir: &Path,
+        subtree: &ManagedSubtree,
         paths: &[PathBuf],
-        matcher: Option<&ignore::gitignore::Gitignore>,
         nested: &[String],
     ) -> Vec<PathAction> {
         let mut actions = Vec::with_capacity(paths.len());
         for path in paths {
-            if !is_managed_content_path(managed_dir, path)
-                || path_has_agent_home_component(managed_dir, path)
-                || is_nested_managed_path_with_list(managed_dir, path, nested)
-            {
+            if !subtree.is_content_path_with_nested(path, nested) {
                 continue;
             }
-            let relative = match relative_managed_path(managed_dir, path) {
+            let relative = match subtree.relative_path(path) {
                 Ok(r) => r,
                 Err(_) => continue,
             };
-            if matcher_matches(matcher, managed_dir, path) {
+            if subtree.is_ignored(path) {
                 actions.push(PathAction::Clear(relative));
                 continue;
             }
@@ -3443,7 +3308,7 @@ pub mod supervisor {
 
     fn wait_for_settled_events(
         receiver: &Receiver<notify::Result<notify::Event>>,
-        managed_dir: &Path,
+        subtree: &ManagedSubtree,
         settled: &mut SettledPaths,
     ) {
         let mut deadline = Instant::now() + SETTLE_WINDOW;
@@ -3455,8 +3320,8 @@ pub mod supervisor {
 
             match receiver.recv_timeout(deadline - now) {
                 Ok(Ok(event)) => {
-                    if event_affects_managed_subtree(managed_dir, &event.paths) {
-                        settled.absorb(managed_dir, &event.paths);
+                    if event_affects_managed_subtree(subtree, &event.paths) {
+                        settled.absorb(subtree, &event.paths);
                         deadline = Instant::now() + SETTLE_WINDOW;
                     }
                 }
@@ -3467,19 +3332,8 @@ pub mod supervisor {
         }
     }
 
-    fn event_affects_managed_subtree(managed_dir: &Path, paths: &[PathBuf]) -> bool {
-        paths
-            .iter()
-            .any(|path| is_managed_content_path(managed_dir, path))
-    }
-
-    fn is_managed_content_path(managed_dir: &Path, path: &Path) -> bool {
-        let agent_home = managed_dir.join(AGENT_HOME_DIR);
-        path != managed_dir
-            && path.starts_with(managed_dir)
-            && !path.starts_with(agent_home)
-            && !path_has_agent_home_component(managed_dir, path)
-            && !is_nested_managed_path(managed_dir, path)
+    fn event_affects_managed_subtree(subtree: &ManagedSubtree, paths: &[PathBuf]) -> bool {
+        paths.iter().any(|path| subtree.is_content_path(path))
     }
 
     fn record_external_change(managed_dir: &Path, agent_home: &Path) -> io::Result<()> {
@@ -3545,7 +3399,8 @@ pub mod supervisor {
             .lock()
             .map_err(|_| io::Error::other("history lock poisoned"))?;
         let git_dir = history_repo_dir(agent_home);
-        let nested = nested_managed_relative_paths(managed_dir)?;
+        let subtree = ManagedSubtree::new(managed_dir, agent_home);
+        let nested = subtree.nested_managed_relative_paths()?;
         git_stage_work_tree(&git_dir, managed_dir, &nested)?;
         let changed_files = git_staged_changes_vs_head(&git_dir)?;
         let reconciliation_files = changed_files
@@ -3579,7 +3434,8 @@ pub mod supervisor {
             .lock()
             .map_err(|_| io::Error::other("history lock poisoned"))?;
         let git_dir = history_repo_dir(agent_home);
-        let nested = nested_managed_relative_paths(managed_dir)?;
+        let subtree = ManagedSubtree::new(managed_dir, agent_home);
+        let nested = subtree.nested_managed_relative_paths()?;
         git_stage_work_tree(&git_dir, managed_dir, &nested)?;
         let changed_files = git_staged_changes_vs_head(&git_dir)?;
         if changed_files.is_empty() {
@@ -3616,7 +3472,8 @@ pub mod supervisor {
             .lock()
             .map_err(|_| io::Error::other("history lock poisoned"))?;
         let git_dir = history_repo_dir(agent_home);
-        let nested = nested_managed_relative_paths(managed_dir)?;
+        let subtree = ManagedSubtree::new(managed_dir, agent_home);
+        let nested = subtree.nested_managed_relative_paths()?;
         git_stage_work_tree(&git_dir, managed_dir, &nested)?;
         let changed_files = git_staged_changes_vs_head(&git_dir)?;
         let entry_id = history_entry_id();
@@ -4026,7 +3883,8 @@ pub mod supervisor {
         };
         git_restore_tree(&git_dir, managed_dir, &parent_commit)?;
 
-        let nested = nested_managed_relative_paths(managed_dir)?;
+        let subtree = ManagedSubtree::new(managed_dir, agent_home);
+        let nested = subtree.nested_managed_relative_paths()?;
         let undo_entry_id = history_entry_id();
         let undo_summary = sanitize_field(&format!("Undo {}: {}", latest.entry_id, latest.summary));
         git_stage_and_commit(
@@ -4099,20 +3957,6 @@ pub mod supervisor {
 
     fn sanitize_field(value: &str) -> String {
         value.replace(['\t', '\n', '\r'], " ")
-    }
-
-    fn relative_managed_path(managed_dir: &Path, path: &Path) -> io::Result<String> {
-        Ok(path
-            .strip_prefix(managed_dir)
-            .map_err(io::Error::other)?
-            .to_string_lossy()
-            .replace('\\', "/"))
-    }
-
-    fn is_nested_managed_root(managed_dir: &Path, path: &Path) -> bool {
-        path != managed_dir
-            && path.starts_with(managed_dir)
-            && path.join(AGENT_HOME_DIR).join("identity").is_file()
     }
 
     fn rediscover_managed_dir(original: &Path, identity: &str) -> io::Result<Option<PathBuf>> {
@@ -4200,36 +4044,6 @@ pub mod supervisor {
             Ok(content) => Ok(content.trim() == identity),
             Err(_) => Ok(false),
         }
-    }
-
-    fn is_nested_managed_path(managed_dir: &Path, path: &Path) -> bool {
-        if !path.starts_with(managed_dir) {
-            return false;
-        }
-
-        let mut current = path;
-        loop {
-            if is_nested_managed_root(managed_dir, current) {
-                return true;
-            }
-            let Some(parent) = current.parent() else {
-                return false;
-            };
-            if parent == current || !parent.starts_with(managed_dir) {
-                return false;
-            }
-            current = parent;
-        }
-    }
-
-    fn path_has_agent_home_component(managed_dir: &Path, path: &Path) -> bool {
-        let Ok(relative) = path.strip_prefix(managed_dir) else {
-            return false;
-        };
-
-        relative
-            .components()
-            .any(|component| component.as_os_str() == AGENT_HOME_DIR)
     }
 
     fn history_repo_dir(agent_home: &Path) -> PathBuf {
