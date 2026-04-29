@@ -313,7 +313,7 @@ _Avoid_: Dashboard, control panel
 - The **Supervisor Agent** owns the lifecycle of **Directory Agent** processes
 - The **Supervisor Agent** starts, stops, restarts, and reconnects **Directory Agent** processes
 - On startup, the **Supervisor Agent** discovers **Agent Homes**, starts or reconnects **Directory Agents**, and registers them
-- The initial **Agent Transport** uses the **Pi Agent Runtime** RPC mode over local stdio
+- The initial **Agent Transport** uses the **Pi Agent Runtime** JSONL JSON-RPC over local stdio
 - Direct **Agent Messages** between **Directory Agents** are logically direct but physically routed by the **Supervisor Agent** in the initial system
 - Installing a nested **Managed Directory** performs an **Ownership Split**
 - An **Agent Removal** for a nested **Managed Directory** performs an **Ownership Merge**
@@ -478,7 +478,7 @@ _Avoid_: Dashboard, control panel
 > **Dev:** "Who restarts a **Directory Agent** if its process exits?"
 > **Domain expert:** "The **Supervisor Agent** owns the **Directory Agent** process lifecycle and restarts it."
 > **Dev:** "Do **Directory Agents** open network sockets to talk to each other?"
-> **Domain expert:** "No. The initial **Agent Transport** uses Pi RPC over local stdio, with the **Supervisor Agent** routing messages between child processes."
+> **Domain expert:** "No. The initial **Agent Transport** uses Pi's JSONL JSON-RPC over local stdio, with the **Supervisor Agent** routing messages between child processes."
 > **Dev:** "What happens when `/projects/app` gets its own **Directory Agent** under managed `/projects`?"
 > **Domain expert:** "That is an **Ownership Split**: `/projects` stops managing the `/projects/app` subtree, and the new child agent takes over."
 > **Dev:** "What happens if the `/projects/app` agent is removed?"

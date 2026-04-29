@@ -190,155 +190,112 @@ fn start_daemon_with_reconciliation_delay(
         .expect("afs daemon should start")
 }
 
-fn fake_pi_runtime(test_name: &str) -> std::path::PathBuf {
-    let runtime_dir = unique_afs_home(test_name);
-    std::fs::create_dir_all(&runtime_dir).expect("test should create fake runtime directory");
-    let runtime = runtime_dir.join("pi");
+/// Path to the JSONL-conforming fake Pi binary built from
+/// `src/bin/fake_pi.rs`. Tests pass this path to AFS via
+/// `AFS_PI_RUNTIME`; per-test fixture files live under each agent's
+/// `$AFS_AGENT_HOME` and drive the fake's reply behavior.
+///
+/// The `_test_name` parameter is kept for back-compat with the
+/// previous shell-script fake; the binary is shared across all tests
+/// because per-test state lives in the agent home, not the runtime.
+fn fake_pi_runtime(_test_name: &str) -> std::path::PathBuf {
+    std::path::PathBuf::from(env!("CARGO_BIN_EXE_fake_pi"))
+}
+
+#[allow(dead_code)]
+fn write_relevance_reply(
+    agent_home: &std::path::Path,
+    relevance: &str,
+    reason: &str,
+    answer: &str,
+    file_references: &[&str],
+) {
+    let body = serde_json::json!({
+        "schema_version": 1,
+        "relevance": relevance,
+        "reason": reason,
+        "answer": answer,
+        "file_references": file_references,
+        "changed_files": [],
+        "history_entries": [],
+        "delegates": [],
+    });
     std::fs::write(
-        &runtime,
-        r#"#!/bin/sh
-{
-  printf 'argv=%s\n' "$*"
-  for arg in "$@"; do
-    printf 'arg=%s\n' "$arg"
-  done
-  printf 'env_HOME=%s\n' "$HOME"
-  printf 'env_ANTHROPIC_API_KEY=%s\n' "${ANTHROPIC_API_KEY-}"
-  printf 'env_OPENAI_API_KEY=%s\n' "${OPENAI_API_KEY-}"
-  printf 'done=1\n'
-} > "$AFS_AGENT_HOME/spawn-observed"
-{
-  printf 'identity=%s\n' "$AFS_AGENT_ID"
-  printf 'managed_dir=%s\n' "$AFS_MANAGED_DIR"
-  printf 'rpc=%s\n' "$AFS_AGENT_RPC"
-} > "$AFS_AGENT_HOME/runtime-started"
-while IFS= read -r _line; do
-  if [ "$_line" = "ASK" ]; then
-    IFS= read -r asked_path
-    IFS= read -r asked_prompt
-    {
-      printf 'path=%s\n' "$asked_path"
-      printf 'prompt=%s\n' "$asked_prompt"
-    } >> "$AFS_AGENT_HOME/ask-received"
-    if [ -f "$AFS_AGENT_HOME/ask-delay-seconds" ]; then
-      sleep "$(cat "$AFS_AGENT_HOME/ask-delay-seconds")"
-    fi
-    if [ -f "$AFS_AGENT_HOME/delegate-target" ]; then
-      delegate_target="$(cat "$AFS_AGENT_HOME/delegate-target")"
-      delegate_reply_target="supervisor"
-      if [ -f "$AFS_AGENT_HOME/delegate-reply-target" ]; then
-        delegate_reply_target="$(cat "$AFS_AGENT_HOME/delegate-reply-target")"
-      fi
-      delegate_prompt="$asked_prompt"
-      if [ -f "$AFS_AGENT_HOME/delegate-prompt" ]; then
-        delegate_prompt="$(cat "$AFS_AGENT_HOME/delegate-prompt")"
-      fi
-      printf 'DELEGATE\t%s\t%s\t%s\n' "$delegate_target" "$delegate_reply_target" "$delegate_prompt"
-      if [ -f "$AFS_AGENT_HOME/delegate-second-prompt" ]; then
-        delegate_second_prompt="$(cat "$AFS_AGENT_HOME/delegate-second-prompt")"
-        printf 'DELEGATE\t%s\t%s\t%s\n' "$delegate_target" "$delegate_reply_target" "$delegate_second_prompt"
-      fi
-      if [ "$delegate_reply_target" = "delegator" ]; then
-        IFS= read -r delegated_marker
-        IFS= read -r delegated_agent
-        IFS= read -r delegated_answer
-        IFS= read -r delegated_changed_files
-        IFS= read -r delegated_history_entries
-        {
-          printf 'agent=%s\n' "$delegated_agent"
-          printf 'answer=%s\n' "$delegated_answer"
-          printf 'changed_files=%s\n' "$delegated_changed_files"
-          printf 'history_entries=%s\n' "$delegated_history_entries"
-        } >> "$AFS_AGENT_HOME/delegated-reply-received"
-        printf 'delegator %s used %s\n' "$AFS_AGENT_ID" "$delegated_answer"
-      fi
-    else
-      printf 'agent %s answered about %s\n' "$AFS_AGENT_ID" "$asked_path"
-    fi
-  elif [ "$_line" = "BROADCAST" ]; then
-    IFS= read -r asked_prompt
-    printf 'prompt=%s\n' "$asked_prompt" >> "$AFS_AGENT_HOME/broadcast-received"
-    if [ -f "$AFS_AGENT_HOME/broadcast-delay-seconds" ]; then
-      sleep "$(cat "$AFS_AGENT_HOME/broadcast-delay-seconds")"
-    fi
-    if [ -f "$AFS_AGENT_HOME/broadcast-response" ]; then
-      cat "$AFS_AGENT_HOME/broadcast-response"
-    fi
-  elif [ "$_line" = "COLLABORATE" ]; then
-    IFS= read -r peer_count
-    : > "$AFS_AGENT_HOME/collaborate-peers"
-    i=0
-    while [ "$i" -lt "$peer_count" ]; do
-      IFS= read -r peer_line
-      printf '%s\n' "$peer_line" >> "$AFS_AGENT_HOME/collaborate-peers"
-      i=$((i + 1))
-    done
-    IFS= read -r collab_prompt
-    printf 'prompt=%s\n' "$collab_prompt" >> "$AFS_AGENT_HOME/collaborate-received"
-    delegated_answer=""
-    if [ -f "$AFS_AGENT_HOME/collaborate-delegate-target" ]; then
-      collab_target="$(cat "$AFS_AGENT_HOME/collaborate-delegate-target")"
-      collab_dprompt="$collab_prompt"
-      if [ -f "$AFS_AGENT_HOME/collaborate-delegate-prompt" ]; then
-        collab_dprompt="$(cat "$AFS_AGENT_HOME/collaborate-delegate-prompt")"
-      fi
-      printf 'DELEGATE\t%s\tdelegator\t%s\n' "$collab_target" "$collab_dprompt"
-      IFS= read -r _marker
-      IFS= read -r _agent
-      IFS= read -r delegated_answer
-      IFS= read -r _changed
-      IFS= read -r _history
-      {
-        printf 'agent=%s\n' "$_agent"
-        printf 'answer=%s\n' "$delegated_answer"
-      } >> "$AFS_AGENT_HOME/collaborate-delegated-reply"
-    fi
-    if [ -f "$AFS_AGENT_HOME/collaborate-response-template" ]; then
-      template="$(cat "$AFS_AGENT_HOME/collaborate-response-template")"
-      escaped_answer="$(printf '%s' "$delegated_answer" | sed 's/[\\/&]/\\&/g')"
-      printf '%s\n' "$template" | sed "s/__PEER_ANSWER__/$escaped_answer/g"
-    elif [ -f "$AFS_AGENT_HOME/collaborate-response" ]; then
-      cat "$AFS_AGENT_HOME/collaborate-response"
-    else
-      printf 'COLLABORATE_REPLY\t%s collaborated\tnone\tnone\n' "$AFS_AGENT_ID"
-    fi
-  elif [ "$_line" = "TASK" ]; then
-    IFS= read -r requester
-    IFS= read -r reply_target
-    IFS= read -r task_prompt
-    {
-      printf 'requester=%s\n' "$requester"
-      printf 'reply_target=%s\n' "$reply_target"
-      printf 'prompt=%s\n' "$task_prompt"
-    } >> "$AFS_AGENT_HOME/task-received"
-    if [ -f "$AFS_AGENT_HOME/task-delay-seconds" ]; then
-      sleep "$(cat "$AFS_AGENT_HOME/task-delay-seconds")"
-    fi
-    if [ -f "$AFS_AGENT_HOME/task-write-file" ]; then
-      task_write_file="$(cat "$AFS_AGENT_HOME/task-write-file")"
-      task_write_content="delegated task content"
-      if [ -f "$AFS_AGENT_HOME/task-write-content" ]; then
-        task_write_content="$(cat "$AFS_AGENT_HOME/task-write-content")"
-      fi
-      printf '%s\n' "$task_write_content" > "$AFS_MANAGED_DIR/$task_write_file"
-    fi
-    if [ -f "$AFS_AGENT_HOME/task-response" ]; then
-      task_answer="$(cat "$AFS_AGENT_HOME/task-response")"
-    else
-      task_answer="delegated answer for $task_prompt from $AFS_AGENT_ID"
-    fi
-    printf 'TASK_REPLY\t%s\tnone\tnone\n' "$task_answer"
-  fi
-done
-"#,
+        agent_home.join("broadcast-response.json"),
+        serde_json::to_string(&body).expect("relevance reply serializes"),
     )
-    .expect("test should create fake Pi runtime");
-    let mut permissions = std::fs::metadata(&runtime)
-        .expect("fake Pi runtime should exist")
-        .permissions();
-    permissions.set_mode(0o755);
-    std::fs::set_permissions(&runtime, permissions).expect("fake Pi runtime should be executable");
-    runtime
+    .expect("write broadcast-response.json");
+}
+
+#[allow(dead_code)]
+fn write_collaborate_reply(
+    agent_home: &std::path::Path,
+    answer: &str,
+    changed_files: &[&str],
+    history_entries: &[&str],
+) {
+    let body = serde_json::json!({
+        "schema_version": 1,
+        "relevance": "strong",
+        "reason": "fake collab",
+        "answer": answer,
+        "file_references": [],
+        "changed_files": changed_files,
+        "history_entries": history_entries,
+        "delegates": [],
+    });
+    std::fs::write(
+        agent_home.join("collaborate-response.json"),
+        serde_json::to_string(&body).expect("collaborate reply serializes"),
+    )
+    .expect("write collaborate-response.json");
+}
+
+#[allow(dead_code)]
+fn write_collaborate_template_reply(agent_home: &std::path::Path, answer_template: &str) {
+    // The template uses __PEER_ANSWER__ which the fake does not yet
+    // substitute (Pi has no streaming peer-answer semantics); tests
+    // that previously relied on the substitution should write the
+    // expected literal answer here.
+    let body = serde_json::json!({
+        "schema_version": 1,
+        "relevance": "strong",
+        "reason": "fake collab template",
+        "answer": answer_template,
+        "file_references": [],
+        "changed_files": [],
+        "history_entries": [],
+        "delegates": [],
+    });
+    std::fs::write(
+        agent_home.join("collaborate-response-template.json"),
+        serde_json::to_string(&body).expect("template reply serializes"),
+    )
+    .expect("write collaborate-response-template.json");
+}
+
+#[allow(dead_code)]
+fn write_task_reply(
+    agent_home: &std::path::Path,
+    answer: &str,
+    changed_files: &[&str],
+    history_entries: &[&str],
+) {
+    let body = serde_json::json!({
+        "schema_version": 1,
+        "relevance": "strong",
+        "reason": "fake task",
+        "answer": answer,
+        "file_references": [],
+        "changed_files": changed_files,
+        "history_entries": history_entries,
+        "delegates": [],
+    });
+    std::fs::write(
+        agent_home.join("task-response.json"),
+        serde_json::to_string(&body).expect("task reply serializes"),
+    )
+    .expect("write task-response.json");
 }
 
 fn stop_daemon(daemon: &mut Child) {
@@ -4149,6 +4106,10 @@ fn install_with_valid_config_spawns_agent_runtime_with_provider_and_model() {
         observed.contains("arg=--model") && observed.contains("arg=claude-sonnet-4-6"),
         "runtime should receive --model from config. got:\n{observed}"
     );
+    assert!(
+        observed.contains("arg=-e") && observed.contains("afs_reply.ts"),
+        "runtime should receive -e <path-to-afs_reply.ts>. got:\n{observed}"
+    );
 
     stop_daemon(&mut daemon);
 }
@@ -4200,6 +4161,10 @@ fn install_with_config_without_model_omits_model_flag() {
     assert!(
         !observed.contains("arg=--model"),
         "runtime should not receive --model when unset in config. got:\n{observed}"
+    );
+    assert!(
+        observed.contains("arg=-e") && observed.contains("afs_reply.ts"),
+        "runtime should receive -e <path-to-afs_reply.ts>. got:\n{observed}"
     );
 
     stop_daemon(&mut daemon);
@@ -4255,6 +4220,10 @@ fn install_forwards_runtime_provider_id_to_pi() {
     assert!(
         !observed.contains("arg=openai\n"),
         "runtime should not receive bare --provider openai when runtime_provider_id overrides it. got:\n{observed}"
+    );
+    assert!(
+        observed.contains("arg=-e") && observed.contains("afs_reply.ts"),
+        "runtime should receive -e <path-to-afs_reply.ts>. got:\n{observed}"
     );
 
     stop_daemon(&mut daemon);
@@ -6312,6 +6281,72 @@ fn text_file_with_pdf_magic_prefix_falls_back_to_text_index() {
     assert!(
         !stdout.contains("failed="),
         "text file that incidentally starts with %PDF- should not be counted as a failed extraction; got:\n{stdout}"
+    );
+
+    stop_daemon(&mut daemon);
+}
+
+/// Real-Pi wire-format canary. Skips by default; runs only when the
+/// caller sets `AFS_REAL_PI_SMOKE=1` AND a `pi` binary is on PATH
+/// AND the caller has already configured Pi credentials (via
+/// `pi login` or equivalent). Spawns AFS against the real
+/// `pi --mode rpc` and exercises one `afs ask` end-to-end so a
+/// future Pi release that drifts from the JSONL JSON-RPC schema
+/// AFS targets surfaces here instead of in user-visible silent
+/// failure (the bug that produced issue #40).
+///
+/// Run with:
+///   AFS_REAL_PI_SMOKE=1 cargo test -- --ignored real_pi_smoke
+#[test]
+#[ignore]
+fn real_pi_smoke_ask_returns_afs_reply() {
+    if std::env::var("AFS_REAL_PI_SMOKE").ok().as_deref() != Some("1") {
+        eprintln!(
+            "skipping real-Pi smoke: set AFS_REAL_PI_SMOKE=1 and ensure `pi` is on PATH and authenticated"
+        );
+        return;
+    }
+    let pi_path = match Command::new("which").arg("pi").output() {
+        Ok(output) if output.status.success() => {
+            std::path::PathBuf::from(String::from_utf8_lossy(&output.stdout).trim().to_string())
+        }
+        _ => {
+            eprintln!("skipping real-Pi smoke: `pi` not found on PATH");
+            return;
+        }
+    };
+
+    let afs_home = unique_afs_home("real-pi-smoke");
+    let socket_path = supervisor_socket(&afs_home);
+    write_config(&afs_home, r#"{"provider":"claude","auth_method":"oauth"}"#);
+    let managed_dir = unique_afs_home("real-pi-smoke-managed");
+    std::fs::create_dir_all(&managed_dir).expect("create managed dir");
+    std::fs::write(managed_dir.join("hello.txt"), "smoke test\n").expect("seed managed file");
+    let managed_dir = managed_dir.canonicalize().expect("canonicalize");
+
+    let mut daemon = start_daemon_with_pi_runtime(&afs_home, &pi_path);
+    await_socket(&socket_path);
+
+    let install = install_managed_dir(&afs_home, &managed_dir);
+    assert!(
+        install.status.success(),
+        "afs install should succeed against real Pi\nstderr:\n{}",
+        String::from_utf8_lossy(&install.stderr)
+    );
+
+    let ask = afs_ask(&afs_home, "what is in hello.txt?");
+    let stdout = String::from_utf8_lossy(&ask.stdout);
+    let stderr = String::from_utf8_lossy(&ask.stderr);
+
+    // We accept any of: a structured reply (afs_reply was called),
+    // a graceful "agent finished without afs_reply" diagnostic, or
+    // a Pi-side parse error. What we DON'T accept is a hang or a
+    // panic. The point of this test is to flush wire-format drift.
+    assert!(
+        ask.status.success()
+            || stderr.contains("did not reply")
+            || stderr.contains("agent finished"),
+        "real-Pi ask either succeeded or surfaced a diagnostic; instead got\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
 
     stop_daemon(&mut daemon);

@@ -341,10 +341,11 @@ entry. Non-latest entries are rejected. External and reconciliation entries need
 
 ## Agent Runtime Protocol
 
-AFS starts the external runtime as:
+AFS speaks Pi's documented JSONL JSON-RPC over child stdio (see
+`@mariozechner/pi-coding-agent/docs/rpc.md`). The supervisor starts the runtime as:
 
 ```text
-$AFS_PI_RUNTIME --mode rpc --provider <claude|openai> [--model <model>]
+$AFS_PI_RUNTIME --mode rpc --provider <claude|openai> -e <agent-home>/extensions/afs_reply.ts [--model <model>]
 ```
 
 The runtime is started with the managed directory as its working directory and
@@ -356,68 +357,73 @@ receives these environment variables:
 - `AFS_AGENT_RPC=stdio`
 - `<api-key-env>` when the configured auth method is `api_key`
 
-The supervisor sends line-oriented requests on stdin.
+### Wire format
 
-Direct ask:
+One JSON object per line, LF (`\n`) as the only record delimiter. Clients
+must NOT split on `\r`, U+2028, or U+2029 — those characters can appear
+inside JSON strings. The supervisor sends commands on the agent's stdin
+and consumes responses + events on stdout.
 
-```text
-ASK
-<requested-path>
-<prompt>
-```
+### Structured output (`afs_reply` extension)
 
-Broadcast ask:
-
-```text
-BROADCAST
-<prompt>
-```
-
-Broadcast replies use one line:
+Pi's RPC `prompt` command does not accept a `response_format` /
+`json_schema` parameter. AFS instead vendors `assets/pi-extensions/afs_reply.ts`
+into every Agent Home and passes `-e <path>` to Pi. The extension registers
+an `afs_reply` tool whose TypeBox parameters pin the structured-output
+contract every directory agent must satisfy:
 
 ```text
-possible|strong<TAB><reason><TAB><answer><TAB><semicolon-separated-file-references>
+{
+  "schema_version": 1,
+  "relevance":      "none" | "possible" | "strong",
+  "reason":         <string>,
+  "answer":         <string>,
+  "file_references":  [<string>, ...],
+  "changed_files":    [<string>, ...],
+  "history_entries":  [<string>, ...],
+  "delegates":        [{
+    "target":       <agent-identity-or-absolute-path>,
+    "reply_target": "delegator" | "supervisor",
+    "prompt":       <string>
+  }, ...]
+}
 ```
 
-Delegated task:
+The tool uses `terminate: true`, so the agent ends its turn on the
+`afs_reply` call. AFS reads the structured args from the `tool_execution_end`
+event on Pi's stdout. A stale on-disk extension is rejected on the very
+first turn because the Rust deserializer asserts `schema_version == 1`.
 
-```text
-TASK
-<requester-agent-id>
-<delegator|supervisor>
-<prompt>
-```
+### Conversation primitives
 
-Task reply:
+Pi has exactly one prompting verb: `prompt`. The supervisor performs all
+fan-out (broadcast), collaboration, and delegation; per agent it just
+sends prompts and consumes events. AFS prepends a structured envelope tag
+to every prompt's first line so the test fake (and a future routing layer)
+can identify the AFS-level intent without changing Pi's contract:
 
-```text
-TASK_REPLY<TAB><answer><TAB><changed-files-or-none><TAB><history-entries-or-none>
-```
-
-A direct ask may request delegation by returning:
-
-```text
-DELEGATE<TAB><target-agent-id-or-absolute-path><TAB><delegator|supervisor><TAB><prompt>
-```
-
-Collaboration round (sent after a broadcast when 2+ agents replied
-`possible`/`strong`):
-
-```text
-COLLABORATE
-<peer-count>
-<peer-agent-id><TAB><peer-managed-dir>   (one line per peer, repeated peer-count times)
-<prompt>
-```
-
-During its turn the agent may emit zero or more `DELEGATE` lines and must
-terminate the turn with:
-
-```text
-COLLABORATE_REPLY<TAB><answer><TAB><changed-files-or-none><TAB><history-entries-or-none>
-```
+- `<<<AFS:VERB=ask>>>` — direct ask against an explicit managed path.
+- `<<<AFS:VERB=broadcast>>>` — relevance discovery across all agents.
+- `<<<AFS:VERB=collaborate>>>` — a follow-up round when 2+ agents reply
+  `possible`/`strong`; carries the peer manifest in the message body.
+- `<<<AFS:VERB=task>>>` — a delegated task issued from another agent.
+- `<<<AFS:VERB=delegated_reply>>>` — the consultee's reply delivered back
+  to the consulter so the agent can refine its answer in a follow-up turn.
 
 The per-turn timeout reuses `AFS_BROADCAST_REPLY_TIMEOUT_MS`.
+
+### Wire-format canary
+
+A single `#[ignore]`-marked test (`real_pi_smoke_ask_returns_afs_reply` in
+`tests/cli.rs`) exercises the full wire path against a real `pi --mode rpc`.
+Run it with:
+
+```sh
+AFS_REAL_PI_SMOKE=1 cargo test -- --ignored real_pi_smoke
+```
+
+It is excluded from the default verification gate so contributors are not
+required to install Pi to run `cargo test`.
 
 ## PRD #1 Status
 
