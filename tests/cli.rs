@@ -6351,3 +6351,42 @@ fn real_pi_smoke_ask_returns_afs_reply() {
 
     stop_daemon(&mut daemon);
 }
+
+#[test]
+fn directory_agent_stderr_is_captured_to_runtime_log() {
+    let afs_home = unique_afs_home("runtime-log-stderr");
+    let managed_dir = unique_afs_home("runtime-log-stderr-managed");
+    let pi_runtime = fake_pi_runtime("runtime-log-stderr-runtime");
+    let socket_path = supervisor_socket(&afs_home);
+    std::fs::create_dir_all(managed_dir.join(".afs"))
+        .expect("test should create managed directory and agent home");
+    let managed_dir = managed_dir
+        .canonicalize()
+        .expect("managed directory should canonicalize");
+    let stderr_sigil = "fake-pi-stderr-banner-12345";
+    std::fs::write(
+        managed_dir.join(".afs/runtime-stderr"),
+        format!("{stderr_sigil}\n"),
+    )
+    .expect("test should seed runtime-stderr before install");
+
+    let mut daemon = start_daemon_with_pi_runtime(&afs_home, &pi_runtime);
+    await_socket(&socket_path);
+
+    let install = install_managed_dir(&afs_home, &managed_dir);
+    assert!(install.status.success(), "afs install should succeed");
+
+    let log_path = managed_dir.join(".afs/runtime.log");
+    let captured = wait_until(Duration::from_secs(5), || {
+        std::fs::read_to_string(&log_path)
+            .map(|contents| contents.contains(stderr_sigil))
+            .unwrap_or(false)
+    });
+    let log_contents = std::fs::read_to_string(&log_path).unwrap_or_default();
+    assert!(
+        captured,
+        "Pi runtime stderr should be appended to <agent-home>/runtime.log; got:\n{log_contents}"
+    );
+
+    stop_daemon(&mut daemon);
+}
