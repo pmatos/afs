@@ -57,13 +57,14 @@ source-grounded coverage map.
   ready but some files (for example, malformed PDFs) failed extraction.
 - `afs ask <prompt>` supports explicit path routing to the deepest owning
   managed directory.
-- Broad asks are broadcast to registered agents and include relevant replies,
-  file references, participating agents, changed files, and the broadcast
-  timeout.
+- Broad asks are broadcast to registered agents and return a synthesized answer
+  from relevant replies, plus file references, participating agents, changed
+  files, and the broadcast timeout.
 - After broadcast discovery, relevant agents enter a sequential collaboration
   round. Each may delegate to another relevant agent (delegator reply target)
-  and use the reply in its refined answer. The final `afs ask` output
-  aggregates all participating agents (broadcast + consulted), file
+  and use the reply in its refined answer. The final `afs ask` output uses the
+  refined answer text rather than exposing the agent transcript, while still
+  aggregating all participating agents (broadcast + consulted), file
   references, changed files, and history entries from both phases.
 - Directory agents can delegate direct tasks to another agent and request the
   reply either to the supervisor or back to the delegator.
@@ -140,11 +141,18 @@ Build AFS:
 cargo build
 ```
 
+This repository also contains a `fake_pi` helper binary for tests, so `cargo
+run` examples must name the user-facing binary explicitly:
+
+```sh
+cargo run --bin afs -- <command>
+```
+
 Authenticate once with the chosen provider (interactive):
 
 ```sh
-cargo run -- login --provider claude
-# or: cargo run -- login --provider openai
+cargo run --bin afs -- login --provider claude
+# or: cargo run --bin afs -- login --provider openai
 ```
 
 Login forwards to the configured Pi runtime to perform the OAuth flow and
@@ -153,45 +161,45 @@ writes `$AFS_HOME/config.json` on success.
 Start the supervisor in one terminal:
 
 ```sh
-cargo run -- daemon
+cargo run --bin afs -- daemon
 ```
 
 Install a selected directory from another terminal:
 
 ```sh
-cargo run -- install /path/to/project
+cargo run --bin afs -- install /path/to/project
 ```
 
 Ask about an explicit managed path:
 
 ```sh
-cargo run -- ask "summarize /path/to/project/README.md"
+cargo run --bin afs -- ask "summarize /path/to/project/README.md"
 ```
 
 Ask a broad discovery question:
 
 ```sh
-cargo run -- ask "where are my recent health records?"
+cargo run --bin afs -- ask "where are my recent health records?"
 ```
 
 Inspect status and history:
 
 ```sh
-cargo run -- agents
-cargo run -- history /path/to/project
+cargo run --bin afs -- agents
+cargo run --bin afs -- history /path/to/project
 ```
 
 Undo the newest undoable history entry:
 
 ```sh
-cargo run -- undo /path/to/project history-123 --yes
+cargo run --bin afs -- undo /path/to/project history-123 --yes
 ```
 
 Use a separate supervisor home for experiments:
 
 ```sh
 export AFS_HOME=/tmp/afs-demo-home
-cargo run -- daemon
+cargo run --bin afs -- daemon
 ```
 
 ## CLI Reference
@@ -278,7 +286,13 @@ configured timeout. Replies whose file references fall outside the managed
 directory (including via symlinks) or match the directory's ignore policy are
 filtered out.
 
-Direct and delegated answers include:
+Broadcast prompts frame words such as "manages", "oversees", "owns", or
+"responsible for" as AFS directory-agent responsibility when the question is
+about finding relevant managed data. Agents should only treat that language as
+human, organizational, legal, or governance ownership when the prompt asks for
+that explicitly.
+
+Final answers include:
 
 - file references
 - an index-warming caveat (only while the owning agent's local index is
@@ -315,9 +329,8 @@ lines (each terminated by `\n`) before the final-answer block:
 - `progress: task complete agent=<id> changed_files=<n>` after each delegated
   task returns.
 
-The streamed body is otherwise unchanged; consumers that buffer the entire
-`afs ask` response see the same final answer plus the additional progress
-lines at the start.
+The streamed body is the same synthesized final body that buffered consumers
+receive, with the additional progress lines at the start.
 
 ### `afs history <path>`
 
@@ -496,8 +509,8 @@ Implemented or usable:
 - Broadcast collaboration: when two or more agents reply with relevance, the
   supervisor runs a sequential collaboration round in which each relevant
   agent may delegate to another relevant agent and use the reply in its
-  refined answer. The final `afs ask` output reports every participant and
-  aggregates change reports from both phases.
+  refined answer. The final `afs ask` output uses the refined answer text,
+  reports every participant, and aggregates change reports from both phases.
 - Direct agent-to-agent delegation with supervisor/delegator reply targets.
 - Change reports in final ask output for delegated mutations.
 - FIFO handling for multiple delegated tasks sent to one target during one ask.

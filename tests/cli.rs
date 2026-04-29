@@ -1091,7 +1091,15 @@ fn broad_ask_broadcasts_to_registered_agents_and_reports_relevant_references() {
     let stdout = String::from_utf8_lossy(&ask.stdout);
     assert!(
         stdout.contains("Found the 2025 blood panel"),
-        "afs ask should include the relevant agent answer"
+        "afs ask should include the relevant answer"
+    );
+    assert!(
+        !stdout.contains("answers:"),
+        "broadcast final body should be a synthesized answer, not an agent transcript\nstdout:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("managed_dir="),
+        "broadcast final body should not expose per-agent transcript metadata\nstdout:\n{stdout}"
     );
     assert!(
         stdout.contains(&format!("- {}", lab_file.display())),
@@ -1116,6 +1124,64 @@ fn broad_ask_broadcasts_to_registered_agents_and_reports_relevant_references() {
             .expect("recipes agent should receive broadcast")
             .contains("find my last blood tests from 2025"),
         "silent agent should still receive the Broadcast Request"
+    );
+
+    stop_daemon(&mut daemon);
+}
+
+#[test]
+fn broad_ask_frames_responsibility_language_as_afs_directory_responsibility() {
+    let afs_home = unique_afs_home("ask-broadcast-role-context");
+    let managed_dir = unique_afs_home("ask-broadcast-role-context-managed");
+    let pi_runtime = fake_pi_runtime("ask-broadcast-role-context-runtime");
+    let socket_path = supervisor_socket(&afs_home);
+    std::fs::create_dir_all(&managed_dir).expect("test should create managed directory");
+    let managed_dir = managed_dir
+        .canonicalize()
+        .expect("managed directory should canonicalize");
+    let mut daemon =
+        start_daemon_with_pi_runtime_and_broadcast_timeout(&afs_home, &pi_runtime, 1000);
+
+    assert!(
+        wait_until(Duration::from_secs(2), || socket_path
+            .metadata()
+            .map(|metadata| metadata.file_type().is_socket())
+            .unwrap_or(false)),
+        "daemon should create the Supervisor Socket before install connects"
+    );
+
+    let install = install_managed_dir(&afs_home, &managed_dir);
+    assert!(install.status.success(), "afs install should succeed");
+    let identity =
+        std::fs::read_to_string(managed_dir.join(".afs/identity")).expect("identity exists");
+
+    let ask = afs_ask(&afs_home, "is anyone overseeing health data?");
+
+    assert!(
+        ask.status.success(),
+        "afs ask should succeed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&ask.stdout),
+        String::from_utf8_lossy(&ask.stderr)
+    );
+    let prompt_log = std::fs::read_to_string(managed_dir.join(".afs/prompt-received"))
+        .expect("fake Pi should log the broadcast prompt");
+    assert!(
+        prompt_log.contains(&format!("Agent identity: {}", identity.trim())),
+        "broadcast prompt should name the AFS agent identity\nprompt:\n{prompt_log}"
+    );
+    assert!(
+        prompt_log.contains(&format!("Managed directory: {}", managed_dir.display())),
+        "broadcast prompt should name the managed directory\nprompt:\n{prompt_log}"
+    );
+    assert!(
+        prompt_log.contains(
+            "If the user asks who manages, oversees, owns, or is responsible for a topic"
+        ),
+        "broadcast prompt should frame responsibility language as AFS responsibility\nprompt:\n{prompt_log}"
+    );
+    assert!(
+        prompt_log.contains("unless the prompt explicitly asks for a human"),
+        "broadcast prompt should preserve human/governance ownership as an explicit ask\nprompt:\n{prompt_log}"
     );
 
     stop_daemon(&mut daemon);
@@ -1201,20 +1267,24 @@ fn broadcast_relevant_agents_collaborate_and_use_consulted_reply_in_final_synthe
     );
     let stdout = String::from_utf8_lossy(&ask.stdout);
     assert!(
-        stdout.contains("recipes thinks the answer involves workouts"),
-        "broadcast answers block should include recipes reply\nstdout:\n{stdout}"
+        !stdout.contains("answers:"),
+        "broadcast output should not expose the discovery transcript\nstdout:\n{stdout}"
     );
     assert!(
-        stdout.contains("workouts has the daily routine"),
-        "broadcast answers block should include workouts reply\nstdout:\n{stdout}"
+        !stdout.contains("collaboration:"),
+        "broadcast output should not expose the collaboration transcript\nstdout:\n{stdout}"
     );
     assert!(
-        stdout.contains("collaboration:"),
-        "ask output should include the collaboration block\nstdout:\n{stdout}"
+        !stdout.contains("recipes thinks the answer involves workouts"),
+        "raw broadcast discovery answers should stay internal\nstdout:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("workouts has the daily routine"),
+        "raw broadcast discovery answers should stay internal\nstdout:\n{stdout}"
     );
     assert!(
         stdout.contains("recipes incorporated peer note: workouts says check workouts/run.md"),
-        "consulter's refined answer must contain the consultee's reply text\nstdout:\n{stdout}"
+        "the synthesized answer must contain the consulter's refined final answer\nstdout:\n{stdout}"
     );
     assert!(
         stdout.contains(recipes_identity.trim()),
@@ -1512,7 +1582,11 @@ fn broadcast_with_single_relevant_reply_skips_collaboration_phase() {
     let stdout = String::from_utf8_lossy(&ask.stdout);
     assert!(
         stdout.contains("lone has the answer"),
-        "broadcast answer from the lone relevant agent should appear\nstdout:\n{stdout}"
+        "synthesized answer from the lone relevant agent should appear\nstdout:\n{stdout}"
+    );
+    assert!(
+        !stdout.contains("answers:"),
+        "single-relevant broadcast should not expose an agent transcript block\nstdout:\n{stdout}"
     );
     assert!(
         !stdout.contains("collaboration:"),
@@ -5508,8 +5582,8 @@ fn broadcast_progress_streams_before_final_body() {
         .expect("streamed output should include the fast agent's broadcast reply progress");
     let body = lines
         .iter()
-        .find(|(_, line)| line == "answers:")
-        .expect("streamed output should include the answers body line");
+        .find(|(_, line)| line == "answer:")
+        .expect("streamed output should include the synthesized answer body line");
 
     assert!(
         waiting.0 + Duration::from_millis(1500) <= body.0,

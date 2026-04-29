@@ -14,6 +14,10 @@ Do not commit with failing formatting, linting, or tests unless the user explici
 
 Prefer behavior-focused tests through public interfaces, especially CLI-visible behavior for AFS user workflows.
 
+When documenting or sharing `cargo run` invocations for the user-facing CLI,
+use `cargo run --bin afs -- <command>`. The workspace also builds the
+`fake_pi` helper binary, so plain `cargo run -- <command>` is ambiguous.
+
 ## Project Status Guidance
 
 PRD #1 (AFS v1) is complete: every user story, implementation decision, and

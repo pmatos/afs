@@ -397,10 +397,12 @@ pub mod supervisor {
         )
     }
 
-    fn build_broadcast_message(prompt: &str) -> String {
+    fn build_broadcast_message(prompt: &str, agent_identity: &str, managed_dir: &Path) -> String {
         format!(
-            "{}\nQuestion: {}\n\nIf this directory is not relevant to the question, set relevance to \"none\" and leave answer empty. Otherwise set relevance to \"possible\" or \"strong\" with reason and answer.\n\n{}",
+            "{}\nAgent identity: {}\nManaged directory: {}\nQuestion: {}\n\nIf this directory is not relevant to the question, set relevance to \"none\" and leave answer empty. Otherwise set relevance to \"possible\" or \"strong\" with reason and answer.\n\nAFS role context: you are the AFS directory agent for the managed directory above. If the user asks who manages, oversees, owns, or is responsible for a topic, interpret that as asking which AFS directory agent manages a relevant directory unless the prompt explicitly asks for a human, organization, legal owner, or governance policy. When relevant, answer as the AFS agent responsible for this managed directory.\n\n{}",
             crate::agent_rpc::envelope::BROADCAST,
+            agent_identity,
+            managed_dir.display(),
             prompt,
             AFS_REPLY_REMINDER,
         )
@@ -482,7 +484,6 @@ pub mod supervisor {
             agent_identity: agent.identity.clone(),
             managed_dir: agent.managed_dir.clone(),
             relevance: reply.relevance.as_wire_str().to_string(),
-            reason: reply.reason,
             answer: reply.answer,
             file_references,
         })
@@ -1566,7 +1567,8 @@ pub mod supervisor {
             ))?;
             if n == 0 {
                 let empty = CollaborationOutcome {
-                    answers: Vec::new(),
+                    final_answers: Vec::new(),
+                    supporting_answers: Vec::new(),
                 };
                 return response.write_body(&format_broadcast_ask_response(&[], &empty, timeout));
             }
@@ -1583,12 +1585,11 @@ pub mod supervisor {
             // per-agent FIFO queue) and `RegisteredAgent::stop` would
             // also block.
             let (tx, rx) = mpsc::channel::<(usize, io::Result<crate::agent_rpc::AfsReply>)>();
-            let broadcast_message = build_broadcast_message(prompt);
             let worker_deadline = Instant::now() + timeout;
             for (index, agent) in self.agents.iter().enumerate() {
                 let tx = tx.clone();
                 let runtime = agent.runtime.clone();
-                let message = broadcast_message.clone();
+                let message = build_broadcast_message(prompt, &agent.identity, &agent.managed_dir);
                 thread::spawn(move || {
                     let result = (|| -> io::Result<crate::agent_rpc::AfsReply> {
                         // Bound the lock-acquisition wait by the
@@ -1654,7 +1655,8 @@ pub mod supervisor {
             }
 
             let mut outcome = CollaborationOutcome {
-                answers: Vec::new(),
+                final_answers: Vec::new(),
+                supporting_answers: Vec::new(),
             };
 
             if indexed_replies.len() >= 2 {
@@ -1731,7 +1733,7 @@ pub mod supervisor {
 
             if delegates.is_empty() {
                 outcome
-                    .answers
+                    .final_answers
                     .push(build_task_reply(initial_reply, identity));
                 return Ok(());
             }
@@ -1746,7 +1748,7 @@ pub mod supervisor {
                     "error collaboration delegate batch must use one reply target"
                 ))?;
                 outcome
-                    .answers
+                    .final_answers
                     .push(build_task_reply(initial_reply, identity));
                 return Ok(());
             }
@@ -1773,7 +1775,7 @@ pub mod supervisor {
                 if reply_target == ReplyTarget::Delegator {
                     delegator_replies.push(task_reply);
                 } else {
-                    outcome.answers.push(task_reply);
+                    outcome.final_answers.push(task_reply);
                 }
             }
 
@@ -1781,7 +1783,7 @@ pub mod supervisor {
                 // Supervisor consumes delegated replies directly; the
                 // agent's initial answer rolls up as its own entry.
                 outcome
-                    .answers
+                    .final_answers
                     .push(build_task_reply(initial_reply, identity));
                 return Ok(());
             }
@@ -1793,7 +1795,7 @@ pub mod supervisor {
             let mut current_reply = initial_reply;
             let mut pending_replies = std::mem::take(&mut delegator_replies);
             for task_reply in pending_replies.drain(..) {
-                outcome.answers.push(task_reply.clone());
+                outcome.supporting_answers.push(task_reply.clone());
                 let deliver_deadline = Instant::now() + broadcast_reply_timeout();
                 let next = match self.agents[agent_index]
                     .deliver_delegated_reply_with_deadline(&task_reply, deliver_deadline)
@@ -1811,7 +1813,7 @@ pub mod supervisor {
             }
 
             outcome
-                .answers
+                .final_answers
                 .push(build_task_reply(current_reply, identity));
             Ok(())
         }
@@ -2070,7 +2072,6 @@ pub mod supervisor {
         agent_identity: String,
         managed_dir: PathBuf,
         relevance: String,
-        reason: String,
         answer: String,
         file_references: Vec<String>,
     }
@@ -2109,7 +2110,8 @@ pub mod supervisor {
     }
 
     struct CollaborationOutcome {
-        answers: Vec<TaskReply>,
+        final_answers: Vec<TaskReply>,
+        supporting_answers: Vec<TaskReply>,
     }
 
     struct RecordedChange {
@@ -2758,25 +2760,7 @@ pub mod supervisor {
         if replies.is_empty() {
             response.push_str("no relevant agents replied before broadcast timeout\n");
         } else {
-            response.push_str("answers:\n");
-            for reply in replies {
-                response.push_str(&format!(
-                    "- agent={} managed_dir={} relevance={} reason={}\n",
-                    reply.agent_identity,
-                    reply.managed_dir.display(),
-                    reply.relevance,
-                    reply.reason
-                ));
-                response.push_str(&format!("  {}\n", reply.answer));
-            }
-        }
-
-        if !outcome.answers.is_empty() {
-            response.push_str("collaboration:\n");
-            for answer in &outcome.answers {
-                response.push_str(&format!("- agent={}\n", answer.agent_identity));
-                response.push_str(&format!("  {}\n", answer.answer));
-            }
+            push_broadcast_final_answer(&mut response, replies, outcome);
         }
 
         let references = replies
@@ -2800,7 +2784,7 @@ pub mod supervisor {
                 participants.push(reply.agent_identity.as_str());
             }
         }
-        for answer in &outcome.answers {
+        for answer in outcome.all_answers() {
             if seen.insert(answer.agent_identity.as_str()) {
                 participants.push(answer.agent_identity.as_str());
             }
@@ -2815,13 +2799,11 @@ pub mod supervisor {
         ));
 
         let aggregated_changed: Vec<String> = outcome
-            .answers
-            .iter()
+            .all_answers()
             .flat_map(|answer| answer.changed_files.iter().cloned())
             .collect();
         let aggregated_history: Vec<String> = outcome
-            .answers
-            .iter()
+            .all_answers()
             .flat_map(|answer| answer.history_entries.iter().cloned())
             .collect();
         response.push_str(&format!(
@@ -2834,6 +2816,106 @@ pub mod supervisor {
         ));
         response.push_str(&format!("broadcast_timeout_ms: {}\n", timeout.as_millis()));
         response
+    }
+
+    impl CollaborationOutcome {
+        fn all_answers(&self) -> impl Iterator<Item = &TaskReply> {
+            self.final_answers
+                .iter()
+                .chain(self.supporting_answers.iter())
+        }
+    }
+
+    fn push_broadcast_final_answer(
+        response: &mut String,
+        replies: &[BroadcastReply],
+        outcome: &CollaborationOutcome,
+    ) {
+        let raw_answers = broadcast_final_answer_texts(replies, outcome);
+        let answers = unique_non_empty_answers(raw_answers);
+
+        if answers.is_empty() {
+            response.push_str("Relevant agents replied, but none provided answer text.\n");
+        } else if answers.len() == 1 {
+            push_answer_text(response, &answers[0]);
+        } else {
+            response.push_str("answer:\n");
+            for answer in &answers {
+                push_bulleted_answer(response, answer);
+            }
+        }
+    }
+
+    fn broadcast_final_answer_texts<'a>(
+        replies: &'a [BroadcastReply],
+        outcome: &'a CollaborationOutcome,
+    ) -> Vec<&'a str> {
+        if outcome.final_answers.is_empty() {
+            return replies.iter().map(|reply| reply.answer.as_str()).collect();
+        }
+
+        let mut used_final_answers = BTreeSet::new();
+        let mut answers = Vec::new();
+        for reply in replies {
+            let mut found_non_empty_final = false;
+            for (index, answer) in outcome.final_answers.iter().enumerate() {
+                if answer.agent_identity != reply.agent_identity || answer.answer.trim().is_empty()
+                {
+                    continue;
+                }
+                used_final_answers.insert(index);
+                found_non_empty_final = true;
+                answers.push(answer.answer.as_str());
+            }
+            if !found_non_empty_final {
+                answers.push(reply.answer.as_str());
+            }
+        }
+
+        for (index, answer) in outcome.final_answers.iter().enumerate() {
+            if used_final_answers.contains(&index) || answer.answer.trim().is_empty() {
+                continue;
+            }
+            answers.push(answer.answer.as_str());
+        }
+        answers
+    }
+
+    fn unique_non_empty_answers(raw_answers: Vec<&str>) -> Vec<String> {
+        let mut seen = BTreeSet::new();
+        let mut answers = Vec::new();
+        for answer in raw_answers {
+            let answer = answer.trim();
+            if answer.is_empty() {
+                continue;
+            }
+            if seen.insert(answer.to_string()) {
+                answers.push(answer.to_string());
+            }
+        }
+        answers
+    }
+
+    fn push_answer_text(response: &mut String, answer: &str) {
+        response.push_str(answer);
+        if !response.ends_with('\n') {
+            response.push('\n');
+        }
+    }
+
+    fn push_bulleted_answer(response: &mut String, answer: &str) {
+        let mut lines = answer.lines();
+        let Some(first) = lines.next() else {
+            return;
+        };
+        response.push_str("- ");
+        response.push_str(first.trim_end());
+        response.push('\n');
+        for line in lines {
+            response.push_str("  ");
+            response.push_str(line.trim_end());
+            response.push('\n');
+        }
     }
 
     fn report_list(values: &[String]) -> String {
