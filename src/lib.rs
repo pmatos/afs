@@ -519,7 +519,7 @@ pub mod supervisor {
     /// agent emits `agent_end`, the deadline expires, or the stream
     /// closes.
     fn abort_and_drain(io: &mut AgentRuntimeIo, deadline: Duration) -> io::Result<()> {
-        use crate::agent_rpc::{self, RpcCommand, RpcEvent};
+        use crate::agent_rpc::{self, RpcCommand};
 
         let abort_id = format!("shutdown-{}", std::process::id());
         {
@@ -528,44 +528,67 @@ pub mod supervisor {
         }
         set_nonblocking(&io.stdout, true)?;
         let until = Instant::now() + deadline;
+        let outcome = drain_until_agent_end(
+            &mut io.stdin,
+            |buf| read_nonblocking_line(&mut io.stdout, buf),
+            until,
+        );
+        let _ = set_nonblocking(&io.stdout, false);
+        outcome
+    }
+
+    /// Transport-generic body of `abort_and_drain`: read JSONL lines
+    /// from `read_line` until `agent_end`, the deadline expires, or
+    /// the stream EOFs. Auto-cancels late dialog `extension_ui_request`
+    /// events through `stdin` so a user-installed Pi extension cannot
+    /// block shutdown. Sleeps 10 ms when the closure reports no data
+    /// (the `WouldBlock` branch in `read_nonblocking_line`).
+    fn drain_until_agent_end<W, F>(
+        stdin: &mut W,
+        mut read_line: F,
+        until: Instant,
+    ) -> io::Result<()>
+    where
+        W: Write,
+        F: FnMut(&mut Vec<u8>) -> io::Result<Option<String>>,
+    {
+        use crate::agent_rpc::{self, RpcCommand, RpcEvent};
+
         let mut buffer: Vec<u8> = Vec::new();
 
-        let outcome = loop {
+        loop {
             // Wall-clock deadline check at the top of every
             // iteration so an agent that keeps writing lines after
             // `abort` (without ever sending `agent_end`) cannot
             // hang `RegisteredAgent::stop` past the bounded drain
             // window.
             if Instant::now() >= until {
-                break Ok(());
+                return Ok(());
             }
-            let line = match read_nonblocking_line(&mut io.stdout, &mut buffer) {
+            let line = match read_line(&mut buffer) {
                 Ok(Some(line)) => line,
                 Ok(None) => {
                     thread::sleep(Duration::from_millis(10));
                     continue;
                 }
-                Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => break Ok(()),
-                Err(error) => break Err(error),
+                Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
+                Err(error) => return Err(error),
             };
 
             match agent_rpc::dispatch(&line) {
                 Ok(RpcEvent::ExtensionUiRequest { id: ui_id, method }) => {
                     if matches!(method.as_str(), "select" | "confirm" | "input" | "editor") {
-                        let mut writer = agent_rpc::JsonlWriter::new(&mut io.stdin);
+                        let mut writer = agent_rpc::JsonlWriter::new(&mut *stdin);
                         let _ = writer.send(&RpcCommand::ExtensionUiResponse {
                             id: &ui_id,
                             cancelled: true,
                         });
                     }
                 }
-                Ok(RpcEvent::AgentEnd) => break Ok(()),
+                Ok(RpcEvent::AgentEnd) => return Ok(()),
                 _ => {}
             }
-        };
-
-        let _ = set_nonblocking(&io.stdout, false);
-        outcome
+        }
     }
 
     fn shutdown_drain_window() -> Duration {
@@ -4590,6 +4613,59 @@ pub mod supervisor {
             )));
         }
         Ok(())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::collections::VecDeque;
+
+        #[test]
+        fn drain_exits_when_agent_end_observed() {
+            let sentinel =
+                r#"{"type":"agent_end","messages":[{"id":"sentinel","content":"unread"}]}"#;
+            let mut events: VecDeque<String> = VecDeque::from([
+                r#"{"type":"response","command":"prompt","id":"shutdown","success":true}"#
+                    .to_string(),
+                r#"{"type":"agent_end","messages":[]}"#.to_string(),
+                sentinel.to_string(),
+            ]);
+            let read_line =
+                |_buf: &mut Vec<u8>| -> io::Result<Option<String>> { Ok(events.pop_front()) };
+            let mut stdin = Vec::<u8>::new();
+            let until = Instant::now() + Duration::from_secs(5);
+            let result = drain_until_agent_end(&mut stdin, read_line, until);
+            assert!(result.is_ok(), "drain should exit on agent_end: {result:?}");
+            assert_eq!(
+                events.len(),
+                1,
+                "drain must stop at agent_end without consuming the sentinel"
+            );
+            assert_eq!(events.front().map(String::as_str), Some(sentinel));
+        }
+
+        #[test]
+        fn drain_exits_when_deadline_expires_without_events() {
+            let read_line = |_buf: &mut Vec<u8>| -> io::Result<Option<String>> { Ok(None) };
+            let mut stdin = Vec::<u8>::new();
+            let deadline = Duration::from_millis(50);
+            let started = Instant::now();
+            let until = started + deadline;
+            let result = drain_until_agent_end(&mut stdin, read_line, until);
+            let elapsed = started.elapsed();
+            assert!(
+                result.is_ok(),
+                "drain should exit cleanly on deadline: {result:?}"
+            );
+            assert!(
+                elapsed >= deadline,
+                "drain returned before deadline elapsed: {elapsed:?} < {deadline:?}"
+            );
+            assert!(
+                elapsed < deadline + Duration::from_millis(250),
+                "drain ran far past deadline: elapsed={elapsed:?}, deadline={deadline:?}"
+            );
+        }
     }
 }
 
