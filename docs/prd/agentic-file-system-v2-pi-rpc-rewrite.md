@@ -1,14 +1,14 @@
 ## Problem Statement
 
 PRD #1 shipped a working Agentic File System on top of a hand-rolled
-line+TAB stdio protocol that AFS itself defined and that real Pi never
-implemented. The fake Pi used by `tests/cli.rs` satisfied the protocol
-because the protocol was specified by what the fake reads. Against the
-canonical `@mariozechner/pi-coding-agent` runtime advertised in the
-README, every `afs ask`, broadcast, collaboration, delegation, and
-queued task is silently inert: Pi's `--mode rpc` parser receives the
-literal byte sequence `BROADCAST\n…` (or `ASK\n…`, `TASK\n…`,
-`COLLABORATE\n…`), feeds it to `JSON.parse`, and returns
+tab-delimited stdio protocol that AFS itself defined and that real Pi
+never implemented. The fake Pi used by `tests/cli.rs` satisfied the
+protocol because the protocol was specified by what the fake reads.
+Against the canonical `@mariozechner/pi-coding-agent` runtime advertised
+in the README, every `afs ask`, broadcast, collaboration, delegation,
+and queued task is silently inert: Pi's `--mode rpc` parser receives
+legacy AFS verb records instead of JSONL JSON-RPC, feeds them to
+`JSON.parse`, and returns
 `Failed to parse command: Unexpected token …`. The supervisor, the
 registry, the index, the watcher, history, undo, and reconciliation
 all continue to work; only the agent-runtime channel is broken. Issue
@@ -139,7 +139,7 @@ that test, not in user-visible silent failure.
   fake routes by the explicit envelope tag on the prompt
   (`<<<AFS:VERB=…>>>`), not by natural-language sniffing.
   Fixture filenames stay stable; only the encoding inside
-  changes from line+TAB to JSON.
+  changes from the legacy tab-delimited format to JSON.
 - Add unit tests in `agent_rpc::tests` for: LF-only framing,
   CR-strip, extension-UI auto-cancel for each dialog method,
   multi-`afs_reply` first-wins semantics, missing-`afs_reply`
