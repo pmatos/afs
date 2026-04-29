@@ -1486,8 +1486,8 @@ fn broadcast_with_single_relevant_reply_skips_collaboration_phase() {
         "strong\tlone is the only relevant agent\tlone has the answer\t\n",
     )
     .expect("test should configure lone broadcast response");
-    // silent_dir gets a non-possible/strong reply so parse_broadcast_reply discards it,
-    // leaving exactly one relevant reply for the supervisor to consider.
+    // silent_dir replies with relevance=none so the supervisor discards it,
+    // leaving exactly one relevant reply to consider.
     std::fs::write(
         silent_dir.join(".afs/broadcast-response"),
         "none\tnot relevant\t\t\n",
