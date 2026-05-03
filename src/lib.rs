@@ -1957,12 +1957,15 @@ pub mod supervisor {
                 )?;
                 let reconciliation = self.agents[agent_index].reconciliation.clone();
                 let history = self.agents[agent_index].history.clone();
+                let reconciliation_nested = ManagedSubtree::new(&managed_dir, &agent_home)
+                    .nested_managed_relative_paths()?;
                 self.agents[agent_index].reconciliation_task =
                     Some(spawn_startup_reconciliation_task(
                         managed_dir,
                         reconciliation,
                         history,
                         reconciliation_files,
+                        reconciliation_nested,
                     ));
             }
 
@@ -2426,6 +2429,7 @@ pub mod supervisor {
         reconciliation: Arc<Mutex<ReconciliationState>>,
         history: Arc<HistoryBackend>,
         reconciliation_files: Vec<String>,
+        nested_exclusions: Vec<String>,
     ) -> ReconciliationTask {
         let cancel = Arc::new(AtomicBool::new(false));
         let thread_cancel = cancel.clone();
@@ -2433,7 +2437,11 @@ pub mod supervisor {
             if thread_cancel.load(Ordering::Relaxed) {
                 return;
             }
-            let state = match history.record_reconciliation(&managed_dir, &reconciliation_files) {
+            let state = match history.record_reconciliation(
+                &managed_dir,
+                &reconciliation_files,
+                &nested_exclusions,
+            ) {
                 Ok(Some(change)) => ReconciliationState::Complete {
                     changed_files: change.files.len(),
                 },

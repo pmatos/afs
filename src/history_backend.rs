@@ -354,14 +354,19 @@ impl HistoryBackend {
         &self,
         managed_dir: &Path,
         files: &[String],
+        nested_exclusions: &[String],
     ) -> io::Result<Option<RecordedChange>> {
-        if files.is_empty() {
-            return Ok(None);
-        }
         let _guard = self
             .lock
             .lock()
             .map_err(|_| io::Error::other("history lock poisoned"))?;
+        // Mirrors legacy `record_startup_reconciliation`'s upfront baseline
+        // ensure: a HEAD-less repo would otherwise stage paths, see no diff,
+        // and silently return None.
+        self.record_baseline(managed_dir, nested_exclusions)?;
+        if files.is_empty() {
+            return Ok(None);
+        }
         let git_dir = self.git_dir();
         git_stage_paths(&git_dir, managed_dir, files)?;
         let changed_files = git_staged_changes_vs_head(&git_dir)?;
@@ -399,6 +404,12 @@ impl HistoryBackend {
             .lock
             .lock()
             .map_err(|_| io::Error::other("history lock poisoned"))?;
+        // Mirrors legacy `startup_reconciliation_files` which called
+        // `ensure_history_baseline_commit` before staging; without this the
+        // diff-vs-HEAD path silently sees nothing on a HEAD-less repo and
+        // downstream agent changes never commit. `record_baseline` is
+        // idempotent and lock-free, so re-entering it under our lock is safe.
+        self.record_baseline(managed_dir, nested_exclusions)?;
         let git_dir = self.git_dir();
         git_stage_work_tree(&git_dir, managed_dir, nested_exclusions)?;
         let changed_files = git_staged_changes_vs_head(&git_dir)?;
@@ -1397,6 +1408,7 @@ mod tests {
             .record_reconciliation(
                 &managed_dir,
                 &["foo.txt".to_string(), "bar.txt".to_string()],
+                &[],
             )
             .expect("record_reconciliation should succeed")
             .expect("Some");
@@ -1410,7 +1422,7 @@ mod tests {
 
         let count_after_recon = commit_count(&backend.git_dir());
         let empty = backend
-            .record_reconciliation(&managed_dir, &[])
+            .record_reconciliation(&managed_dir, &[], &[])
             .expect("empty input should be Ok");
         assert!(empty.is_none());
         assert_eq!(
@@ -1476,6 +1488,77 @@ mod tests {
         let mut files = recorded.files;
         files.sort();
         assert_eq!(files, vec!["new.txt".to_string(), "old.txt".to_string()]);
+
+        std::fs::remove_dir_all(&workspace).ok();
+    }
+
+    #[test]
+    fn record_reconciliation_reseeds_baseline_when_repo_has_no_head() {
+        // Same regression as pending_external_files: legacy
+        // `record_startup_reconciliation` ensured the baseline upfront.
+        let workspace = unique_tempdir("recon-no-head");
+        let managed_dir = workspace.join("project");
+        let agent_home = managed_dir.join(".afs");
+        std::fs::create_dir_all(&managed_dir).unwrap();
+        std::fs::create_dir_all(&agent_home).unwrap();
+
+        std::fs::write(managed_dir.join("seed.txt"), "seed").unwrap();
+        let backend = HistoryBackend::open(&agent_home).unwrap();
+        backend.record_baseline(&managed_dir, &[]).unwrap();
+        std::fs::remove_dir_all(backend.git_dir()).unwrap();
+
+        backend
+            .record_reconciliation(&managed_dir, &["seed.txt".to_string()], &[])
+            .expect("record_reconciliation should re-seed the baseline rather than silently no-op");
+
+        std::fs::write(managed_dir.join("notes.txt"), "v1").unwrap();
+        let recorded = backend
+            .record_agent_change(&managed_dir, &[])
+            .expect("agent change should succeed")
+            .expect("Some — baseline must exist for changes to commit");
+        assert!(
+            recorded.files.contains(&"notes.txt".to_string()),
+            "files: {:?}",
+            recorded.files
+        );
+
+        std::fs::remove_dir_all(&workspace).ok();
+    }
+
+    #[test]
+    fn pending_external_files_reseeds_baseline_when_repo_has_no_head() {
+        // Regression: legacy `startup_reconciliation_files` called
+        // `ensure_history_baseline_commit` upfront. After extraction this
+        // defense was missing, so a HEAD-less repo (e.g., `.afs/history/repo`
+        // wiped by a user or partial install) caused `pending_external_files`
+        // to error on `git_reset_index` and downstream `record_agent_change`
+        // calls to silently return `None` forever.
+        let workspace = unique_tempdir("pending-no-head");
+        let managed_dir = workspace.join("project");
+        let agent_home = managed_dir.join(".afs");
+        std::fs::create_dir_all(&managed_dir).unwrap();
+        std::fs::create_dir_all(&agent_home).unwrap();
+
+        std::fs::write(managed_dir.join("seed.txt"), "seed").unwrap();
+        let backend = HistoryBackend::open(&agent_home).unwrap();
+        backend.record_baseline(&managed_dir, &[]).unwrap();
+
+        std::fs::remove_dir_all(backend.git_dir()).unwrap();
+
+        backend
+            .pending_external_files(&managed_dir, &[], SystemTime::now())
+            .expect("pending should re-seed the baseline rather than fail on missing HEAD");
+
+        std::fs::write(managed_dir.join("notes.txt"), "v1").unwrap();
+        let recorded = backend
+            .record_agent_change(&managed_dir, &[])
+            .expect("record_agent_change should succeed after re-seeded baseline")
+            .expect("expected Some — agent changes must commit when baseline exists");
+        assert!(
+            recorded.files.contains(&"notes.txt".to_string()),
+            "files: {:?}",
+            recorded.files
+        );
 
         std::fs::remove_dir_all(&workspace).ok();
     }
