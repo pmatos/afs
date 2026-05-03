@@ -827,6 +827,76 @@ fn undo_latest_external_change_with_yes_restores_file_and_records_reversal() {
 }
 
 #[test]
+fn undo_treats_filename_with_comma_space_as_one_history_file() {
+    let afs_home = unique_afs_home("undo-comma-space-path");
+    let managed_dir = unique_afs_home("managed-undo-comma-space-path");
+    let pi_runtime = fake_pi_runtime("undo-comma-space-path-runtime");
+    let socket_path = supervisor_socket(&afs_home);
+    std::fs::create_dir_all(&managed_dir).expect("test should create managed directory");
+    let target_file = managed_dir.join("a, b.txt");
+    std::fs::write(&target_file, "before\n").expect("test should create managed file");
+    let managed_dir = managed_dir
+        .canonicalize()
+        .expect("managed directory should canonicalize");
+    let target_file = target_file
+        .canonicalize()
+        .expect("target file should canonicalize");
+    let mut daemon = start_daemon_with_pi_runtime(&afs_home, &pi_runtime);
+
+    assert!(
+        wait_until(Duration::from_secs(2), || socket_path
+            .metadata()
+            .map(|metadata| metadata.file_type().is_socket())
+            .unwrap_or(false)),
+        "daemon should create the Supervisor Socket before install connects"
+    );
+
+    let install = install_managed_dir(&afs_home, &managed_dir);
+    assert!(install.status.success(), "afs install should succeed");
+
+    std::fs::write(&target_file, "after\n").expect("test should modify managed file");
+    assert!(
+        wait_until(Duration::from_secs(3), || {
+            let history = afs_history(&afs_home, &managed_dir);
+            history.status.success()
+                && String::from_utf8_lossy(&history.stdout).contains("a, b.txt")
+        }),
+        "afs history should record the file with comma-space in its path"
+    );
+
+    let history = afs_history(&afs_home, &managed_dir);
+    let stdout = String::from_utf8_lossy(&history.stdout);
+    let entry = history_entry_id(stdout.lines().next().expect("history should have an entry"));
+    let undo = Command::new(env!("CARGO_BIN_EXE_afs"))
+        .env("AFS_HOME", &afs_home)
+        .arg("undo")
+        .arg(&managed_dir)
+        .arg(entry)
+        .arg("--yes")
+        .output()
+        .expect("afs undo should run");
+
+    assert!(
+        undo.status.success(),
+        "afs undo --yes should succeed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&undo.stdout),
+        String::from_utf8_lossy(&undo.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&undo.stdout).contains("files=1"),
+        "undo should report one affected History Entry file, not split on comma-space\nstdout:\n{}",
+        String::from_utf8_lossy(&undo.stdout)
+    );
+    assert_eq!(
+        std::fs::read_to_string(&target_file).expect("target file should be readable"),
+        "before\n",
+        "undo should restore the file whose path contains comma-space"
+    );
+
+    stop_daemon(&mut daemon);
+}
+
+#[test]
 fn undo_rejects_non_latest_history_entry_without_changing_files() {
     let afs_home = unique_afs_home("undo-non-latest");
     let managed_dir = unique_afs_home("managed-undo-non-latest");

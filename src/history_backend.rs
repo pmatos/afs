@@ -8,6 +8,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const HISTORY_DIR: &str = "history";
 const HISTORY_REPO_DIR: &str = "repo";
+const FILES_TRAILER: &str = "Afs-Files";
+const FILES_JSON_TRAILER: &str = "Afs-Files-Json";
 
 pub(crate) struct HistoryBackend {
     agent_home: PathBuf,
@@ -125,17 +127,7 @@ impl HistoryBackend {
                 .get("Afs-Summary")
                 .cloned()
                 .unwrap_or_default();
-            let original_files: Vec<String> = record
-                .trailers
-                .get("Afs-Files")
-                .map(|field| {
-                    if field.is_empty() {
-                        Vec::new()
-                    } else {
-                        field.split(", ").map(ToOwned::to_owned).collect()
-                    }
-                })
-                .unwrap_or_default();
+            let original_files = files_from_trailers(&record.trailers);
             let rewritten_files: Vec<String> = original_files
                 .iter()
                 .map(|file| prefix_child_path(child_origin, file))
@@ -237,17 +229,7 @@ impl HistoryBackend {
                 .get("Afs-Summary")
                 .cloned()
                 .unwrap_or_default();
-            let files = record
-                .trailers
-                .get("Afs-Files")
-                .map(|field| {
-                    if field.is_empty() {
-                        Vec::new()
-                    } else {
-                        field.split(", ").map(ToOwned::to_owned).collect()
-                    }
-                })
-                .unwrap_or_default();
+            let files = files_from_trailers(&record.trailers);
             let undoable = record
                 .trailers
                 .get("Afs-Undoable")
@@ -445,17 +427,7 @@ impl HistoryBackend {
                 .get("Afs-Summary")
                 .cloned()
                 .unwrap_or_default();
-            let files = record
-                .trailers
-                .get("Afs-Files")
-                .map(|field| {
-                    if field.is_empty() {
-                        Vec::new()
-                    } else {
-                        field.split(", ").map(ToOwned::to_owned).collect()
-                    }
-                })
-                .unwrap_or_default();
+            let files = files_from_trailers(&record.trailers);
             let undoable = record
                 .trailers
                 .get("Afs-Undoable")
@@ -691,6 +663,33 @@ fn history_summary(prefix: &str, files: &[String]) -> String {
     }
 }
 
+fn legacy_files_trailer(files: &[String]) -> String {
+    files.join(", ")
+}
+
+fn files_json_trailer(files: &[String]) -> String {
+    serde_json::to_string(files).unwrap_or_else(|_| "[]".to_string())
+}
+
+fn files_from_trailers(trailers: &BTreeMap<String, String>) -> Vec<String> {
+    if let Some(raw) = trailers.get(FILES_JSON_TRAILER)
+        && let Ok(files) = serde_json::from_str::<Vec<String>>(raw)
+    {
+        return files;
+    }
+
+    trailers
+        .get(FILES_TRAILER)
+        .map(|field| {
+            if field.is_empty() {
+                Vec::new()
+            } else {
+                field.split(", ").map(ToOwned::to_owned).collect()
+            }
+        })
+        .unwrap_or_default()
+}
+
 fn git_has_commits(git_dir: &Path) -> io::Result<bool> {
     let output = git_base_command(git_dir, None)
         .arg("rev-parse")
@@ -902,7 +901,11 @@ fn git_commit_message(request: &GitCommitRequest<'_>) -> String {
     message.push_str(&format!("Afs-File-Count: {}\n", request.files.len()));
     message.push_str(&format!(
         "Afs-Files: {}\n",
-        sanitize_field(&request.files.join(", "))
+        sanitize_field(&legacy_files_trailer(request.files))
+    ));
+    message.push_str(&format!(
+        "Afs-Files-Json: {}\n",
+        sanitize_field(&files_json_trailer(request.files))
     ));
     if let Some(undoes) = request.undoes {
         message.push_str(&format!("Afs-Undoes: {}\n", sanitize_field(undoes)));
@@ -1021,6 +1024,27 @@ mod tests {
             .trim()
             .parse()
             .expect("count should parse")
+    }
+
+    #[test]
+    fn files_round_trip_paths_containing_legacy_separator() {
+        let files = vec!["a, b.txt".to_string(), "nested/c, d.md".to_string()];
+        let mut trailers = BTreeMap::new();
+        trailers.insert(FILES_JSON_TRAILER.to_string(), files_json_trailer(&files));
+        trailers.insert(FILES_TRAILER.to_string(), legacy_files_trailer(&files));
+
+        assert_eq!(files_from_trailers(&trailers), files);
+    }
+
+    #[test]
+    fn files_from_trailers_reads_legacy_comma_separated_entries() {
+        let mut trailers = BTreeMap::new();
+        trailers.insert(FILES_TRAILER.to_string(), "a.txt, nested/b.md".to_string());
+
+        assert_eq!(
+            files_from_trailers(&trailers),
+            vec!["a.txt".to_string(), "nested/b.md".to_string()]
+        );
     }
 
     #[test]
