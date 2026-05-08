@@ -552,3 +552,22 @@ cargo test --all-targets --all-features
 
 Behavior-focused tests live in `tests/cli.rs` and exercise the public CLI plus
 supervisor socket path.
+
+### Mutation testing
+
+A nightly GitHub Actions workflow (`.github/workflows/cargo-mutants.yml`) runs
+[`cargo-mutants`](https://mutants.rs) across an 8-shard matrix and uploads
+each shard's `mutants.out/` as a build artifact. The workflow can also be
+triggered manually via `workflow_dispatch` from the Actions tab. Mutation
+coverage is informational: the per-shard mutate step is `continue-on-error`
+because individual shards may not finish the full mutant set within the
+90-minute budget. `src/bin/fake_pi.rs` (the test-fixture fake Pi runtime) is
+excluded via `.cargo/mutants.toml`.
+
+To run a single shard locally (roughly the cost of a few full test runs):
+
+```sh
+cargo install cargo-mutants
+cargo mutants --shard 0/8 --baseline=skip --in-place --timeout 180 \
+    -- --all-targets --all-features
+```

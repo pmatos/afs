@@ -4,3 +4,6 @@
 .claude/worktrees/
 .ultraplan/
 .codex
+
+mutants.out/
+mutants.out.old/
