@@ -1,0 +1,4 @@
+[alias]
+# `cargo mutate -- --all-targets --all-features` runs cargo-mutants with the
+# afs-canonical flag set. See README "Mutation testing".
+mutate = "mutants --baseline=skip --in-place --timeout 180"

@@ -1,0 +1,4 @@
+# cargo-mutants configuration. See https://mutants.rs.
+exclude_globs = [
+    "src/bin/fake_pi.rs",
+]
