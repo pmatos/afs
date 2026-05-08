@@ -555,19 +555,32 @@ supervisor socket path.
 
 ### Mutation testing
 
-A nightly GitHub Actions workflow (`.github/workflows/cargo-mutants.yml`) runs
-[`cargo-mutants`](https://mutants.rs) across an 8-shard matrix and uploads
-each shard's `mutants.out/` as a build artifact. The workflow can also be
-triggered manually via `workflow_dispatch` from the Actions tab. Mutation
-coverage is informational: the per-shard mutate step is `continue-on-error`
-because individual shards may not finish the full mutant set within the
-90-minute budget. `src/bin/fake_pi.rs` (the test-fixture fake Pi runtime) is
-excluded via `.cargo/mutants.toml`.
-
-To run a single shard locally (roughly the cost of a few full test runs):
+[`cargo-mutants`](https://mutants.rs) is wired up for local-only use; CI does
+not run mutation testing. A `cargo mutate` alias in `.cargo/config.toml` and
+the exclusion in `.cargo/mutants.toml` (which drops `src/bin/fake_pi.rs`,
+the test-fixture fake Pi runtime) bake in the recommended flag set, so a
+local run is one line:
 
 ```sh
-cargo install cargo-mutants
-cargo mutants --shard 0/8 --baseline=skip --in-place --timeout 180 \
-    -- --all-targets --all-features
+cargo install cargo-mutants   # one-time
+cargo mutate -- --all-targets --all-features
 ```
+
+The alias expands to `cargo mutants --baseline=skip --in-place --timeout 180`,
+which mutates the source tree in place, skips the redundant baseline run
+(your green `cargo test` already proves the suite passes), and caps each
+mutant's test invocation at 180 seconds. Run `cargo mutate --list` to see
+the catalog of mutants without running them.
+
+A full run takes hours. For interruptible local sessions, run a single shard
+at a time and iterate over them across days:
+
+```sh
+cargo mutate --shard 0/8 -- --all-targets --all-features
+cargo mutate --shard 1/8 -- --all-targets --all-features
+# …through 7/8
+```
+
+Outputs land in `mutants.out/` (gitignored). See `mutants.out/missed.txt`
+for any mutants the test suite failed to catch — those are the gaps worth
+turning into new tests.
