@@ -556,28 +556,29 @@ supervisor socket path.
 ### Mutation testing
 
 [`cargo-mutants`](https://mutants.rs) is wired up for local-only use; CI does
-not run mutation testing. A `cargo mutate` alias in `.cargo/config.toml` and
-the exclusion in `.cargo/mutants.toml` (which drops `src/bin/fake_pi.rs`,
+not run mutation testing. The `cargo mutate` alias in `.cargo/config.toml`
+and the exclusion in `.cargo/mutants.toml` (which drops `src/bin/fake_pi.rs`,
 the test-fixture fake Pi runtime) bake in the recommended flag set, so a
-local run is one line:
+local run is a one-liner. The `scripts/run-mutants.sh` wrapper appends the
+project default test selection so you can stay even shorter:
 
 ```sh
 cargo install cargo-mutants   # one-time
-cargo mutate -- --all-targets --all-features
+scripts/run-mutants.sh        # full mutation run
 ```
 
 The alias expands to `cargo mutants --baseline=skip --in-place --timeout 180`,
 which mutates the source tree in place, skips the redundant baseline run
 (your green `cargo test` already proves the suite passes), and caps each
-mutant's test invocation at 180 seconds. Run `cargo mutate --list` to see
-the catalog of mutants without running them.
+mutant's test invocation at 180 seconds. Run `scripts/run-mutants.sh --list`
+to see the catalog of mutants without running them.
 
 A full run takes hours. For interruptible local sessions, run a single shard
 at a time and iterate over them across days:
 
 ```sh
-cargo mutate --shard 0/8 -- --all-targets --all-features
-cargo mutate --shard 1/8 -- --all-targets --all-features
+scripts/run-mutants.sh --shard 0/8
+scripts/run-mutants.sh --shard 1/8
 # …through 7/8
 ```
 
