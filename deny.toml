@@ -1,0 +1,50 @@
+# cargo-deny configuration. See https://embarkstudios.github.io/cargo-deny/.
+# Run locally with `cargo deny check`; CI enforces it (see .github/workflows/rust.yml).
+
+[graph]
+# Only Linux is supported (see CLAUDE.md), so evaluate the dependency graph for
+# the Linux target. This keeps Windows/macOS/wasm-only crates from muddying the
+# license and advisory results.
+targets = [
+    { triple = "x86_64-unknown-linux-gnu" },
+    { triple = "aarch64-unknown-linux-gnu" },
+]
+
+[advisories]
+# Fail the build on any security vulnerability or yanked crate.
+yanked = "deny"
+ignore = [
+    # ttf-parser is unmaintained upstream and reaches us only transitively
+    # through pdf-extract -> lopdf. There is no maintained drop-in replacement
+    # wired through lopdf yet, so we accept it and revisit when lopdf migrates
+    # off ttf-parser (e.g. to skrifa). Tracked upstream in lopdf.
+    { id = "RUSTSEC-2026-0192", reason = "ttf-parser unmaintained; transitive via pdf-extract->lopdf, no upgrade available" },
+]
+
+[licenses]
+# Permissive licenses only. Every crate in the tree must satisfy one of these.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-3-Clause",
+    "0BSD",
+    "ISC",
+    "Zlib",
+    "CC0-1.0",
+    "Unicode-3.0",
+    "Unlicense",
+]
+confidence-threshold = 0.9
+# `afs` itself carries no license and is never published (publish = false in
+# Cargo.toml), so skip license checks for our own workspace crate.
+private = { ignore = true }
+
+[bans]
+# Duplicate versions are common in transitive trees; surface them without failing.
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
