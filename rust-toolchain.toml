@@ -1,0 +1,5 @@
+# Pin the toolchain so local, CI, and cargo-mutants runs are reproducible.
+# See issue #59 (tooling audit) and CLAUDE.md's verification gate.
+[toolchain]
+channel = "stable"
+components = ["clippy", "rustfmt"]

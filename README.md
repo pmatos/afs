@@ -585,3 +585,52 @@ scripts/run-mutants.sh --shard 1/8
 Outputs land in `mutants.out/` (gitignored). See `mutants.out/missed.txt`
 for any mutants the test suite failed to catch — those are the gaps worth
 turning into new tests.
+
+### Supply-chain policy (cargo-deny)
+
+[`cargo-deny`](https://embarkstudios.github.io/cargo-deny/) enforces the
+dependency policy in `deny.toml`: it fails on RUSTSEC security advisories and
+yanked crates, restricts crates to a permissive license allow-list, and pins the
+source registry to crates.io. CI runs it (the `supply-chain` job in
+`.github/workflows/rust.yml`); run it locally the same way:
+
+```sh
+cargo install cargo-deny   # one-time
+cargo deny check
+```
+
+One advisory is baselined in `deny.toml`: `RUSTSEC-2026-0192` (`ttf-parser`
+unmaintained), which reaches the tree only transitively through
+`pdf-extract → lopdf` and has no maintained replacement wired through `lopdf`
+yet. Revisit when `lopdf` migrates off `ttf-parser`.
+
+### Continuous integration
+
+`.github/workflows/rust.yml` runs the format/lint/test gate and `cargo-deny` on
+every push and pull request, with [`Swatinem/rust-cache`](https://github.com/Swatinem/rust-cache)
+for faster builds and `concurrency: cancel-in-progress` so superseded runs are
+cancelled. `.github/workflows/workflow-lint.yml` lints the workflows themselves
+with [`actionlint`](https://github.com/rhysd/actionlint) and
+[`zizmor`](https://github.com/zizmorcore/zizmor). All third-party actions are
+pinned to commit SHAs (with a human-readable tag comment), and Dependabot
+(`.github/dependabot.yml`) keeps both the `cargo` and `github-actions` ecosystems
+current.
+
+### Toolchain pinning
+
+`rust-toolchain.toml` pins the stable channel plus the `clippy` and `rustfmt`
+components, so local, CI, and `cargo-mutants` runs all use the same toolchain.
+
+### Git and agent hooks
+
+A zero-dependency pre-commit hook mirrors the fast half of the CI gate
+(`cargo fmt --check` + `cargo clippy`). Enable it once per clone:
+
+```sh
+git config core.hooksPath .githooks
+```
+
+For Claude Code sessions, the committed `.claude/settings.json` runs
+`.claude/hooks/rust-fmt-check.sh` after every Rust-file edit, enforcing
+`cargo fmt --all -- --check` immediately; clippy and tests stay in CI and the
+pre-commit hook.
