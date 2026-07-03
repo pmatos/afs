@@ -611,10 +611,11 @@ every push and pull request, with [`Swatinem/rust-cache`](https://github.com/Swa
 for faster builds and `concurrency: cancel-in-progress` so superseded runs are
 cancelled. `.github/workflows/workflow-lint.yml` lints the workflows themselves
 with [`actionlint`](https://github.com/rhysd/actionlint) and
-[`zizmor`](https://github.com/zizmorcore/zizmor). All third-party actions are
-pinned to commit SHAs (with a human-readable tag comment), and Dependabot
-(`.github/dependabot.yml`) keeps both the `cargo` and `github-actions` ecosystems
-current.
+[`zizmor`](https://github.com/zizmorcore/zizmor). Actions are referenced by their
+latest release tag; `.github/zizmor.yml` sets zizmor's `unpinned-uses` policy to
+`ref-pin` so tags are accepted (a floating branch like `@main` is still
+rejected). Dependabot (`.github/dependabot.yml`) keeps both the `cargo` and
+`github-actions` ecosystems current.
 
 ### Toolchain pinning
 
