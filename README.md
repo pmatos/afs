@@ -613,9 +613,10 @@ cancelled. `.github/workflows/workflow-lint.yml` lints the workflows themselves
 with [`actionlint`](https://github.com/rhysd/actionlint) and
 [`zizmor`](https://github.com/zizmorcore/zizmor). Actions are referenced by their
 latest release tag; `.github/zizmor.yml` sets zizmor's `unpinned-uses` policy to
-`ref-pin` so tags are accepted (a floating branch like `@main` is still
-rejected). Dependabot (`.github/dependabot.yml`) keeps both the `cargo` and
-`github-actions` ecosystems current.
+`ref-pin`, which accepts any explicit ref (tag, branch, or SHA) so our tag pins
+pass. (`ref-pin` does not by itself forbid a floating branch like `@main`.)
+Dependabot (`.github/dependabot.yml`) keeps both the `cargo` and `github-actions`
+ecosystems current.
 
 ### Toolchain pinning
 
