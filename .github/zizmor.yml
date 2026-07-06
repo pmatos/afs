@@ -1,0 +1,13 @@
+# zizmor configuration. See https://docs.zizmor.sh/configuration/.
+#
+# Project policy pins third-party actions to their latest release *tag* (kept
+# current by Dependabot), not to commit SHAs. Relax the unpinned-uses audit from
+# its default hash-pin requirement to ref-pin, which accepts any explicit ref
+# (tag, branch, or SHA) so our tag pins pass. Note ref-pin does NOT forbid a
+# floating branch such as @main; enforcing tag-only refs would need a separate
+# check (tracked in #61).
+rules:
+  unpinned-uses:
+    config:
+      policies:
+        "*": ref-pin

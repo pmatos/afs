@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# Local pre-commit gate mirroring the fast half of .github/workflows/rust.yml,
+# so contributors catch formatting/lint failures before pushing. The full test
+# suite stays in CI (it is too slow for every commit).
+#
+# Enable once per clone:
+#   git config core.hooksPath .githooks
+#
+# Bypass for a deliberate work-in-progress commit with `git commit --no-verify`.
+set -euo pipefail
+
+if ! command -v cargo >/dev/null 2>&1; then
+    echo "pre-commit: cargo not found; skipping Rust gate" >&2
+    exit 0
+fi
+
+echo "pre-commit: cargo fmt --all -- --check"
+cargo fmt --all -- --check
+
+echo "pre-commit: cargo clippy --all-targets --all-features -- -D warnings"
+cargo clippy --all-targets --all-features -- -D warnings
