@@ -24,4 +24,19 @@ jobs:
         run: npm install --no-save @commitlint/cli@21 @commitlint/config-conventional@21 # zizmor: ignore[adhoc-packages] no lockfile-managed manifest for this single CI utility step; versions pinned to the @commitlint major release
       - name: Lint pushed commits
         if: github.event.before != '0000000000000000000000000000000000000000'
-        run: npx commitlint --from ${{ github.event.before }} --to ${{ github.sha }} --verbose
+        # A plain `--from/--to` range walks every commit, including the non-Conventional
+        # side-branch commits a merge-commit-strategy PR introduces (only the PR title,
+        # not those commits, is covered by lint-pr-title.yml). Restrict to first-parent
+        # so only the merge commit (ignored by default) or genuine direct-push commits
+        # are linted. `--git-log-args` looks like the built-in way to do this, but as of
+        # commitlint v21 it's a no-op: @conventional-changelog/git-client's getRawCommits
+        # only recognizes a boolean `firstParent` field, never populated from the CLI's
+        # gitLogArgs string, so the flag is silently dropped. Do the traversal ourselves.
+        run: |
+          lint_status=0
+          while IFS= read -r sha; do
+            if ! git log -1 --format=%B "$sha" | npx commitlint --verbose; then
+              lint_status=1
+            fi
+          done < <(git rev-list --first-parent "${{ github.event.before }}..${{ github.sha }}")
+          exit "$lint_status"
