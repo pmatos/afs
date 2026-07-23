@@ -34,9 +34,11 @@ jobs:
         # gitLogArgs string, so the flag is silently dropped. Do the traversal ourselves.
         run: |
           lint_status=0
+          commits=$(git rev-list --first-parent "${{ github.event.before }}..${{ github.sha }}") || exit 1
           while IFS= read -r sha; do
+            [ -z "$sha" ] && continue
             if ! git log -1 --format=%B "$sha" | npx commitlint --verbose; then
               lint_status=1
             fi
-          done < <(git rev-list --first-parent "${{ github.event.before }}..${{ github.sha }}")
+          done <<< "$commits"
           exit "$lint_status"
