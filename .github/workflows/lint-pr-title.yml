@@ -3,7 +3,7 @@
 name: Lint PR title
 
 on:
-  pull_request_target:
+  pull_request_target: # zizmor: ignore[dangerous-triggers] no checkout step, no untrusted templating into run: steps, and permissions are read-only; needed (over pull_request) so title validation still runs on fork PRs
     types:
       - opened
       - edited
