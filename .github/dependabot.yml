@@ -4,6 +4,8 @@ updates:
     directory: "/"
     schedule:
       interval: weekly
+    commit-message:
+      prefix: chore
     open-pull-requests-limit: 10
     groups:
       cargo-minor-patch:
@@ -15,6 +17,8 @@ updates:
     directory: "/"
     schedule:
       interval: weekly
+    commit-message:
+      prefix: ci
     open-pull-requests-limit: 10
     groups:
       github-actions:
