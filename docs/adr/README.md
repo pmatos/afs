@@ -14,9 +14,9 @@ number (`ADR-0001`, `ADR-0002`) in `CLAUDE.md` and
 
 ## Current naming
 
-New ADRs use `docs/adr/YYYY-MM-DD-slug.md`, dated the day the ADR is
-authored. Reference one in prose or comments as `ADR-YYYY-MM-DD` (add
-the slug too if more than one ADR shares a date). Two authors can't
-independently pick the same real-world date-and-slug pair the way they
-could pick the same next integer, so there's no numbering-collision
-class left to check for in CI.
+New ADRs use `docs/adr/YYYY-MM-DD-HHMM-slug.md` (UTC, 24h clock), timestamped
+when the ADR is authored. Reference one in prose or comments as
+`ADR-YYYY-MM-DD-HHMM`. A bare date isn't enough — more than one ADR can land
+in a day — but two authors can't independently pick the same real-world
+minute the way they could pick the same next integer, so there's no
+numbering-collision class left to check for in CI.
