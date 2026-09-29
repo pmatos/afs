@@ -4202,7 +4202,7 @@ fn install_with_valid_config_spawns_agent_runtime_with_provider_and_model() {
 
     write_config(
         &afs_home,
-        r#"{"provider":"claude","model":"claude-sonnet-4-6","auth_method":"oauth"}"#,
+        r#"{"provider":"claude","model":"claude-sonnet-5-5","auth_method":"oauth"}"#,
     );
 
     let mut daemon = start_daemon_with_pi_runtime(&afs_home, &pi_runtime);
@@ -4247,7 +4247,7 @@ fn install_with_valid_config_spawns_agent_runtime_with_provider_and_model() {
         "runtime should receive --provider claude. got:\n{observed}"
     );
     assert!(
-        observed.contains("arg=--model") && observed.contains("arg=claude-sonnet-4-6"),
+        observed.contains("arg=--model") && observed.contains("arg=claude-sonnet-5-5"),
         "runtime should receive --model from config. got:\n{observed}"
     );
     assert!(
